@@ -803,10 +803,21 @@ async fn fast_graph_leg(
         client
             .native_facts_for_tokens(scope, &tokens, config.recall.inject.max_facts.max(1))
             .await
-    } else {
+    } else if config.tenancy_enabled()
+        || engram_paths::pinned_slug().as_deref() == Some(scope.slug())
+    {
         client
             .facts_for_tokens(scope, &tokens, config.recall.inject.max_facts.max(1))
             .await
+    } else {
+        // Untenanted, the legacy graph is ONE group built from the pinned store; a
+        // session on any other store would be handed another project's facts.
+        // Tenanted, the group IS the isolation boundary (see facts_for_tokens).
+        legs.insert(
+            "graph".into(),
+            "fast: legacy facts serve only the pinned store (use graph.backend: native)".into(),
+        );
+        return leg;
     };
     match facts {
         Ok(mut facts) => {
