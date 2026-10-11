@@ -23,6 +23,7 @@ Paths are resolved from env (the installer / container set these):
   ENGRAM_BIN   engine dir (default ~/.claude)        ENGRAM_GRAPH  graph dir (default $ENGRAM_BIN/graph)
   ENGRAM_LOG_DIR (default ~/.claude/logs)            NEO4J_URI     (default bolt://127.0.0.1:7687)
 """
+import fcntl
 import json
 import os
 import socket
@@ -598,7 +599,37 @@ def tick(force=None):
     save_state(st)
 
 
+_SINGLETON_FD = None  # held open for the process lifetime so the lock persists
+
+
+def acquire_singleton_lock():
+    """Refuse to start a second daemon instance.
+
+    A manual ``--once`` run overlapping the systemd ``--loop`` service means two
+    pipelines harvest the SAME memories at once — double the LLM calls and a race
+    on the per-slug ingest state. An exclusive, non-blocking flock makes the
+    second starter exit cleanly (0, not an error: "already running" is not a
+    failure). The lock is released by the kernel when the holder dies — even on
+    SIGKILL or a crash — so it never goes stale. Guards every mode (--loop,
+    --once, --force) because it is taken before any of them dispatch."""
+    global _SINGLETON_FD
+    lock = ENGRAM_BIN / "engram-daemon.lock"
+    try:
+        fd = open(lock, "a+")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("another engram-daemon already holds the lock — exiting without starting a second instance")
+        sys.exit(0)
+    except OSError as e:
+        # Can't create or lock the file (e.g. a read-only FS). Don't wedge the
+        # daemon over a missing guard — log and run, matching the old behaviour.
+        log(f"singleton lock unavailable ({e}); continuing without it")
+        return
+    _SINGLETON_FD = fd  # keep the fd open; closing it would drop the lock
+
+
 def main():
+    acquire_singleton_lock()
     a = sys.argv[1:]
     if "--force" in a:
         tick(force=a[a.index("--force") + 1])
