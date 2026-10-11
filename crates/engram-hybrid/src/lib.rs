@@ -15,8 +15,9 @@ use engram_tenant::{GraphScope, Tenant};
 use engram_vector::{Corpus, QdrantClient, Scope};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
@@ -1279,6 +1280,74 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The keyword leg caches each file's chunks, so the property that matters is
+    /// that the cache follows the vault: an edited file's NEW text is served (the
+    /// `(mtime, size)` key invalidated the stale entry) and a deleted file stops
+    /// appearing (the entry was evicted). A steady-state vault reusing cached
+    /// chunks is what the other wiki tests already exercise; this one drives the
+    /// invalidate and evict branches that only a changing vault reaches.
+    ///
+    /// The edit changes the byte length, so the `size` half of the key fires
+    /// deterministically — no dependence on the filesystem's coarse mtime clock,
+    /// which is exactly the same-second-same-size edit the cache is documented not
+    /// to catch and which no test should hinge on.
+    #[tokio::test]
+    async fn keyword_leg_cache_refreshes_on_edit_and_delete() {
+        let dir = std::env::temp_dir().join(format!(
+            "engram-hybrid-wikicache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        let vault = dir.join("vault");
+        std::fs::create_dir_all(vault.join("Notes")).unwrap();
+        let page = vault.join("Notes/A.md");
+        std::fs::write(&page, "# Alpha\n\nThe BEFORE marker lives here.\n").unwrap();
+
+        // Written literally (not re-serialized) so the test needs no Serialize on
+        // Config; vector disabled makes this a pure keyword-leg search.
+        let yaml = format!(
+            "vector_store:\n  enabled: false\ntenants:\n  t:\n    slugs: ['-t']\n    vault: {}\n",
+            vault.display()
+        );
+        let config: Config = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        let tenant = Tenant::resolve(&config, Some("t")).unwrap();
+        let config_path = dir.join("engram.yaml");
+        std::fs::write(&config_path, &yaml).unwrap();
+
+        // Finds the original content.
+        let hit = wiki_search(&config_path, &tenant, "before marker", 5).await.unwrap();
+        assert!(
+            hit.results.iter().any(|r| r.text.contains("BEFORE")),
+            "first search did not find the original page"
+        );
+
+        // Rewrite with new, longer content: the differing byte length changes the
+        // cache key, so the stale entry is dropped and the page re-parsed.
+        std::fs::write(&page, "# Alpha\n\nThe AFTER marker lives here now, extended.\n").unwrap();
+        let hit = wiki_search(&config_path, &tenant, "after marker extended", 5).await.unwrap();
+        assert!(
+            hit.results.iter().any(|r| r.text.contains("AFTER")),
+            "edited content was not served — cache did not invalidate"
+        );
+        assert!(
+            !hit.results.iter().any(|r| r.text.contains("BEFORE")),
+            "stale content still served after edit"
+        );
+
+        // Delete it: the evict branch must drop it from the cache.
+        std::fs::remove_file(&page).unwrap();
+        let hit = wiki_search(&config_path, &tenant, "after marker extended", 5).await.unwrap();
+        assert!(
+            hit.results.is_empty(),
+            "deleted page still returned from cache: {:?}",
+            hit.results
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The whole point of the feature, end to end: one identity's recall must not
     /// surface another's memory, even when the two stores hold a file of the same
     /// name saying different things.
@@ -1688,12 +1757,39 @@ pub struct WikiOutput {
 }
 
 /// A chunk read off disk, for the local keyword leg.
+#[derive(Clone)]
 struct LocalChunk {
     path: String,
     title: String,
     breadcrumb: String,
     index: usize,
     text: String,
+}
+
+/// One file's parsed+chunked form, held between queries.
+///
+/// `mtime`/`size` are the freshness key: a `stat` rather than a content hash,
+/// precisely because reading the content is the cost being cached away. The one
+/// edit this cannot see is a same-second, same-byte-length rewrite — and the
+/// keyword leg is best-effort and local-first, so a rare staleness there just
+/// means the SHA-accurate vector leg (the authoritative wiki index) carries the
+/// hit instead.
+struct CachedFile {
+    mtime: i64,
+    size: u64,
+    chunks: Vec<LocalChunk>,
+}
+
+/// Process-global, per-vault cache of parsed chunks, so `local_chunks` re-reads
+/// and re-chunks only files that changed since the last query rather than the
+/// whole vault every time. Keyed by canonical vault root in the outer map so two
+/// vaults (or two tenants) can never share entries — correctness holds even
+/// though in practice one `engram-mcp` process serves exactly one tenant for its
+/// whole life. Only that long-lived server calls `wiki_search`, so this is where
+/// the caching pays off; a one-shot caller would simply build it once and exit.
+fn wiki_cache() -> &'static Mutex<HashMap<PathBuf, HashMap<String, CachedFile>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, HashMap<String, CachedFile>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 impl engram_retrieval::Indexable for LocalChunk {
@@ -1710,12 +1806,13 @@ impl engram_retrieval::Indexable for LocalChunk {
 /// Search one tenant's vault: keyword over the files, vectors over the chunks,
 /// fused with RRF.
 ///
-/// The keyword leg reads and re-chunks the vault on each call. That is a real
-/// cost and an accepted one: it needs no index, so it works the moment a file is
-/// saved and keeps working when Qdrant or the embedder is down — the same
-/// local-first posture the memory keyword leg has. Vault size is the limit here;
-/// at the point that hurts, the chunks are already in Qdrant and the vector leg
-/// is the one to lean on.
+/// The keyword leg needs no index: it walks the vault and chunks it in process,
+/// so it works the moment a file is saved and keeps working when Qdrant or the
+/// embedder is down — the same local-first posture the memory keyword leg has.
+/// It does not re-chunk the whole vault per query, though: [`local_chunks`]
+/// caches each file's chunks under its `(mtime, size)` and re-parses only what
+/// changed, so a large vault costs a walk plus the parse of its edits, not a
+/// full re-read every time.
 pub async fn wiki_search(
     config_path: &Path,
     tenant: &Tenant,
@@ -1788,7 +1885,16 @@ pub async fn wiki_search(
     })
 }
 
-/// Walk, parse and chunk the vault for the keyword leg.
+/// Walk the vault and return its chunks for the keyword leg, re-reading and
+/// re-chunking only the files that changed since the last query.
+///
+/// The walk still runs every call — it is cheap (readdir + stat) and it is how
+/// new, deleted and renamed files are noticed. What it no longer does is
+/// `read_to_string` + parse + chunk every page on every query: each file's
+/// chunks are cached under its `(mtime, size)` in [`wiki_cache`], so a
+/// steady-state vault produces its chunks from memory and only a genuinely
+/// edited page pays the parse cost. A deleted file is evicted at the end of the
+/// walk so its chunks stop being served.
 fn local_chunks(tenant: &Tenant, legs: &mut HashMap<String, String>) -> Vec<LocalChunk> {
     let root = match tenant.vault_root() {
         Ok(root) => root,
@@ -1805,21 +1911,56 @@ fn local_chunks(tenant: &Tenant, legs: &mut HashMap<String, String>) -> Vec<Loca
         }
     };
     let params = engram_wiki::ChunkParams::default();
+
+    // One short critical section for the whole walk. `local_chunks` is sync (no
+    // `.await` anywhere below) and the MCP server drives it single-threaded, so
+    // holding the std `Mutex` across the fs reads neither parks the async
+    // executor nor contends — and it keeps "only one re-chunk of a given vault
+    // at a time" true if a second caller ever appears.
+    let mut guard = wiki_cache().lock().unwrap_or_else(|poison| poison.into_inner());
+    let files = guard.entry(root.clone()).or_default();
+
+    let present: HashSet<&String> = paths.iter().collect();
+    files.retain(|path, _| present.contains(path));
+
     let mut chunks = Vec::new();
     for path in &paths {
-        let Ok(raw) = std::fs::read_to_string(engram_wiki::absolute(&root, path)) else {
+        let absolute = engram_wiki::absolute(&root, path);
+        let Ok(metadata) = std::fs::metadata(&absolute) else {
+            continue; // vanished between walk and stat — skip, as a read failure would
+        };
+        let size = metadata.len();
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|age| age.as_secs() as i64)
+            .unwrap_or_default();
+
+        if let Some(cached) = files
+            .get(path)
+            .filter(|cached| cached.mtime == mtime && cached.size == size)
+        {
+            chunks.extend(cached.chunks.iter().cloned());
+            continue;
+        }
+
+        let Ok(raw) = std::fs::read_to_string(&absolute) else {
             continue;
         };
-        let document = engram_wiki::parse(path, &raw, 0);
-        for chunk in engram_wiki::chunk(&document, params) {
-            chunks.push(LocalChunk {
+        let document = engram_wiki::parse(path, &raw, mtime);
+        let file_chunks: Vec<LocalChunk> = engram_wiki::chunk(&document, params)
+            .into_iter()
+            .map(|chunk| LocalChunk {
                 path: path.clone(),
                 title: document.title.clone(),
                 breadcrumb: chunk.breadcrumb(),
                 index: chunk.index,
-                text: chunk.text.clone(),
-            });
-        }
+                text: chunk.text,
+            })
+            .collect();
+        chunks.extend(file_chunks.iter().cloned());
+        files.insert(path.clone(), CachedFile { mtime, size, chunks: file_chunks });
     }
     chunks
 }
