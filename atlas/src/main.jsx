@@ -5,9 +5,9 @@ import fcose from "cytoscape-fcose";
 import {
   Activity, AlertTriangle, BookOpen, Boxes, BrainCircuit, ChevronLeft,
   ChevronRight, CircleDot, Database, ExternalLink, Filter, Focus, GitBranch,
-  HeartPulse, Layers3, List, LocateFixed, Menu, Network, PanelLeftClose,
-  PanelRightClose, RefreshCw, ScrollText, Search, Server, Settings2, Sparkles,
-  X, ZoomIn, ZoomOut,
+  HeartPulse, HelpCircle, Info, Layers3, List, LocateFixed, Menu, Network,
+  Network as GraphIcon, PanelLeftClose, PanelRightClose, RefreshCw, ScrollText,
+  Search, Server, Settings2, Sparkles, X, ZoomIn, ZoomOut,
 } from "lucide-react";
 import "./styles.css";
 
@@ -15,6 +15,23 @@ cytoscape.use(fcose);
 
 const TYPE_LABELS = {project: "Project", reference: "Reference", feedback: "Feedback", user: "User"};
 const STATUS_LABELS = {indexed: "Indexed", unindexed: "Unindexed", stale: "Stale", unknown: "Coverage unknown"};
+const SOURCE_LABELS = {graph: "Graph", vector: "Vector", keyword: "Keyword"};
+
+// Plain-English definitions for the operator jargon the UI surfaces. Kept in one
+// place so the same wording is reused everywhere a term appears.
+const HINTS = {
+  slug: "The store ID used for its directory and tenant routing.",
+  graphed: "Memories recorded as processed by graph sync.",
+  graphPending: "On-disk memories still waiting for graph extraction.",
+  harvest: "A model call that extracts graph entities and facts from a memory.",
+  staging: "Short-term memories waiting for consolidation.",
+  quarantine: "Memories held for review.",
+  coverageUnknown: "Graph coverage is not measured for this store.",
+  rrf: "RRF combines the rank from each search source; a result found by more sources can rank higher.",
+  digest: "Short identifier for detecting identical prompts; prompt text is not shown.",
+  genWindow: "Counted from the latest 300 audit events; a busy 5-minute window may be truncated.",
+  scope: "Scope filters Atlas and Memories. Pending jobs covers all stores; Recall searches the -root store.",
+};
 const NAV = [
   ["atlas", "Atlas", Network],
   ["memories", "Memories", BookOpen],
@@ -52,6 +69,14 @@ function Badge({children, tone = "neutral"}) {
   return <span className={`badge badge-${tone}`}>{children}</span>;
 }
 
+// Keyboard-accessible inline help: a focusable info dot that reveals its text on
+// hover AND on keyboard focus (the CSS tooltip keys off [data-tip]). The native
+// title is a fallback for places a container would clip the CSS tooltip.
+function Hint({text, label}) {
+  return <span className="hint" tabIndex={0} role="note" data-tip={text} title={text}
+    aria-label={label ? `${label}: ${text}` : text}><HelpCircle size={13}/></span>;
+}
+
 function TypeBadge({type}) {
   const safe = TYPE_LABELS[type] ? type : "unknown";
   return <Badge tone={safe}>{TYPE_LABELS[type] || "Other"}</Badge>;
@@ -62,7 +87,15 @@ function StatusBadge({status}) {
 }
 
 function Notice({children, tone = "warning"}) {
-  return <div className={`notice notice-${tone}`}><AlertTriangle size={15}/><span>{children}</span></div>;
+  const Icon = tone === "info" ? Info : AlertTriangle;
+  return <div className={`notice notice-${tone}`}><Icon size={15}/><span>{children}</span></div>;
+}
+
+// Error + retry affordance reused by pages that fetch independently of the main
+// snapshot, so a failed request reads as a failure (not as empty/healthy data).
+function InlineError({message, onRetry, label = "Retry"}) {
+  return <div className="inline-error"><Notice>{message}</Notice>
+    <button className="action-button" onClick={onRetry}><RefreshCw size={15}/>{label}</button></div>;
 }
 
 function Spinner({label = "Loading memories…"}) {
@@ -83,12 +116,12 @@ function Navigation({view, setView, open, setOpen, wikiUrl}) {
         // resolvable tenant (scope=all / untenanted) it falls back to the Tenants view.
         if (id === "wiki") {
           return wikiUrl
-            ? <a key={id} className="nav-external" href={wikiUrl} target="_blank" rel="noopener noreferrer" onClick={() => setOpen(false)}>
+            ? <a key={id} className="nav-external" href={wikiUrl} target="_blank" rel="noopener noreferrer" title={label} aria-label={`${label} (opens in a new tab)`} onClick={() => setOpen(false)}>
                 <Icon size={18}/><span>{label}</span></a>
-            : <button key={id} title="Select a tenant's project to open its wiki" onClick={() => {setView("tenants"); setOpen(false);}}>
+            : <button key={id} title="Select a tenant's project to open its wiki" aria-label="Wiki — select a tenant's project to open its wiki" onClick={() => {setView("tenants"); setOpen(false);}}>
                 <Icon size={18}/><span>{label}</span></button>;
         }
-        return <button key={id} className={view === id ? "active" : ""} onClick={() => {setView(id); setOpen(false);}}>
+        return <button key={id} className={view === id ? "active" : ""} title={label} aria-label={label} aria-current={view === id ? "page" : undefined} onClick={() => {setView(id); setOpen(false);}}>
           <Icon size={18}/><span>{label}</span>
         </button>;
       })}
@@ -129,7 +162,7 @@ function WorkspaceHeader({view, project, setProject, projects, coverage, setNavO
     <div className="workspace-title"><span>Engram</span><h1>{title}</h1></div>
     <div className="header-actions">
       <Coverage coverage={coverage} compact/>
-      <label className="scope-select"><span>Scope</span><select value={project} onChange={e => setProject(e.target.value)}>
+      <label className="scope-select"><span>Scope<Hint text={HINTS.scope} label="Scope"/></span><select value={project} onChange={e => setProject(e.target.value)}>
         <option value="all">All projects</option>
         {tenantAware
           ? grouped.map(([tenant, items]) => <optgroup key={tenant} label={tenant}>{items.map(Option)}</optgroup>)
@@ -247,14 +280,23 @@ function GraphCanvas({snapshot, nodes, layers, query, selectedId, onSelect, focu
 
   return <div className="graph-stage">
     <div ref={holder} className="graph-canvas" aria-label="Interactive memory graph"/>
-    {!elements.some(item => !item.data.source) && <Empty title="No memories in this view" detail="Change the filters or project scope."/>}
+    {!elements.some(item => !item.data.source) && <Empty title="No memories in this scope" detail="Choose another project above, or add a memory to a store and refresh."/>}
     <div className="graph-controls">
-      <button onClick={() => command("fit")} title="Fit graph"><LocateFixed size={17}/></button>
-      <button onClick={() => command("in")} title="Zoom in"><ZoomIn size={17}/></button>
-      <button onClick={() => command("out")} title="Zoom out"><ZoomOut size={17}/></button>
-      {selectedId && <button className={focusMode ? "active" : ""} onClick={() => onFocusMode(!focusMode)} title="Focus neighborhood"><Focus size={17}/></button>}
+      <button onClick={() => command("fit")} title="Fit graph" aria-label="Fit graph to view"><LocateFixed size={17}/></button>
+      <button onClick={() => command("in")} title="Zoom in" aria-label="Zoom in"><ZoomIn size={17}/></button>
+      <button onClick={() => command("out")} title="Zoom out" aria-label="Zoom out"><ZoomOut size={17}/></button>
+      {selectedId && <button className={focusMode ? "active" : ""} aria-pressed={focusMode} onClick={() => onFocusMode(!focusMode)} title="Focus neighborhood" aria-label="Focus on selected memory's neighborhood"><Focus size={17}/></button>}
     </div>
-    <div className="graph-legend"><span><i className="line wiki"/>Wiki-link</span><span><i className="line shared"/>Shared entity</span><span><i className="node-key unindexed"/>Unindexed</span></div>
+    <div className="graph-legend" aria-label="Graph legend">
+      <span className="legend-group">Types
+        <i className="node-dot type-project" title="Project"/><i className="node-dot type-reference" title="Reference"/>
+        <i className="node-dot type-feedback" title="Feedback"/><i className="node-dot type-user" title="User"/>
+      </span>
+      <span><i className="node-key stale"/>Stale</span>
+      <span><i className="node-key unknown"/>Unindexed / unknown</span>
+      <span><i className="line wiki"/>Wiki-link</span>
+      <span><i className="line shared"/>Shared entity</span>
+    </div>
   </div>;
 }
 
@@ -304,12 +346,16 @@ function AtlasPage({snapshot, selected, setSelected}) {
   const choose = choice => {setSelected(choice); setFocusMode(false);};
   return <div className="atlas-page">
     <div className="atlas-toolbar">
-      <button className={`icon-button ${listOpen ? "active" : ""}`} onClick={() => setListOpen(!listOpen)} title="Toggle results"><PanelLeftClose size={18}/></button>
-      <label className="search-field"><Search size={17}/><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Find a memory…"/></label>
-      <label className="filter-control"><Filter size={15}/><select value={type} onChange={event => setType(event.target.value)}><option value="all">All types</option>{Object.entries(TYPE_LABELS).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
-      <label className="filter-control"><Database size={15}/><select value={status} onChange={event => setStatus(event.target.value)}><option value="all">Any coverage</option>{Object.entries(STATUS_LABELS).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
-      <div className="layer-controls"><span><Layers3 size={15}/>Layers</span><button className={layers.wiki_link ? "active" : ""} onClick={() => setLayers({...layers, wiki_link: !layers.wiki_link})}>Links</button><button className={layers.shared_entity ? "active" : ""} onClick={() => setLayers({...layers, shared_entity: !layers.shared_entity})}>Entities</button></div>
+      <button className={`icon-button ${listOpen ? "active" : ""}`} aria-pressed={listOpen} onClick={() => setListOpen(!listOpen)} title="Toggle results list" aria-label="Toggle results list"><PanelLeftClose size={18}/></button>
+      <label className="search-field"><Search size={17}/><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Find a memory…" aria-label="Find a memory"/></label>
+      <label className="filter-control"><Filter size={15}/><select value={type} onChange={event => setType(event.target.value)} aria-label="Filter by type"><option value="all">All types</option>{Object.entries(TYPE_LABELS).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
+      <label className="filter-control"><Database size={15}/><select value={status} onChange={event => setStatus(event.target.value)} aria-label="Filter by coverage"><option value="all">Any coverage</option>{Object.entries(STATUS_LABELS).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>
+      <div className="layer-controls"><span><Layers3 size={15}/>Layers</span><button className={layers.wiki_link ? "active" : ""} aria-pressed={layers.wiki_link} onClick={() => setLayers({...layers, wiki_link: !layers.wiki_link})}>Links</button><button className={layers.shared_entity ? "active" : ""} aria-pressed={layers.shared_entity} onClick={() => setLayers({...layers, shared_entity: !layers.shared_entity})}>Entities</button></div>
       <span className="shown-count">{filtered.length} / {snapshot.nodes.length}</span>
+      <div className="mobile-view-switch" role="group" aria-label="Choose list or graph view">
+        <button className={listOpen ? "active" : ""} aria-pressed={listOpen} onClick={() => setListOpen(true)}><List size={14}/>List</button>
+        <button className={!listOpen ? "active" : ""} aria-pressed={!listOpen} onClick={() => setListOpen(false)}><GraphIcon size={14}/>Graph</button>
+      </div>
     </div>
     {snapshot.warnings.map(warning => <Notice key={warning}>{warning}</Notice>)}
     {focusMode && <div className="focus-banner"><Focus size={15}/>Focused on {selectedNode?.name}<button onClick={() => setFocusMode(false)}>Return to overview</button></div>}
@@ -326,7 +372,7 @@ function MemoriesPage({snapshot, selectedId, setSelectedId}) {
   const [type, setType] = useState("all");
   const selected = snapshot.nodes.find(node => node.id === selectedId) || snapshot.nodes[0];
   const shown = snapshot.nodes.filter(node => (type === "all" || node.type === type) && `${node.name} ${node.description} ${node.file}`.toLowerCase().includes(query.toLowerCase()));
-  return <div className="page-content memories-page"><div className="content-toolbar"><label className="search-field"><Search size={17}/><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Search all memories…"/></label><select value={type} onChange={event => setType(event.target.value)}><option value="all">All types</option>{Object.entries(TYPE_LABELS).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></div><div className="reader-layout"><div className="reader-list">{shown.map(node => <MemoryListItem key={node.id} node={node} selected={selected?.id === node.id} onSelect={setSelectedId}/>)}</div><article className="reader">{selected ? <MemoryInspector node={selected} onClose={() => setSelectedId("")}/> : <Empty title="No memories" detail="This project scope has no memory files."/>}</article></div></div>;
+  return <div className="page-content memories-page"><div className="content-toolbar"><label className="search-field"><Search size={17}/><input value={query} onChange={event => setQuery(event.target.value)} placeholder="Search all memories…"/></label><select value={type} onChange={event => setType(event.target.value)}><option value="all">All types</option>{Object.entries(TYPE_LABELS).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></div><div className="reader-layout"><div className="reader-list">{shown.map(node => <MemoryListItem key={node.id} node={node} selected={selected?.id === node.id} onSelect={setSelectedId}/>)}{!shown.length && <Empty title="No matches" detail="No memory matches this search in the current scope."/>}</div><article className="reader">{selected ? <MemoryInspector node={selected} onClose={() => setSelectedId("")}/> : <Empty title="No memories" detail="This project scope has no memory files."/>}</article></div></div>;
 }
 
 function RecallPage({onLocate}) {
@@ -339,14 +385,25 @@ function RecallPage({onLocate}) {
     setBusy(true); setError("");
     try {setResult(await api(`/api/recall/hybrid?k=10&q=${encodeURIComponent(query)}`));} catch (error) {setError(error.message);} finally {setBusy(false);}
   };
-  return <div className="page-content recall-page"><Notice tone="info">Recall currently searches the active <code>-root</code> store. All-project recall is not implied.</Notice><section className="hero-search"><span className="eyebrow">Hybrid recall</span><h2>What do you want to remember?</h2><div><Search size={19}/><input value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => event.key === "Enter" && run()} placeholder="Ask about a project, decision, person, or system…"/><button onClick={run} disabled={busy}>{busy ? "Searching…" : "Recall"}</button></div></section>{error && <Notice>{error}</Notice>}{result && <div className="recall-results"><div className="section-heading"><h3>Results</h3><span>{result.results.length} memories · {result.sources_used.join(" + ") || "no rankers"}</span></div>{result.results.map(item => <article key={item.file}><div><TypeBadge type={item.type || "reference"}/><h3>{item.name}</h3><p>{item.description}</p>{item.facts?.map((fact, index) => <blockquote key={index}>{fact}</blockquote>)}</div><button onClick={() => onLocate(`-root:${item.file}`)}><LocateFixed size={16}/>Locate</button></article>)}</div>}</div>;
+  return <div className="page-content recall-page"><Notice tone="info">Recall currently searches the active <code>-root</code> store. All-project recall is not implied.</Notice><section className="hero-search"><span className="eyebrow">Hybrid recall</span><h2>What do you want to remember?</h2><div><Search size={19}/><input value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => event.key === "Enter" && run()} placeholder="Ask about a project, decision, person, or system…" aria-label="Recall query"/><button onClick={run} disabled={busy}>{busy ? "Searching…" : "Recall"}</button></div></section>{error && <Notice>{error}</Notice>}{result && (result.results.length
+    ? <div className="recall-results"><div className="section-heading"><h3>Results<Hint text={HINTS.rrf} label="Ranking"/></h3><span>{result.results.length} memories · {result.sources_used.join(" + ") || "no rankers"}</span></div>{result.results.map(item => <article key={item.file}><div><div className="source-chips">{(item.sources || []).map(src => <span key={src} className={`source-chip source-${src}`}>{SOURCE_LABELS[src] || src}</span>)}{item.type && <TypeBadge type={item.type}/>}</div><h3>{item.name}</h3><p>{item.description}</p>{item.facts?.map((fact, index) => <blockquote key={index}>{fact}</blockquote>)}</div><button onClick={() => onLocate(`-root:${item.file}`)}><LocateFixed size={16}/>Locate</button></article>)}</div>
+    : <Empty title="No results" detail="No memory in the -root store matched this query. Try different words."/>)}</div>;
 }
 
 function ActivityPage({snapshot}) {
   const [queues, setQueues] = useState(null);
-  useEffect(() => {api("/api/queues").then(setQueues).catch(() => setQueues({staging: [], quarantine: []}));}, []);
-  const cards = [{label: "Indexed", value: snapshot.coverage.indexed, tone: "indexed"}, {label: "Stale", value: snapshot.coverage.stale, tone: "stale"}, {label: "Unindexed", value: snapshot.coverage.unindexed, tone: "unindexed"}, {label: "Coverage unknown", value: snapshot.coverage.unknown, tone: "unknown"}];
-  return <div className="page-content"><div className="metric-grid">{cards.map(card => <div className="metric-card" key={card.label}><i className={`dot ${card.tone}`}/><span>{card.label}</span><strong>{card.value}</strong></div>)}</div><div className="two-column"><section className="panel"><div className="section-heading"><h3>Staging</h3><Badge>{queues?.staging?.length || 0}</Badge></div>{queues?.staging?.map(item => <div className="queue-item" key={item}>{item}</div>) || <Spinner/>}{queues && !queues.staging.length && <Empty title="Staging is clear" detail="No short-term memories are waiting."/>}</section><section className="panel"><div className="section-heading"><h3>Quarantine</h3><Badge>{queues?.quarantine?.length || 0}</Badge></div>{queues?.quarantine?.map(item => <div className="queue-item" key={item}>{item}</div>)}{queues && !queues.quarantine.length && <Empty title="Quarantine is clear" detail="No suspect memories require review."/>}</section></div></div>;
+  const [qErr, setQErr] = useState("");
+  const loadQ = useCallback(() => {api("/api/queues").then(q => {setQueues(q); setQErr("");}).catch(e => setQErr(e.message));}, []);
+  useEffect(() => {loadQ();}, [loadQ]);
+  const cards = [{label: "Indexed", value: snapshot.coverage.indexed, tone: "indexed"}, {label: "Stale", value: snapshot.coverage.stale, tone: "stale"}, {label: "Unindexed", value: snapshot.coverage.unindexed, tone: "unindexed"}, {label: "Coverage unknown", value: snapshot.coverage.unknown, tone: "unknown", hint: HINTS.coverageUnknown}];
+  // One fetch feeds both queues, so a failure shows error + retry in each panel
+  // rather than rendering as two "clear" queues (a healthy-looking lie).
+  const body = (items, emptyTitle, emptyDetail) => qErr
+    ? <InlineError message={qErr} onRetry={loadQ}/>
+    : !queues ? <Spinner label="Loading queue…"/>
+    : items.length ? items.map(item => <div className="queue-item" key={item}>{item}</div>)
+    : <Empty title={emptyTitle} detail={emptyDetail}/>;
+  return <div className="page-content"><div className="metric-grid">{cards.map(card => <div className="metric-card" key={card.label}><i className={`dot ${card.tone}`}/><span>{card.label}{card.hint && <Hint text={card.hint} label={card.label}/>}</span><strong>{card.value}</strong></div>)}</div><div className="two-column"><section className="panel"><div className="section-heading"><h3>Staging<Hint text={HINTS.staging} label="Staging"/></h3><Badge>{queues ? queues.staging.length : "—"}</Badge></div>{body(queues?.staging || [], "Staging is clear", "No short-term memories are waiting.")}</section><section className="panel"><div className="section-heading"><h3>Quarantine<Hint text={HINTS.quarantine} label="Quarantine"/></h3><Badge>{queues ? queues.quarantine.length : "—"}</Badge></div>{body(queues?.quarantine || [], "Quarantine is clear", "No suspect memories require review.")}</section></div></div>;
 }
 
 function fmtAgo(ts) {
@@ -360,85 +417,115 @@ function fmtAgo(ts) {
 
 function LlmPage() {
   const [data, setData] = useState(null);
+  const [dataErr, setDataErr] = useState("");
   const [pending, setPending] = useState(null);
-  const [error, setError] = useState("");
+  const [pendingErr, setPendingErr] = useState("");
   const [paused, setPaused] = useState(false);
-  const load = useCallback(() => {
-    api("/api/atlas/llm?limit=300").then(d => {setData(d); setError("");}).catch(e => setError(e.message));
-    api("/api/atlas/pending").then(setPending).catch(() => {});
-  }, []);
+  const loadData = useCallback(() => {api("/api/atlas/llm?limit=300").then(d => {setData(d); setDataErr("");}).catch(e => setDataErr(e.message));}, []);
+  const loadPending = useCallback(() => {api("/api/atlas/pending").then(p => {setPending(p); setPendingErr("");}).catch(e => setPendingErr(e.message));}, []);
+  const load = useCallback(() => {loadData(); loadPending();}, [loadData, loadPending]);
   useEffect(() => {
     load();
     if (paused) return undefined;
     const id = setInterval(load, 5000);
     return () => clearInterval(id);
   }, [load, paused]);
-  if (error) return <div className="page-content"><Notice>{error}</Notice><button className="action-button" onClick={load}><RefreshCw size={15}/>Retry</button></div>;
-  if (!data) return <Spinner label="Loading LLM activity…"/>;
-  if (data.captured === "unavailable") return <div className="page-content"><Empty title="LLM audit unavailable" detail="The audit module or its log is not present yet. Trigger a generation call, then refresh."/></div>;
-  const events = data.events || [];
-  const loops = data.loops || [];
-  const now = Date.now() / 1000;
-  const recent = events.filter(e => e.kind !== "health" && now - (e.ts || 0) <= 300);
-  const distinct = new Set(recent.map(e => e.digest)).size;
-  const repeatRatio = recent.length ? Math.round((1 - distinct / recent.length) * 100) : 0;
-  const cards = [
-    {label: "Gen calls / 5 min", value: recent.length, tone: "indexed"},
-    {label: "Distinct prompts", value: distinct, tone: "unknown"},
-    {label: "Repeat ratio", value: `${repeatRatio}%`, tone: repeatRatio >= 50 ? "stale" : "indexed"},
-  ];
-  return <div className="page-content">
-    <div className="metric-grid">{cards.map(c => <div className="metric-card" key={c.label}><i className={`dot ${c.tone}`}/><span>{c.label}</span><strong>{c.value}</strong></div>)}</div>
-    <section className="panel">
-      <div className="section-heading"><h3>Pending jobs</h3>
-        <Badge tone={pending?.totals?.graph ? "status-stale" : "ok"}>{pending ? `${pending.totals.graph} graph` : "…"}</Badge>
-        {pending?.totals?.staging ? <Badge tone="status-stale">{pending.totals.staging} staging</Badge> : null}
-        {pending?.totals?.quarantine ? <Badge tone="danger">{pending.totals.quarantine} quarantine</Badge> : null}
-      </div>
-      <p className="panel-hint">Work the daemon still has to do, per store. <strong>Graph</strong> = memories not yet extracted into the graph — each becomes a <code>harvest</code> call below as the sync reaches it. <strong>Staging</strong> awaits consolidation; <strong>quarantine</strong> awaits review.</p>
-      {!pending ? <Spinner/> : pending.slugs.length
+
+  // Pending jobs render independently of the audit log, so a missing audit module
+  // (captured === "unavailable") never hides the daemon's on-disk backlog.
+  const pendingSection = <section className="panel">
+    <div className="section-heading"><h3>Pending jobs</h3>
+      {pending && <div className="badge-row inline">
+        <Badge tone={pending.totals.graph ? "status-stale" : "ok"}>{pending.totals.graph} graph</Badge>
+        {pending.totals.staging ? <Badge tone="status-stale">{pending.totals.staging} staging</Badge> : null}
+        {pending.totals.quarantine ? <Badge tone="danger">{pending.totals.quarantine} quarantine</Badge> : null}
+      </div>}
+    </div>
+    <p className="panel-hint">All stores · on-disk backlog the daemon still has to work through. <strong>Graph</strong> = memories not yet extracted into the graph — each becomes a <code className="tip" tabIndex={0} data-tip={HINTS.harvest} title={HINTS.harvest}>harvest</code> call below as the sync reaches it. <strong>Staging</strong> awaits consolidation; <strong>quarantine</strong> awaits review.</p>
+    {pendingErr ? <InlineError message={pendingErr} onRetry={loadPending}/>
+      : !pending ? <Spinner label="Loading backlog…"/>
+      : pending.slugs.length
         ? <div className="llm-table-wrap"><table className="llm-table">
-            <thead><tr><th>Scope</th><th>Tenant</th><th>Graphed</th><th>On disk</th><th>Graph pending</th><th>Staging</th><th>Quarantine</th></tr></thead>
+            <thead><tr>
+              <th>Scope<Hint text={HINTS.slug} label="Scope"/></th><th>Tenant</th>
+              <th className="num">Graphed<Hint text={HINTS.graphed} label="Graphed"/></th>
+              <th className="num">On disk</th>
+              <th className="num">Graph pending<Hint text={HINTS.graphPending} label="Graph pending"/></th>
+              <th className="num">Staging<Hint text={HINTS.staging} label="Staging"/></th>
+              <th className="num">Quarantine<Hint text={HINTS.quarantine} label="Quarantine"/></th>
+            </tr></thead>
             <tbody>{pending.slugs.map(s => <tr key={s.slug}>
               <td title={s.slug}>{s.label}</td>
               <td>{s.tenant || "—"}</td>
-              <td>{s.graphed}</td>
-              <td>{s.on_disk}</td>
-              <td><Badge tone={s.graph_pending ? "status-stale" : "ok"}>{s.graph_pending}</Badge></td>
-              <td>{s.staging || "—"}</td>
-              <td>{s.quarantine || "—"}</td>
+              <td className="num">{s.graphed}</td>
+              <td className="num">{s.on_disk}</td>
+              <td className="num"><Badge tone={s.graph_pending ? "status-stale" : "ok"}>{s.graph_pending}</Badge></td>
+              <td className="num">{s.staging || "—"}</td>
+              <td className="num">{s.quarantine || "—"}</td>
             </tr>)}</tbody>
           </table></div>
-        : <Empty title="No pending jobs" detail="Every store is fully harvested, consolidated and reviewed."/>}
-    </section>
-    <section className="panel">
-      <div className="section-heading"><h3>Possible loops</h3><Badge tone={loops.length ? "danger" : "ok"}>{loops.length}</Badge></div>
-      <p className="panel-hint">Exact-repeat detector: the same prompt re-sent to the model. Prompts differing only by a timestamp or whitespace won't match; health probes are excluded.</p>
-      {loops.length
-        ? loops.map(g => <Notice key={`${g.digest}-${g.proc}`} tone="warning"><strong>{g.count}×</strong>&nbsp; {g.model || "?"} · {g.role || "—"} · {g.proc} · over {Math.max(1, Math.round((g.last_ts || 0) - (g.first_ts || 0)))}s · <code>{g.digest}</code></Notice>)
-        : <Empty title="No repeated prompts" detail="No identical generation call has recurred in the window."/>}
-    </section>
-    <section className="panel">
-      <div className="section-heading"><h3>Recent calls</h3><Badge>{events.length}</Badge><button className="action-button" onClick={() => setPaused(p => !p)}>{paused ? "Resume" : "Pause"}</button></div>
-      <div className="llm-table-wrap"><table className="llm-table">
-        <thead><tr><th>When</th><th>Caller</th><th>Kind</th><th>Backend</th><th>Model</th><th>Role</th><th>Chars</th><th>ms</th><th>Outcome</th><th>Digest</th></tr></thead>
-        <tbody>
-          {events.map((e, i) => <tr key={i} className={e.kind === "health" ? "llm-health" : ""}>
-            <td title={e.ts ? new Date(e.ts * 1000).toLocaleString() : ""}>{fmtAgo(e.ts)}</td>
-            <td>{e.proc}</td>
-            <td>{e.kind}{e.attempt > 1 ? ` #${e.attempt}` : ""}</td>
-            <td>{e.backend}</td>
-            <td className="llm-mono">{e.model}</td>
-            <td>{e.role || "—"}</td>
-            <td>{e.chars}</td>
-            <td>{e.ms}</td>
-            <td><Badge tone={e.outcome === "ok" ? "ok" : e.outcome === "empty" ? "stale" : "danger"}>{e.outcome}</Badge></td>
-            <td className="llm-mono" title={e.detail || ""}>{e.digest}</td>
-          </tr>)}
-          {!events.length && <tr><td colSpan="10"><Empty title="No calls recorded yet" detail="Generation calls appear here as engram sends them."/></td></tr>}
-        </tbody>
-      </table></div>
-    </section>
+        : <Empty title="No backlog found" detail="No pending work in the current on-disk stores — every one is harvested, consolidated and reviewed."/>}
+  </section>;
+
+  let auditSections;
+  if (dataErr) {
+    auditSections = <InlineError message={dataErr} onRetry={loadData}/>;
+  } else if (!data) {
+    auditSections = <Spinner label="Loading LLM activity…"/>;
+  } else if (data.captured === "unavailable") {
+    auditSections = <Empty title="LLM audit unavailable" detail="The audit module or its log is not present yet. Trigger a generation call, then refresh."/>;
+  } else {
+    const events = data.events || [];
+    const loops = data.loops || [];
+    const now = Date.now() / 1000;
+    const recent = events.filter(e => e.kind !== "health" && now - (e.ts || 0) <= 300);
+    const distinct = new Set(recent.map(e => e.digest)).size;
+    const repeatRatio = recent.length ? Math.round((1 - distinct / recent.length) * 100) : 0;
+    const cards = [
+      {label: "Gen calls / 5 min", value: recent.length, tone: "indexed", hint: HINTS.genWindow},
+      {label: "Distinct prompts", value: distinct, tone: "unknown"},
+      {label: "Repeat ratio", value: `${repeatRatio}%`, tone: repeatRatio >= 50 ? "stale" : "indexed"},
+    ];
+    auditSections = <>
+      <div className="metric-grid metric-grid-3">{cards.map(c => <div className="metric-card" key={c.label}><i className={`dot ${c.tone}`}/><span>{c.label}{c.hint && <Hint text={c.hint} label={c.label}/>}</span><strong>{c.value}</strong></div>)}</div>
+      <section className="panel">
+        <div className="section-heading"><h3>Possible loops</h3><Badge tone={loops.length ? "danger" : "ok"}>{loops.length}</Badge></div>
+        <p className="panel-hint">Exact-repeat detector: the same prompt re-sent to the model. Prompts differing only by a timestamp or whitespace won't match; health probes are excluded.</p>
+        {loops.length
+          ? loops.map(g => <Notice key={`${g.digest}-${g.proc}`} tone="warning"><strong>{g.count}×</strong>&nbsp; {g.model || "?"} · {g.role || "—"} · {g.proc} · over {Math.max(1, Math.round((g.last_ts || 0) - (g.first_ts || 0)))}s · <code>{g.digest}</code></Notice>)
+          : <Empty title="No repeated prompts" detail="No identical generation call has recurred in the window."/>}
+      </section>
+      <section className="panel">
+        <div className="section-heading"><h3>Recent calls</h3><Badge>{events.length}</Badge></div>
+        <div className="llm-table-wrap"><table className="llm-table">
+          <thead><tr><th>When</th><th>Caller</th><th>Kind</th><th>Backend</th><th>Model</th><th>Role</th><th className="num">Chars</th><th className="num">Latency (ms)</th><th>Outcome</th><th>Digest<Hint text={HINTS.digest} label="Digest"/></th></tr></thead>
+          <tbody>
+            {events.map((e, i) => <tr key={i} className={e.kind === "health" ? "llm-health" : ""}>
+              <td><span className="tip" tabIndex={0} data-tip={e.ts ? new Date(e.ts * 1000).toLocaleString() : "unknown"} title={e.ts ? new Date(e.ts * 1000).toLocaleString() : ""}>{fmtAgo(e.ts)}</span></td>
+              <td>{e.proc}</td>
+              <td>{e.kind}{e.attempt > 1 ? ` #${e.attempt}` : ""}</td>
+              <td>{e.backend}</td>
+              <td className="llm-mono">{e.model}</td>
+              <td>{e.role || "—"}</td>
+              <td className="num">{e.chars}</td>
+              <td className="num">{e.ms}</td>
+              <td><Badge tone={e.outcome === "ok" ? "ok" : e.outcome === "empty" ? "stale" : "danger"}>{e.outcome}</Badge></td>
+              <td className="llm-mono" title={e.detail || ""}>{e.digest}</td>
+            </tr>)}
+            {!events.length && <tr><td colSpan="10"><Empty title="No calls recorded yet" detail="Generation calls appear here as engram sends them."/></td></tr>}
+          </tbody>
+        </table></div>
+      </section>
+    </>;
+  }
+
+  return <div className="page-content">
+    <div className="llm-refresh-bar">
+      <span className="refresh-state"><i className={`dot ${paused ? "unindexed" : "indexed"}`}/>{paused ? "Auto-refresh paused" : "Refreshes every 5 seconds"}</span>
+      <button className="action-button" aria-pressed={paused} onClick={() => setPaused(p => !p)}>{paused ? "Resume" : "Pause"}</button>
+    </div>
+    {pendingSection}
+    {auditSections}
   </div>;
 }
 
@@ -447,10 +534,21 @@ function SystemPage() {
   const [stats, setStats] = useState(null);
   const [vector, setVector] = useState(null);
   const [skills, setSkills] = useState(null);
-  useEffect(() => {api("/api/health").then(setHealth); api("/api/graph/stats").then(setStats); api("/api/vector/stats").then(setVector); api("/api/skills").then(setSkills);}, []);
+  const [err, setErr] = useState("");
+  // Health drives the whole page, so its failure is a hard error with retry; the
+  // other probes are supplementary and degrade quietly to "Unavailable".
+  const load = useCallback(() => {
+    setErr("");
+    api("/api/health").then(setHealth).catch(e => setErr(e.message));
+    api("/api/graph/stats").then(setStats).catch(() => setStats(null));
+    api("/api/vector/stats").then(setVector).catch(() => setVector(null));
+    api("/api/skills").then(setSkills).catch(() => setSkills({installed: []}));
+  }, []);
+  useEffect(() => {load();}, [load]);
+  if (err) return <div className="page-content"><InlineError message={err} onRetry={load}/></div>;
   if (!health) return <Spinner label="Checking Engram services…"/>;
   const services = [["Generation", health.generate, health.backend], ["Embeddings", health.embed, health.embed_dim ? `${health.embed_dim} dimensions` : "Unavailable"], ["Neo4j", health.neo4j, stats ? `${stats.entities} entities · ${stats.facts} facts` : "Unavailable"], ["Qdrant", vector?.reachable, vector?.reachable ? `${vector.points} points` : "Unavailable"]];
-  return <div className="page-content"><div className="service-grid">{services.map(([name, ok, detail]) => <div className="service-card" key={name}><div><HeartPulse size={18}/><span>{name}</span></div><Badge tone={ok ? "ok" : "danger"}>{ok ? "Healthy" : "Down"}</Badge><p>{detail}</p></div>)}</div><section className="panel"><div className="section-heading"><h3>Installed skills</h3><span>{skills?.installed?.length || 0} available</span></div><div className="skills-grid">{skills?.installed?.map(skill => <div key={skill.name}><strong>/{skill.name}</strong><p>{skill.description}</p></div>) || <Spinner/>}</div></section></div>;
+  return <div className="page-content"><div className="service-grid">{services.map(([name, ok, detail]) => <div className="service-card" key={name}><div className="card-head"><span className="card-title"><HeartPulse size={18}/>{name}</span><Badge tone={ok ? "ok" : "danger"}>{ok ? "Healthy" : "Down"}</Badge></div><p>{detail}</p></div>)}</div><section className="panel"><div className="section-heading"><h3>Installed skills</h3><span>{skills?.installed?.length || 0} available</span></div><div className="skills-grid">{skills ? skills.installed.map(skill => <div key={skill.name}><strong>/{skill.name}</strong><p>{skill.description}</p></div>) : <Spinner/>}</div></section></div>;
 }
 
 function ModelsPage() {
@@ -470,7 +568,7 @@ function RecommendedModels() {
   const [models, setModels] = useState(null);
   useEffect(() => {api("/api/atlas/models/recommended").then(setModels).catch(() => setModels([]));}, []);
   if (!models || !models.length) return null;
-  return <section className="panel recommendation-panel"><div className="section-heading"><h3>Embedding models to evaluate</h3><span>Each model needs its own index generation</span></div><div className="recommendation-grid">{models.map(model => <div key={model.id}><strong>{model.label}</strong><Badge>{model.dimension}D</Badge><p>{model.use_case}</p></div>)}</div></section>;
+  return <section className="panel recommendation-panel"><div className="section-heading"><h3>Embedding models to evaluate</h3><span>Each model needs its own index generation</span></div><div className="recommendation-grid">{models.map(model => <div key={model.id}><div className="rec-head"><strong>{model.label}</strong><Badge>{model.dimension}D</Badge></div><p>{model.use_case}</p></div>)}</div></section>;
 }
 
 function ConfigPage() {
@@ -519,7 +617,7 @@ function TenantsPage() {
         <div><dt>Agent subtree</dt><dd className="llm-mono">{tenant.agent_subtree}</dd></div>
         <div><dt>Section facts</dt><dd>{tenant.extract_facts ? "extracted" : "off"}</dd></div>
       </dl>
-      <div className="tenant-slugs"><span>Stores</span>{tenant.slugs.length ? tenant.slugs.map(slug => <Badge key={slug} tone="neutral">{slug}</Badge>) : <em>none</em>}</div>
+      <div className="tenant-slugs"><span>Stores<Hint text={HINTS.slug} label="Store"/></span>{tenant.slugs.length ? tenant.slugs.map(slug => <Badge key={slug} tone="neutral">{slug}</Badge>) : <em>none</em>}</div>
       <a className="action-button" href={tenant.wiki_url} target="_blank" rel="noopener noreferrer"><ExternalLink size={15}/>Open wiki</a>
     </article>)}</div>
   </div>;
@@ -537,6 +635,17 @@ function App() {
   // Tenant set drives the per-tenant "Wiki" link; fetched once, non-fatal.
   useEffect(() => {api("/api/atlas/tenants").then(setTenants).catch(() => setTenants(null));}, []);
   useEffect(() => {url.setNode(selected?.kind === "memory" ? selected.id : "");}, [selected]);
+  // Escape backs out of transient overlays: the mobile nav drawer first, then any
+  // open inspector — so keyboard users are never trapped inside one.
+  useEffect(() => {
+    const onKey = event => {
+      if (event.key !== "Escape") return;
+      if (navOpen) setNavOpen(false);
+      else if (selected) setSelected(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [navOpen, selected]);
   const locate = id => {url.setProject("all"); url.setView("atlas"); setSelected({kind: "memory", id});};
   const projects = snapshot?.projects || [];
   // The Wiki link targets the tenant owning the selected project; scope=all or an
