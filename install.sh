@@ -496,7 +496,12 @@ PY
 
 sync_service_binaries(){
   local unit path updated=0
-  for unit in /etc/systemd/system/engram-*.service "$HOME/.config/systemd/user"/engram-*.service; do
+  # The system-unit dir is overridable ONLY so the test can sandbox it. Without
+  # this it was hardcoded, and the glob below scanned the live /etc/systemd/system
+  # even under test — so running the suite copied the test's placeholder binary
+  # over whatever real engram-app a unit here pointed at (e.g. /usr/local/bin).
+  local sysdir="${ENGRAM_SYSTEMD_SYSTEM_DIR:-/etc/systemd/system}"
+  for unit in "$sysdir"/engram-*.service "$HOME/.config/systemd/user"/engram-*.service; do
     [[ -f "$unit" ]] || continue
     while read -r path; do
       [[ -n "$path" ]] || continue
