@@ -1317,7 +1317,9 @@ mod tests {
         std::fs::write(&config_path, &yaml).unwrap();
 
         // Finds the original content.
-        let hit = wiki_search(&config_path, &tenant, "before marker", 5).await.unwrap();
+        let hit = wiki_search(&config_path, &tenant, "before marker", 5)
+            .await
+            .unwrap();
         assert!(
             hit.results.iter().any(|r| r.text.contains("BEFORE")),
             "first search did not find the original page"
@@ -1325,8 +1327,14 @@ mod tests {
 
         // Rewrite with new, longer content: the differing byte length changes the
         // cache key, so the stale entry is dropped and the page re-parsed.
-        std::fs::write(&page, "# Alpha\n\nThe AFTER marker lives here now, extended.\n").unwrap();
-        let hit = wiki_search(&config_path, &tenant, "after marker extended", 5).await.unwrap();
+        std::fs::write(
+            &page,
+            "# Alpha\n\nThe AFTER marker lives here now, extended.\n",
+        )
+        .unwrap();
+        let hit = wiki_search(&config_path, &tenant, "after marker extended", 5)
+            .await
+            .unwrap();
         assert!(
             hit.results.iter().any(|r| r.text.contains("AFTER")),
             "edited content was not served — cache did not invalidate"
@@ -1338,7 +1346,9 @@ mod tests {
 
         // Delete it: the evict branch must drop it from the cache.
         std::fs::remove_file(&page).unwrap();
-        let hit = wiki_search(&config_path, &tenant, "after marker extended", 5).await.unwrap();
+        let hit = wiki_search(&config_path, &tenant, "after marker extended", 5)
+            .await
+            .unwrap();
         assert!(
             hit.results.is_empty(),
             "deleted page still returned from cache: {:?}",
@@ -1917,7 +1927,9 @@ fn local_chunks(tenant: &Tenant, legs: &mut HashMap<String, String>) -> Vec<Loca
     // holding the std `Mutex` across the fs reads neither parks the async
     // executor nor contends — and it keeps "only one re-chunk of a given vault
     // at a time" true if a second caller ever appears.
-    let mut guard = wiki_cache().lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut guard = wiki_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let files = guard.entry(root.clone()).or_default();
 
     let present: HashSet<&String> = paths.iter().collect();
@@ -1960,7 +1972,14 @@ fn local_chunks(tenant: &Tenant, legs: &mut HashMap<String, String>) -> Vec<Loca
             })
             .collect();
         chunks.extend(file_chunks.iter().cloned());
-        files.insert(path.clone(), CachedFile { mtime, size, chunks: file_chunks });
+        files.insert(
+            path.clone(),
+            CachedFile {
+                mtime,
+                size,
+                chunks: file_chunks,
+            },
+        );
     }
     chunks
 }
