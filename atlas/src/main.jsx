@@ -360,9 +360,13 @@ function fmtAgo(ts) {
 
 function LlmPage() {
   const [data, setData] = useState(null);
+  const [pending, setPending] = useState(null);
   const [error, setError] = useState("");
   const [paused, setPaused] = useState(false);
-  const load = useCallback(() => api("/api/atlas/llm?limit=300").then(d => {setData(d); setError("");}).catch(e => setError(e.message)), []);
+  const load = useCallback(() => {
+    api("/api/atlas/llm?limit=300").then(d => {setData(d); setError("");}).catch(e => setError(e.message));
+    api("/api/atlas/pending").then(setPending).catch(() => {});
+  }, []);
   useEffect(() => {
     load();
     if (paused) return undefined;
@@ -385,6 +389,28 @@ function LlmPage() {
   ];
   return <div className="page-content">
     <div className="metric-grid">{cards.map(c => <div className="metric-card" key={c.label}><i className={`dot ${c.tone}`}/><span>{c.label}</span><strong>{c.value}</strong></div>)}</div>
+    <section className="panel">
+      <div className="section-heading"><h3>Pending jobs</h3>
+        <Badge tone={pending?.totals?.graph ? "status-stale" : "ok"}>{pending ? `${pending.totals.graph} graph` : "…"}</Badge>
+        {pending?.totals?.staging ? <Badge tone="status-stale">{pending.totals.staging} staging</Badge> : null}
+        {pending?.totals?.quarantine ? <Badge tone="danger">{pending.totals.quarantine} quarantine</Badge> : null}
+      </div>
+      <p className="panel-hint">Work the daemon still has to do, per store. <strong>Graph</strong> = memories not yet extracted into the graph — each becomes a <code>harvest</code> call below as the sync reaches it. <strong>Staging</strong> awaits consolidation; <strong>quarantine</strong> awaits review.</p>
+      {!pending ? <Spinner/> : pending.slugs.length
+        ? <div className="llm-table-wrap"><table className="llm-table">
+            <thead><tr><th>Scope</th><th>Tenant</th><th>Graphed</th><th>On disk</th><th>Graph pending</th><th>Staging</th><th>Quarantine</th></tr></thead>
+            <tbody>{pending.slugs.map(s => <tr key={s.slug}>
+              <td title={s.slug}>{s.label}</td>
+              <td>{s.tenant || "—"}</td>
+              <td>{s.graphed}</td>
+              <td>{s.on_disk}</td>
+              <td><Badge tone={s.graph_pending ? "status-stale" : "ok"}>{s.graph_pending}</Badge></td>
+              <td>{s.staging || "—"}</td>
+              <td>{s.quarantine || "—"}</td>
+            </tr>)}</tbody>
+          </table></div>
+        : <Empty title="No pending jobs" detail="Every store is fully harvested, consolidated and reviewed."/>}
+    </section>
     <section className="panel">
       <div className="section-heading"><h3>Possible loops</h3><Badge tone={loops.length ? "danger" : "ok"}>{loops.length}</Badge></div>
       <p className="panel-hint">Exact-repeat detector: the same prompt re-sent to the model. Prompts differing only by a timestamp or whitespace won't match; health probes are excluded.</p>

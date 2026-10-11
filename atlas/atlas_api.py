@@ -129,6 +129,31 @@ def _slug_owner():
         return lambda _slug: None
 
 
+def _graphed_count(slug: str) -> int:
+    """How many of a slug's memories are already in the graph, read from the
+    per-slug ingest state (`graph/state/<slug>/insert_state.json`, the "done"
+    set the graph sync writes). 0 when there is no state yet — a slug whose
+    memories have not been harvested into the graph at all, so every one of them
+    is still pending. Never raises: unreadable/absent state counts as 0."""
+    path = GRAPH_ROOT / "state" / slug / "insert_state.json"
+    try:
+        return len((json.loads(path.read_text()).get("done") or {}))
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def _area_count(project_dir: Path, area: str) -> int:
+    """Number of memories waiting in a per-store queue dir (`.staging` =
+    awaiting consolidation, `.quarantine` = awaiting review). Mirrors the base
+    `/api/queues` listing, but per store so the pending view can sum across every
+    slug rather than only the one active store."""
+    d = project_dir / "memory" / area
+    try:
+        return sum(1 for _ in d.glob("*.md")) if d.is_dir() else 0
+    except OSError:
+        return 0
+
+
 def _inventory(scope: str) -> tuple[list[dict], list[dict]]:
     projects = []
     nodes = []
@@ -565,6 +590,44 @@ def atlas_tenants():
         return {"enabled": True, "legacy": False, "suffix": suffix,
                 "tenants": out, "warning": str(exc)[:180]}
     return {"enabled": True, "legacy": False, "suffix": suffix, "tenants": out}
+
+
+@app.get("/api/atlas/pending")
+def atlas_pending():
+    """Backlog of queued daemon work, per store (slug) and grouped by tenant.
+
+    These are the jobs that PRODUCE the calls on this page. `graph` is the
+    graph-harvest backlog: on-disk memories not yet extracted into the graph —
+    each one becomes a `harvest`-role generation call when the graph sync reaches
+    it. `staging` is memories awaiting consolidation (a distill call), and
+    `quarantine` memories awaiting review. Read-only, derived from on-disk state;
+    degrades to zeros rather than 500 if anything is unreadable."""
+    owner = _slug_owner()
+    slugs = []
+    totals = {"graph": 0, "staging": 0, "quarantine": 0}
+    for project_dir in _project_dirs():
+        slug = project_dir.name
+        on_disk = len(_memory_files(project_dir))
+        graphed = _graphed_count(slug)
+        graph_pending = max(0, on_disk - graphed)
+        staging = _area_count(project_dir, ".staging")
+        quarantine = _area_count(project_dir, ".quarantine")
+        totals["graph"] += graph_pending
+        totals["staging"] += staging
+        totals["quarantine"] += quarantine
+        if graph_pending or staging or quarantine:
+            slugs.append({
+                "slug": slug,
+                "label": _project_label(slug),
+                "tenant": owner(slug),
+                "on_disk": on_disk,
+                "graphed": graphed,
+                "graph_pending": graph_pending,
+                "staging": staging,
+                "quarantine": quarantine,
+            })
+    slugs.sort(key=lambda r: (r["graph_pending"], r["staging"], r["quarantine"]), reverse=True)
+    return {"totals": totals, "slugs": slugs}
 
 
 @app.get("/api/atlas/memory")
