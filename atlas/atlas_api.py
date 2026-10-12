@@ -129,17 +129,44 @@ def _slug_owner():
         return lambda _slug: None
 
 
-def _graphed_count(slug: str) -> int:
-    """How many of a slug's memories are already in the graph, read from the
-    per-slug ingest state (`graph/state/<slug>/insert_state.json`, the "done"
-    set the graph sync writes). 0 when there is no state yet — a slug whose
-    memories have not been harvested into the graph at all, so every one of them
-    is still pending. Never raises: unreadable/absent state counts as 0."""
+def _graph_done(slug: str) -> set[str]:
+    """The set of a slug's memory FILENAMES already harvested into the graph, read
+    from the per-slug ingest state (`graph/state/<slug>/insert_state.json`, whose
+    "done" maps filename -> episode uuid). Empty when there is no state yet — a
+    slug whose memories have not been harvested at all. Never raises."""
     path = GRAPH_ROOT / "state" / slug / "insert_state.json"
     try:
-        return len((json.loads(path.read_text()).get("done") or {}))
+        return set((json.loads(path.read_text()).get("done") or {}).keys())
+    except (OSError, ValueError, TypeError, AttributeError):
+        return set()
+
+
+def _stale_count(project_dir: Path, graphed_names: set[str]) -> int:
+    """Among a store's already-harvested files, how many were EDITED since the
+    harvest and so need re-extraction. Measured only where a sha baseline exists:
+    the global `graph/sync_state.json` (filename -> sha256) is keyed by bare
+    filename, which only disambiguates the root store, so this returns 0 for
+    non-root stores (documented limitation — other slugs track no hash). Never
+    raises."""
+    if project_dir.name != "-root" or not graphed_names:
+        return 0
+    try:
+        sync = json.loads((GRAPH_ROOT / "sync_state.json").read_text())
     except (OSError, ValueError, TypeError):
         return 0
+    store = project_dir / "memory"
+    stale = 0
+    for name in graphed_names:
+        expected = sync.get(name)
+        path = store / name
+        if not expected or not path.exists():
+            continue
+        try:
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                stale += 1
+        except OSError:
+            continue
+    return stale
 
 
 def _area_count(project_dir: Path, area: str) -> int:
@@ -545,10 +572,16 @@ def atlas_llm(limit: int = Query(300, ge=1, le=2000),
     exact-repeat / loop detector). Content-free: digests + metadata only. Degrades
     to an empty 'unavailable' payload if the audit module or its log is absent."""
     if _audit is None:
-        return {"events": [], "loops": [], "captured": "unavailable"}
+        return {"events": [], "loops": [], "callers": [], "limit": limit, "captured": "unavailable"}
     events = _audit.tail(limit)
+    # Per-caller roll-up over a wider scan than the tail, so callers buried under
+    # a noisy one (graph_sync dominates the newest rows) stay visible. Guarded:
+    # an older installed audit module without this helper degrades to [].
+    callers = _audit.summarize_callers() if hasattr(_audit, "summarize_callers") else []
     return {"events": events,
             "loops": _audit.detect_loops(events, window, repeats),
+            "callers": callers,
+            "limit": limit,
             "captured": "generation calls (python: engram_llm + graphiti)"}
 
 
@@ -594,40 +627,68 @@ def atlas_tenants():
 
 @app.get("/api/atlas/pending")
 def atlas_pending():
-    """Backlog of queued daemon work, per store (slug) and grouped by tenant.
+    """Backlog of queued daemon work, per store (slug) and rolled up by tenant.
 
     These are the jobs that PRODUCE the calls on this page. `graph` is the
     graph-harvest backlog: on-disk memories not yet extracted into the graph —
-    each one becomes a `harvest`-role generation call when the graph sync reaches
-    it. `staging` is memories awaiting consolidation (a distill call), and
-    `quarantine` memories awaiting review. Read-only, derived from on-disk state;
-    degrades to zeros rather than 500 if anything is unreadable."""
+    each becomes a `harvest`-role generation call when the graph sync reaches it.
+    `stale` is already-graphed memories edited since harvest, so they need
+    re-extraction (measured for the root store only — see `_stale_count`).
+    `staging` is memories awaiting consolidation (a distill call) and `quarantine`
+    memories awaiting review. EVERY store is returned (even fully-drained ones) so
+    the operator can confirm nothing is hidden. Read-only, derived from on-disk
+    state; degrades to zeros rather than 500 if anything is unreadable."""
     owner = _slug_owner()
-    slugs = []
-    totals = {"graph": 0, "staging": 0, "quarantine": 0}
+    stores = []
+    totals = {"graph": 0, "stale": 0, "staging": 0, "quarantine": 0, "pending": 0}
+    tenant_rollup: dict[str, dict] = {}
     for project_dir in _project_dirs():
         slug = project_dir.name
-        on_disk = len(_memory_files(project_dir))
-        graphed = _graphed_count(slug)
-        graph_pending = max(0, on_disk - graphed)
+        names = {p.name for p in _memory_files(project_dir)}
+        on_disk = len(names)
+        done = _graph_done(slug)
+        graphed_here = done & names
+        graphed = len(graphed_here)
+        graph_pending = len(names - done)             # true set-difference, not a count subtraction
+        stale = _stale_count(project_dir, graphed_here)
         staging = _area_count(project_dir, ".staging")
         quarantine = _area_count(project_dir, ".quarantine")
+        pending_total = graph_pending + stale + staging + quarantine
+        tenant = owner(slug)
         totals["graph"] += graph_pending
+        totals["stale"] += stale
         totals["staging"] += staging
         totals["quarantine"] += quarantine
-        if graph_pending or staging or quarantine:
-            slugs.append({
-                "slug": slug,
-                "label": _project_label(slug),
-                "tenant": owner(slug),
-                "on_disk": on_disk,
-                "graphed": graphed,
-                "graph_pending": graph_pending,
-                "staging": staging,
-                "quarantine": quarantine,
-            })
-    slugs.sort(key=lambda r: (r["graph_pending"], r["staging"], r["quarantine"]), reverse=True)
-    return {"totals": totals, "slugs": slugs}
+        totals["pending"] += pending_total
+        stores.append({
+            "slug": slug,
+            "label": _project_label(slug),
+            "tenant": tenant,
+            "on_disk": on_disk,
+            "graphed": graphed,
+            "graph_pending": graph_pending,
+            "stale": stale,
+            "staging": staging,
+            "quarantine": quarantine,
+            "pending_total": pending_total,
+        })
+        key = tenant or "—"
+        bucket = tenant_rollup.get(key)
+        if bucket is None:
+            tenant_rollup[key] = bucket = {"tenant": tenant, "label": tenant or "Untenanted",
+                                           "stores": 0, "graph": 0, "stale": 0, "staging": 0,
+                                           "quarantine": 0, "pending_total": 0}
+        bucket["stores"] += 1
+        bucket["graph"] += graph_pending
+        bucket["stale"] += stale
+        bucket["staging"] += staging
+        bucket["quarantine"] += quarantine
+        bucket["pending_total"] += pending_total
+    # Pending-first, then by name, so the operator sees work up top but can still
+    # scroll to confirm the drained stores are present.
+    stores.sort(key=lambda r: (-r["pending_total"], r["slug"]))
+    tenants = sorted(tenant_rollup.values(), key=lambda t: (-t["pending_total"], t["label"]))
+    return {"totals": totals, "stores": stores, "tenants": tenants}
 
 
 @app.get("/api/atlas/memory")

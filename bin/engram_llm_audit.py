@@ -278,3 +278,57 @@ def detect_loops(events: list[dict], window_s: int = 300, threshold: int = 3) ->
         return flagged
     except Exception:
         return []
+
+
+def summarize_callers(max_bytes: int = 6 * 1024 * 1024) -> list[dict]:
+    """Per-caller (proc) roll-up over a WIDE tail of the log — current file plus
+    the rotated `.1` — so every process that has used the model recently stays
+    visible even when one noisy caller (e.g. graph_sync) saturates the newest
+    rows that `tail` returns. Read-only, off the write hot path; never raises.
+
+    Each entry: {proc, count, ok, empty, error, health, last_ts, roles:{role:n}},
+    sorted by count desc. `max_bytes` bounds the scan so cost stays flat as the
+    log grows (rotation keeps each file under the budget)."""
+    try:
+        lock_fd = os.open(str(_lock_path()), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        lock_fd = None
+    try:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_SH)
+            except OSError:
+                pass
+        path = _log_path()
+        events = _parse(_read_tail_bytes(path, max_bytes).splitlines())
+        older = _parse(_read_tail_bytes(Path(str(path) + ".1"), max_bytes).splitlines())
+        agg: dict[str, dict] = {}
+        for event in older + events:
+            proc = event.get("proc") or "?"
+            row = agg.get(proc)
+            if row is None:
+                agg[proc] = row = {"proc": proc, "count": 0, "ok": 0, "empty": 0,
+                                   "error": 0, "health": 0, "last_ts": 0, "roles": {}}
+            row["count"] += 1
+            if event.get("kind") == "health":
+                row["health"] += 1
+            else:
+                outcome = event.get("outcome")
+                row["ok" if outcome == "ok" else "empty" if outcome == "empty" else "error"] += 1
+            ts = event.get("ts")
+            if isinstance(ts, (int, float)) and ts > row["last_ts"]:
+                row["last_ts"] = ts
+            role = event.get("role")
+            if role:
+                row["roles"][role] = row["roles"].get(role, 0) + 1
+        out = list(agg.values())
+        out.sort(key=lambda r: r["count"], reverse=True)
+        return out
+    except Exception:
+        return []
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)

@@ -300,6 +300,17 @@ button, select { cursor: pointer; }
 .llm-table .llm-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
 .llm-table tr.llm-health td { color: var(--subtle); opacity: .7; }
 
+/* LLM Calls — sub-sections, cleared rows, inline controls */
+.sub-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 18px 0 9px; }
+.sub-heading h4 { margin: 0; color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .01em; }
+.llm-table tr.cleared td { color: var(--subtle); opacity: .62; }
+.cell-zero { color: var(--subtle); opacity: .6; }
+.toggle-inline { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; cursor: pointer; }
+.toggle-inline input { accent-color: var(--accent); }
+.recent-controls { display: flex; align-items: center; gap: 12px; }
+.mini-select { display: inline-flex; align-items: center; gap: 6px; color: var(--subtle); font-size: 11px; }
+.mini-select select { height: 30px; padding: 0 8px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 7px; }
+
 /* LLM Calls — refresh bar + inline provenance/source chips */
 .llm-refresh-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 16px; padding: 9px 13px; color: var(--muted); background: var(--surface); border: 1px solid var(--border); border-radius: 10px; font-size: 11.5px; }
 .refresh-state { display: inline-flex; align-items: center; gap: 8px; }

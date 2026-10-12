@@ -23,7 +23,9 @@ const HINTS = {
   slug: "The store ID used for its directory and tenant routing.",
   graphed: "Memories recorded as processed by graph sync.",
   graphPending: "On-disk memories still waiting for graph extraction.",
+  stale: "Already graphed but edited since — needs re-extraction. Measured for the root store only.",
   harvest: "A model call that extracts graph entities and facts from a memory.",
+  caller: "The process that made the model calls. Counts span a wide tail of the audit log, so every recent caller is visible even when one dominates the newest rows.",
   staging: "Short-term memories waiting for consolidation.",
   quarantine: "Memories held for review.",
   coverageUnknown: "Graph coverage is not measured for this store.",
@@ -421,7 +423,10 @@ function LlmPage() {
   const [pending, setPending] = useState(null);
   const [pendingErr, setPendingErr] = useState("");
   const [paused, setPaused] = useState(false);
-  const loadData = useCallback(() => {api("/api/atlas/llm?limit=300").then(d => {setData(d); setDataErr("");}).catch(e => setDataErr(e.message));}, []);
+  const [limit, setLimit] = useState(300);
+  const [callerFilter, setCallerFilter] = useState("all");
+  const [hideCleared, setHideCleared] = useState(false);
+  const loadData = useCallback(() => {api(`/api/atlas/llm?limit=${limit}`).then(d => {setData(d); setDataErr("");}).catch(e => setDataErr(e.message));}, [limit]);
   const loadPending = useCallback(() => {api("/api/atlas/pending").then(p => {setPending(p); setPendingErr("");}).catch(e => setPendingErr(e.message));}, []);
   const load = useCallback(() => {loadData(); loadPending();}, [loadData, loadPending]);
   useEffect(() => {
@@ -433,38 +438,64 @@ function LlmPage() {
 
   // Pending jobs render independently of the audit log, so a missing audit module
   // (captured === "unavailable") never hides the daemon's on-disk backlog.
+  const stores = pending?.stores || [];
+  const shownStores = hideCleared ? stores.filter(s => s.pending_total > 0) : stores;
+  const num = (v, tone = "status-stale") => v ? <Badge tone={tone}>{v}</Badge> : <span className="cell-zero">0</span>;
   const pendingSection = <section className="panel">
     <div className="section-heading"><h3>Pending jobs</h3>
       {pending && <div className="badge-row inline">
         <Badge tone={pending.totals.graph ? "status-stale" : "ok"}>{pending.totals.graph} graph</Badge>
+        {pending.totals.stale ? <Badge tone="status-stale">{pending.totals.stale} stale</Badge> : null}
         {pending.totals.staging ? <Badge tone="status-stale">{pending.totals.staging} staging</Badge> : null}
         {pending.totals.quarantine ? <Badge tone="danger">{pending.totals.quarantine} quarantine</Badge> : null}
+        {pending.totals.pending === 0 ? <Badge tone="ok">all clear</Badge> : null}
       </div>}
     </div>
-    <p className="panel-hint">All stores · on-disk backlog the daemon still has to work through. <strong>Graph</strong> = memories not yet extracted into the graph — each becomes a <code className="tip" tabIndex={0} data-tip={HINTS.harvest} title={HINTS.harvest}>harvest</code> call below as the sync reaches it. <strong>Staging</strong> awaits consolidation; <strong>quarantine</strong> awaits review.</p>
+    <p className="panel-hint">Every store's on-disk backlog the daemon still has to work through. <strong>Graph</strong> = memories not yet extracted into the graph — each becomes a <code className="tip" tabIndex={0} data-tip={HINTS.harvest} title={HINTS.harvest}>harvest</code> call below as the sync reaches it. <strong>Stale</strong> was graphed but edited since; <strong>staging</strong> awaits consolidation; <strong>quarantine</strong> awaits review.</p>
     {pendingErr ? <InlineError message={pendingErr} onRetry={loadPending}/>
       : !pending ? <Spinner label="Loading backlog…"/>
-      : pending.slugs.length
-        ? <div className="llm-table-wrap"><table className="llm-table">
-            <thead><tr>
-              <th>Scope<Hint text={HINTS.slug} label="Scope"/></th><th>Tenant</th>
-              <th className="num">Graphed<Hint text={HINTS.graphed} label="Graphed"/></th>
-              <th className="num">On disk</th>
-              <th className="num">Graph pending<Hint text={HINTS.graphPending} label="Graph pending"/></th>
-              <th className="num">Staging<Hint text={HINTS.staging} label="Staging"/></th>
-              <th className="num">Quarantine<Hint text={HINTS.quarantine} label="Quarantine"/></th>
-            </tr></thead>
-            <tbody>{pending.slugs.map(s => <tr key={s.slug}>
-              <td title={s.slug}>{s.label}</td>
-              <td>{s.tenant || "—"}</td>
-              <td className="num">{s.graphed}</td>
-              <td className="num">{s.on_disk}</td>
-              <td className="num"><Badge tone={s.graph_pending ? "status-stale" : "ok"}>{s.graph_pending}</Badge></td>
-              <td className="num">{s.staging || "—"}</td>
-              <td className="num">{s.quarantine || "—"}</td>
+      : <>
+        {pending.tenants.length > 1 && <>
+          <div className="sub-heading"><h4>By tenant</h4></div>
+          <div className="llm-table-wrap"><table className="llm-table">
+            <thead><tr><th>Tenant</th><th className="num">Stores</th><th className="num">Graph</th><th className="num">Stale</th><th className="num">Staging</th><th className="num">Quarantine</th><th className="num">Pending</th></tr></thead>
+            <tbody>{pending.tenants.map(t => <tr key={t.label} className={t.pending_total ? "" : "cleared"}>
+              <td>{t.label}</td>
+              <td className="num">{t.stores}</td>
+              <td className="num">{num(t.graph)}</td>
+              <td className="num">{num(t.stale)}</td>
+              <td className="num">{num(t.staging)}</td>
+              <td className="num">{num(t.quarantine, "danger")}</td>
+              <td className="num"><strong>{t.pending_total}</strong></td>
             </tr>)}</tbody>
           </table></div>
-        : <Empty title="No backlog found" detail="No pending work in the current on-disk stores — every one is harvested, consolidated and reviewed."/>}
+        </>}
+        <div className="sub-heading"><h4>By store</h4>
+          <label className="toggle-inline"><input type="checkbox" checked={hideCleared} onChange={e => setHideCleared(e.target.checked)}/>Hide cleared</label>
+        </div>
+        <div className="llm-table-wrap"><table className="llm-table">
+          <thead><tr>
+            <th>Store<Hint text={HINTS.slug} label="Store"/></th><th>Tenant</th>
+            <th className="num">Graphed<Hint text={HINTS.graphed} label="Graphed"/></th>
+            <th className="num">On disk</th>
+            <th className="num">Graph pending<Hint text={HINTS.graphPending} label="Graph pending"/></th>
+            <th className="num">Stale<Hint text={HINTS.stale} label="Stale"/></th>
+            <th className="num">Staging<Hint text={HINTS.staging} label="Staging"/></th>
+            <th className="num">Quarantine<Hint text={HINTS.quarantine} label="Quarantine"/></th>
+          </tr></thead>
+          <tbody>{shownStores.map(s => <tr key={s.slug} className={s.pending_total ? "" : "cleared"}>
+            <td title={s.slug}>{s.label}</td>
+            <td>{s.tenant || "—"}</td>
+            <td className="num">{s.graphed}</td>
+            <td className="num">{s.on_disk}</td>
+            <td className="num">{num(s.graph_pending)}</td>
+            <td className="num">{num(s.stale)}</td>
+            <td className="num">{num(s.staging)}</td>
+            <td className="num">{num(s.quarantine, "danger")}</td>
+          </tr>)}
+          {!shownStores.length && <tr><td colSpan="8"><Empty title="No pending work" detail="Every store is harvested, consolidated and reviewed."/></td></tr>}</tbody>
+        </table></div>
+      </>}
   </section>;
 
   let auditSections;
@@ -477,6 +508,8 @@ function LlmPage() {
   } else {
     const events = data.events || [];
     const loops = data.loops || [];
+    const callers = data.callers || [];
+    const filteredEvents = callerFilter === "all" ? events : events.filter(e => e.proc === callerFilter);
     const now = Date.now() / 1000;
     const recent = events.filter(e => e.kind !== "health" && now - (e.ts || 0) <= 300);
     const distinct = new Set(recent.map(e => e.digest)).size;
@@ -496,11 +529,36 @@ function LlmPage() {
           : <Empty title="No repeated prompts" detail="No identical generation call has recurred in the window."/>}
       </section>
       <section className="panel">
-        <div className="section-heading"><h3>Recent calls</h3><Badge>{events.length}</Badge></div>
+        <div className="section-heading"><h3>Callers<Hint text={HINTS.caller} label="Callers"/></h3><Badge>{callers.length}</Badge></div>
+        <p className="panel-hint">Every process that has recently called the model, so a quiet caller stays visible even when one noisy caller dominates the stream below.</p>
+        {callers.length
+          ? <div className="llm-table-wrap"><table className="llm-table">
+              <thead><tr><th>Caller</th><th className="num">Calls</th><th>Last seen</th><th className="num">OK</th><th className="num">Empty</th><th className="num">Error</th><th className="num">Health</th><th>Roles</th></tr></thead>
+              <tbody>{callers.map(c => <tr key={c.proc}>
+                <td className="llm-mono">{c.proc}</td>
+                <td className="num">{c.count}</td>
+                <td><span className="tip" tabIndex={0} data-tip={c.last_ts ? new Date(c.last_ts * 1000).toLocaleString() : "unknown"} title={c.last_ts ? new Date(c.last_ts * 1000).toLocaleString() : ""}>{fmtAgo(c.last_ts)}</span></td>
+                <td className="num">{c.ok || "—"}</td>
+                <td className="num">{c.empty || "—"}</td>
+                <td className="num">{c.error ? <Badge tone="danger">{c.error}</Badge> : "—"}</td>
+                <td className="num">{c.health || "—"}</td>
+                <td>{Object.keys(c.roles || {}).join(", ") || "—"}</td>
+              </tr>)}</tbody>
+            </table></div>
+          : <Empty title="No callers recorded" detail="No process has logged a model call yet."/>}
+      </section>
+      <section className="panel">
+        <div className="section-heading"><h3>Recent calls</h3>
+          <div className="recent-controls">
+            <label className="mini-select">Caller<select value={callerFilter} onChange={e => setCallerFilter(e.target.value)}><option value="all">All ({events.length})</option>{callers.map(c => <option key={c.proc} value={c.proc}>{c.proc}</option>)}</select></label>
+            <label className="mini-select">Load<select value={limit} onChange={e => setLimit(Number(e.target.value))}><option value={300}>300</option><option value={1000}>1000</option><option value={2000}>2000</option></select></label>
+          </div>
+        </div>
+        <p className="panel-hint">Showing the newest {filteredEvents.length}{callerFilter !== "all" ? ` ${callerFilter}` : ""} of {events.length} fetched calls. Buried callers may need a higher Load; use the Callers table above for complete counts.</p>
         <div className="llm-table-wrap"><table className="llm-table">
           <thead><tr><th>When</th><th>Caller</th><th>Kind</th><th>Backend</th><th>Model</th><th>Role</th><th className="num">Chars</th><th className="num">Latency (ms)</th><th>Outcome</th><th>Digest<Hint text={HINTS.digest} label="Digest"/></th></tr></thead>
           <tbody>
-            {events.map((e, i) => <tr key={i} className={e.kind === "health" ? "llm-health" : ""}>
+            {filteredEvents.map((e, i) => <tr key={i} className={e.kind === "health" ? "llm-health" : ""}>
               <td><span className="tip" tabIndex={0} data-tip={e.ts ? new Date(e.ts * 1000).toLocaleString() : "unknown"} title={e.ts ? new Date(e.ts * 1000).toLocaleString() : ""}>{fmtAgo(e.ts)}</span></td>
               <td>{e.proc}</td>
               <td>{e.kind}{e.attempt > 1 ? ` #${e.attempt}` : ""}</td>
@@ -512,7 +570,7 @@ function LlmPage() {
               <td><Badge tone={e.outcome === "ok" ? "ok" : e.outcome === "empty" ? "stale" : "danger"}>{e.outcome}</Badge></td>
               <td className="llm-mono" title={e.detail || ""}>{e.digest}</td>
             </tr>)}
-            {!events.length && <tr><td colSpan="10"><Empty title="No calls recorded yet" detail="Generation calls appear here as engram sends them."/></td></tr>}
+            {!filteredEvents.length && <tr><td colSpan="10"><Empty title="No calls to show" detail={callerFilter === "all" ? "Generation calls appear here as engram sends them." : `No ${callerFilter} calls in the fetched window — try a higher Load.`}/></td></tr>}
           </tbody>
         </table></div>
       </section>
