@@ -257,6 +257,22 @@ def _score(p: Path, scores) -> float:
     return float(scores.get(p.name, 0.0))
 
 
+def _ensure_vector_python():
+    """Re-exec under the vector venv when qdrant-client is not importable here."""
+    try:
+        import qdrant_client  # noqa: F401
+        return
+    except ImportError:
+        pass
+    vpy = os.environ.get("ENGRAM_VECTOR_PYTHON") or str(Path.home() / ".claude/vector/venv/bin/python")
+    if os.environ.get("ENGRAM_CURATE_REEXEC") != "1" and Path(vpy).is_file():
+        os.environ["ENGRAM_CURATE_REEXEC"] = "1"      # one hop only: a broken venv must not loop
+        os.execv(vpy, [vpy, str(Path(__file__).resolve()), *sys.argv[1:]])
+    print(f"[auto-curate] ERROR: qdrant-client not importable by {sys.executable} "
+          f"(vector venv: {vpy})", file=sys.stderr)
+    sys.exit(2)
+
+
 def main():
     apply = "--apply" in sys.argv
     cfg = memory_ai.load()
@@ -272,14 +288,18 @@ def main():
     except Exception:
         scores = {}
 
-    # deterministic near-dup pairs via the Qdrant ANN finder
+    # deterministic near-dup pairs via the Qdrant ANN finder. qdrant-client lives in the
+    # vector venv, not the system python the memory-tidy skill invokes: re-exec there
+    # once. A store we cannot reach is a FAILURE (exit 2), never "nothing to do" — that
+    # exit-0 message hid a dead curator for weeks.
+    _ensure_vector_python()
     try:
         from vector_store import EngramVectorStore
         store = EngramVectorStore(cfg); store.ensure_collection()
         pairs = store.find_duplicates(threshold=ac["merge_threshold"], max_pairs=100)
     except Exception as e:
-        print(f"[auto-curate] vector store unavailable ({e}) — nothing to do.")
-        return
+        print(f"[auto-curate] ERROR: vector store unavailable ({e})", file=sys.stderr)
+        sys.exit(2)
 
     clusters = _clusters(pairs, ac["merge_threshold"])
     # SAME-type only (never merge a feedback into a project); require all files present
