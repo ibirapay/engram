@@ -7,7 +7,7 @@
 #      to lossily rewrite a commented gateway file when ruamel is absent;
 #   2. the middleware uses INLINE users (not usersFile) — the gateway mounts
 #      individual files, so a usersFile would be invisible in the container;
-#   3. "web only": no auth is bolted onto the loopback engram-app / API / CLI.
+#   3. the gateway auth is additive: the loopback APIs keep their own token.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INSTALL="$ROOT/install.sh"
@@ -66,11 +66,13 @@ fi
 grep -Eq '^\s+usersFile:' "$INSTALL" && fail "install.sh emits a usersFile: key (not mounted in the gateway container) — use inline users"
 grep -Eq '^\s+users:\s*$' "$INSTALL" || fail "install.sh web-auth middleware does not emit an inline 'users:' key"
 
-# 3. web-only: the Rust API/app must carry NO request auth (no Authorization/401
-#    gate). engram's loopback surface stays open by design.
-if grep -rnE '\b(WWW-Authenticate|StatusCode::UNAUTHORIZED|401 Unauthorized)\b' "$ROOT/crates/engram-app/src/" 2>/dev/null | grep -v test; then
-  fail "engram-app grew request auth — web auth must live at the gateway only"
-fi
+# 3. the gateway layer is ADDITIVE: the loopback APIs keep their own bearer
+#    token (#37). A loopback bind is no barrier against a web page that
+#    DNS-rebinds its name to 127.0.0.1, and the gateway never sees that request.
+grep -q 'fn authorized' "$ROOT/crates/engram-app/src/main.rs" \
+  || fail "engram-app lost its bearer-token gate (DNS-rebinding defense)"
+grep -q 'def api_token' "$ROOT/bin/engram_api.py" \
+  || fail "engram_api lost its token gate (DNS-rebinding defense)"
 
 echo "PASS test_web_auth"
 exit 0

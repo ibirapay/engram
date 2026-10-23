@@ -4,15 +4,17 @@
 # dynamic-config dir and wires it up. Kept here as the reviewable source of truth.
 #
 # THE MODEL (one credential, web-only):
-#   - engram's atlas dashboard (engram.home.arpa -> 127.0.0.1:8765) has no built-in
-#     auth, and its config editor can change engram.yaml — so over the LAN it must
-#     sit behind this basicAuth middleware. The installer attaches `engram-auth`
+#   - engram's atlas dashboard (engram.home.arpa -> 127.0.0.1:8765) can change
+#     engram.yaml from its config editor, so over the LAN it also sits behind this
+#     basicAuth middleware. The installer attaches `engram-auth`
 #     to the existing `engram` router in the gateway's tls.yml.
 #   - SilverBullet is NOT fronted by this middleware (that would double-prompt);
 #     instead each instance's own SB_USER is set to the SAME user:password, so one
 #     credential logs you into both. See silverbullet/README.md.
-#   - "Web only": this lives at the gateway. The loopback API (127.0.0.1:8787),
-#     the CLI, the MCP server and the daemon are unaffected — they never cross it.
+#   - This layer is for LAN access and is additive: both loopback APIs (atlas
+#     :8765, engram-app :8787) still require their own token (#37), because a
+#     web page can DNS-rebind its name to 127.0.0.1 and never cross the gateway.
+#     The CLI, the MCP server and the daemon do not use HTTP and are unaffected.
 #
 # bcrypt (htpasswd -nbB), the same scheme the gateway's hermes router uses.
 #
