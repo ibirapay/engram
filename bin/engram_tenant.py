@@ -62,9 +62,45 @@ def tenancy_enabled(cfg=None) -> bool:
     return bool((_cfg(cfg).get("tenants") or {}))
 
 
+def is_store_component(slug: str) -> bool:
+    """Mirrors engram_paths::is_store_component: a slug is joined onto
+    ``projects/`` as ONE directory name, so ``..``, ``/abs`` or ``a/b`` would make
+    a store path that leaves the projects root."""
+    return bool(slug) and slug not in (".", "..") and not any(c in slug for c in "/\\\0")
+
+
+def _validate(block: dict) -> None:
+    """The isolation rules Rust's Config::validate enforces at load, so a Python
+    process never runs on a config every Rust binary would refuse."""
+    vaults, owners = {}, {}
+    for name, entry in block.items():
+        if name == LEGACY_GRAPH_GROUP:
+            raise TenantError(f"tenant name {name!r} is reserved: it is the legacy shared graph group")
+        for slug in (entry or {}).get("slugs") or []:
+            slug = str(slug).strip()
+            if not is_store_component(slug):
+                raise TenantError(f"tenant {name!r} slug {slug!r} must be one directory name")
+            if owners.setdefault(slug, name) != name:
+                raise TenantError(f"slug {slug!r} is claimed by both {owners[slug]!r} and {name!r}; "
+                                  "a memory store belongs to exactly one tenant")
+        vault = ((entry or {}).get("vault") or "").strip()
+        if vault:
+            try:  # must exist now: a later-created path could be a symlink into another vault
+                real = Path(vault).resolve(strict=True)
+            except OSError as error:
+                raise TenantError(f"tenant {name!r} vault {vault!r} must be an existing directory: {error}")
+            for other, first in vaults.items():
+                if real == other or other in real.parents or real in other.parents:
+                    raise TenantError(f"vault {vault!r} overlaps the vault of {first!r}; "
+                                      "tenant vaults must be disjoint directories")
+            vaults[real] = name
+
+
 def _tenants(cfg) -> dict:
     block = cfg.get("tenants") or {}
-    return block if isinstance(block, dict) else {}
+    block = block if isinstance(block, dict) else {}
+    _validate(block)
+    return block
 
 
 class Tenant:
@@ -110,6 +146,12 @@ class Tenant:
         return self.is_legacy or (slug or "").strip() in self.slugs
 
     def choose_slug(self, cli=None, derived="") -> str:
+        slug = self._choose_slug(cli, derived)
+        if not is_store_component(slug):
+            raise TenantError(f"memory store {slug!r} is not a single directory name")
+        return slug
+
+    def _choose_slug(self, cli=None, derived="") -> str:
         """Which of this tenant's stores to use.
 
         Mirrors ``Tenant::choose_slug``. The derived slug comes from the working

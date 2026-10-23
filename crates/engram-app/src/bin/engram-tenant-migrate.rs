@@ -283,6 +283,17 @@ async fn run(args: Args) -> Result<(), String> {
         }
         match claimants.into_iter().next() {
             None => println!("  no episode maps to a tenant — leaving the group alone"),
+            // Attribution only sees claimed stores, so an unassigned store's
+            // episodes look like orphans; relabelling the whole group would hand
+            // that identity's facts to this tenant. --allow-unassigned leaves
+            // data where it is, it never adopts it.
+            Some(_) if !unassigned.is_empty() => println!(
+                "  NOT relabelling group '{}': {} store(s) belong to no tenant and may own \
+                 episodes in it; assign them, or re-insert per tenant from the cached \
+                 extractions (memory_graph_insert.py --tenant <name> --only <files>)",
+                args.from_group,
+                unassigned.len()
+            ),
             Some(name) => {
                 let tenant = Tenant::resolve(&config, Some(name)).map_err(|e| e.to_string())?;
                 println!(

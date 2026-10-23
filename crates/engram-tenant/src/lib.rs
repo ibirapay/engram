@@ -32,7 +32,8 @@ use thiserror::Error;
 /// Graphiti's historical single group, used by every memory inserted before
 /// tenancy existed. Retained ONLY for the legacy tenant; a named tenant uses its
 /// own name as the group, which is what stops the graph leg crossing identities.
-pub const LEGACY_GRAPH_GROUP: &str = "canonical";
+/// Defined in engram-config, which reserves it as a tenant name.
+pub use engram_config::LEGACY_GRAPH_GROUP;
 
 /// Everything a binary needs before it may touch a store.
 pub struct Resolved {
@@ -168,6 +169,8 @@ pub enum TenantError {
          or pass --tenant explicitly"
     )]
     UnownedStore { slug: String, available: String },
+    #[error("memory store '{slug}' is not a single directory name")]
+    InvalidSlug { slug: String },
     #[error("tenant '{tenant}' has no vault configured")]
     NoVault { tenant: String },
     #[error("vault for tenant '{tenant}' is not readable at {path}: {detail}")]
@@ -355,6 +358,18 @@ impl Tenant {
     /// itself, which is never done. A tenant with several stores and no usable
     /// hint is told to pick.
     pub fn choose_slug(&self, cli: Option<&str>, derived: &str) -> Result<String, TenantError> {
+        let slug = self.choose_slug_unchecked(cli, derived)?;
+        if !engram_paths::is_store_component(&slug) {
+            return Err(TenantError::InvalidSlug { slug });
+        }
+        Ok(slug)
+    }
+
+    fn choose_slug_unchecked(
+        &self,
+        cli: Option<&str>,
+        derived: &str,
+    ) -> Result<String, TenantError> {
         if let Some(slug) = cli.map(str::trim).filter(|slug| !slug.is_empty()) {
             if !self.owns_slug(slug) {
                 return Err(TenantError::ForeignSlug {
@@ -385,6 +400,11 @@ impl Tenant {
     /// could ask one agent's process to read another's store.
     pub fn graph_scope(&self, slug: &str) -> Result<GraphScope, TenantError> {
         let slug = slug.trim();
+        if !engram_paths::is_store_component(slug) {
+            return Err(TenantError::InvalidSlug {
+                slug: slug.to_string(),
+            });
+        }
         if !self.owns_slug(slug) {
             return Err(TenantError::ForeignSlug {
                 tenant: self.label().to_string(),
@@ -556,8 +576,26 @@ fn canonicalize_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Fixtures name vaults like `/vaults/work`; validation now requires them to
+    /// exist, so create each under a private temp root and point the YAML there.
+    fn real_vaults(yaml: &str) -> String {
+        let root = std::env::temp_dir().join(format!("engram-test-vaults-{}", std::process::id()));
+        let mut out = String::new();
+        for line in yaml.lines() {
+            match line.split_once("vault: ") {
+                Some((head, path)) if path.starts_with("/v") => {
+                    let real = root.join(path.trim_start_matches('/'));
+                    std::fs::create_dir_all(&real).unwrap();
+                    out += &format!("{head}vault: {}\n", real.display());
+                }
+                _ => out += &format!("{line}\n"),
+            }
+        }
+        out
+    }
+
     fn config(yaml: &str) -> Config {
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = serde_yaml::from_str(&real_vaults(yaml)).unwrap();
         config.validate().unwrap();
         config
     }
@@ -815,6 +853,25 @@ mod tests {
         let scope = tenant.graph_scope("-root-anything").unwrap();
         assert_eq!(scope.slug(), "-root-anything");
         assert_eq!(scope.tenant(), LEGACY_GRAPH_GROUP);
+    }
+
+    /// The legacy tenant owns every slug, so the slug's SHAPE is the only thing
+    /// standing between an MCP caller and a path outside `projects/`.
+    #[test]
+    fn a_slug_that_is_not_one_directory_name_is_refused() {
+        let tenant = Tenant::resolve(&config("backend: ollama\n"), None).unwrap();
+        for bad in ["..", ".", "../../etc", "/abs", "a/b", "a\\b"] {
+            assert!(
+                matches!(
+                    tenant.choose_slug(Some(bad), "-root"),
+                    Err(TenantError::InvalidSlug { .. })
+                ),
+                "{bad}"
+            );
+            assert!(tenant.graph_scope(bad).is_err(), "{bad}");
+        }
+        // a derived slug is held to the same rule
+        assert!(tenant.choose_slug(None, "..").is_err());
     }
 
     /// A vault fixture, so the containment tests exercise real symlinks rather

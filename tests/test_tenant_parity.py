@@ -169,6 +169,37 @@ def main():
         check("legacy group", lt.graph_group, "canonical")
         check("legacy takes any slug", lt.choose_slug(None, "-root-anything"), "-root-anything")
 
+        # 8. The rules Rust enforces at config load hold in Python too (the
+        #    Rust side: a_slug_that_is_not_one_directory_name_is_refused,
+        #    tenant_names_and_paths_are_constrained, a_vault_belongs_to_exactly_one_tenant).
+        alias = Path(home) / "work-alias"  # another name for the work vault
+        os.symlink(work, alias)
+        for bad in ("..", "../other", "/etc", "a/b"):
+            try:
+                lt.choose_slug(bad, "-root")
+                FAILURES.append(f"legacy accepted the slug {bad!r}")
+            except legacy.TenantError:
+                pass
+        for label, block in (
+            ("reserved name", {"canonical": {"slugs": ["-a"]}}),
+            ("traversal slug", {"work": {"slugs": ["../other"]}}),
+            ("shared slug", {"work": {"slugs": ["-a"]}, "home": {"slugs": ["-a"]}}),
+            ("aliased vault via symlink", {"work": {"vault": str(work)}, "home": {"vault": str(alias)}}),
+            ("missing vault", {"work": {"vault": str(work / "not-created-yet")}}),
+            ("nested vault", {"work": {"vault": str(work)}, "home": {"vault": str(work / "Runbooks")}}),
+            ("aliased vault", {"work": {"vault": str(work)}, "home": {"vault": str(work / ".." / "work")}}),
+        ):
+            try:
+                legacy.resolve(cfg={"tenants": block}, requested=next(iter(block)))
+                FAILURES.append(f"{label} was accepted")
+            except legacy.TenantError as error:
+                want = "existing directory" if label == "missing vault" else ""
+                if want not in str(error) or (label != "missing vault" and "existing" in str(error)):
+                    FAILURES.append(f"{label} refused for the wrong reason: {error}")
+        (Path(str(work) + "2")).mkdir()
+        legacy.resolve(cfg={"tenants": {"a": {"vault": str(work)}, "b": {"vault": str(work) + "2"}}},
+                   requested="a")  # prefix-sharing siblings are disjoint
+
     if FAILURES:
         print("FAIL test_tenant_parity")
         for failure in FAILURES:

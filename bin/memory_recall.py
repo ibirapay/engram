@@ -268,7 +268,9 @@ def _recall_tenant(slug: str, cfg: dict) -> tuple[bool, str | None]:
             return False, None
         return True, engram_tenant.tenant_of_slug(slug, cfg)
     except Exception:
-        return False, None
+        # A tenants block that fails to load is NOT "tenancy off": falling back
+        # to the unscoped legacy legs would read any store. Refuse instead.
+        return bool((cfg or {}).get("tenants")), None
 
 
 def graph_recall_leg(query: str, k: int, mtype: str = "", timeout: int = 120,

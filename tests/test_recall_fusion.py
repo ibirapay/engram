@@ -221,6 +221,15 @@ def test_legacy_facts_only_for_pinned_store(mr, home, slug):
     print("ok — legacy graph facts reach only the pinned store")
 
 
+def test_invalid_tenants_fail_closed(mr):
+    """A tenants block that fails validation must not read as "tenancy off":
+    that fallback runs the unscoped legacy legs against any store."""
+    bad = {"tenants": {"canonical": {"slugs": ["-x"]}}}  # reserved name
+    assert mr._recall_tenant("-x", bad) == (True, None), mr._recall_tenant("-x", bad)
+    assert mr._recall_tenant("-x", {}) == (False, None)
+    print("ok — an invalid tenants block refuses recall instead of disabling tenancy")
+
+
 def test_hook_dedup(home, slug):
     """Same prompt twice in one session must inject once; a new session re-injects."""
     hook = ROOT / "bin" / "hooks" / "memory-recall-inject.py"
@@ -308,6 +317,7 @@ def main():
         test_graph_facts_reaches_late_entity(mr)
         test_slug_resolution(mr, d, slug)
         test_legacy_facts_only_for_pinned_store(mr, d, slug)
+        test_invalid_tenants_fail_closed(mr)
         os.environ["CLAUDE_MEMORY_SLUG"] = slug
         test_hook_dedup(d, slug)
         test_hook_gates(d, slug)
