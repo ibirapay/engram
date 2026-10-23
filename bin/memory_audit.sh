@@ -16,6 +16,11 @@ MODE="${1:-report}"
 
 DIR="$(memory_dir)"
 INDEX="$(memory_index)"
+# A store may split its index: MEMORY.md (hot, loaded every session) plus
+# MEMORY_FULL.md (everything else). A file listed in either is indexed.
+FULL_INDEX="${DIR}/MEMORY_FULL.md"
+INDEXES=("$INDEX"); [[ -f "$FULL_INDEX" ]] && INDEXES+=("$FULL_INDEX")
+is_index_file() { [[ "$1" == "MEMORY.md" || "$1" == "MEMORY_FULL.md" ]]; }
 
 if [[ ! -d "$DIR" ]]; then
     echo "[memory-audit] no memory dir at $DIR" >&2
@@ -43,13 +48,13 @@ if [[ -f "$INDEX" ]]; then
         if [[ ! -f "${DIR}/${f}" ]]; then
             FILES_ORPHAN_INDEX+=("$f")
         fi
-    done < <(grep -oE '\([a-zA-Z0-9_.-]+\.md\)' "$INDEX" | tr -d '()' | sort -u || true)
+    done < <(grep -hoE '\([a-zA-Z0-9_.-]+\.md\)' "${INDEXES[@]}" | tr -d '()' | sort -u || true)
 
     for f in "$DIR"/*.md; do
         [[ -f "$f" ]] || continue
         name=$(basename "$f")
-        [[ "$name" == "MEMORY.md" ]] && continue
-        if ! grep -qF "](${name})" "$INDEX"; then
+        is_index_file "$name" && continue
+        if ! grep -qF "](${name})" "${INDEXES[@]}"; then
             FILES_MISSING_INDEX+=("$name")
         fi
     done
@@ -70,7 +75,7 @@ declare -A CLUSTER_COUNT
 declare -A NAME_SET
 for f in "$DIR"/*.md; do
     [[ -f "$f" ]] || continue
-    nm=$(basename "$f"); [[ "$nm" == "MEMORY.md" ]] && continue
+    nm=$(basename "$f"); is_index_file "$nm" && continue
     NAME_SET["$(printf '%s' "${nm%.md}" | tr 'A-Z' 'a-z' | tr '-' '_')"]=1
     ns=$(memory_frontmatter_field "$f" name)
     if [[ -n "$ns" ]]; then
@@ -81,7 +86,7 @@ done
 for f in "$DIR"/*.md; do
     [[ -f "$f" ]] || continue
     name=$(basename "$f")
-    [[ "$name" == "MEMORY.md" ]] && continue
+    is_index_file "$name" && continue
 
     size=$(stat -c %s "$f")
     if (( size < 200 )); then
@@ -135,7 +140,7 @@ while IFS= read -r d; do
     FILES_DUP_DESC_NORM+=("$d")
 done < <(
     for f in "$DIR"/*.md; do
-        name=$(basename "$f"); [[ "$name" == "MEMORY.md" ]] && continue
+        name=$(basename "$f"); is_index_file "$name" && continue
         memory_frontmatter_field "$f" description | tr 'A-Z' 'a-z' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
     done | sort | uniq -d || true
 )

@@ -169,7 +169,9 @@ _memory_index_remove_line_unlocked() {
     [[ -f "$idx" ]] || return 1
     grep -qF "](${fname})" "$idx" || return 1
     local tmp="${idx}.tmp.$$"
-    grep -vF "](${fname})" "$idx" > "$tmp" && mv "$tmp" "$idx"
+    # grep -v exits 1 when it selects nothing (the last line was the match);
+    # that is still a successful removal, so it must not skip the mv.
+    { grep -vF "](${fname})" "$idx" || [[ $? -eq 1 ]]; } > "$tmp" && mv "$tmp" "$idx"
     return 0
 }
 memory_index_remove_line() { memory_with_index_lock _memory_index_remove_line_unlocked "$@"; }

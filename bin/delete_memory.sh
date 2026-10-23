@@ -66,6 +66,11 @@ if memory_index_remove_line "$MEMORY_MD" "$FILENAME"; then
 else
     echo "[delete-memory] No MEMORY.md index line for ${FILENAME}"
 fi
+# The cold index (MEMORY_FULL.md) is local-only; a line left there would point
+# at a deleted file forever.
+if memory_index_remove_line "${LOCAL_DIR}/MEMORY_FULL.md" "$FILENAME"; then
+    echo "[delete-memory] Updated MEMORY_FULL.md index"
+fi
 
 # Optional vector index: best-effort, non-blocking removal of this file's point
 # from Qdrant (no-op unless installed with --vector and enabled).
