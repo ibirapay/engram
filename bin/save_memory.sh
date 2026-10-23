@@ -62,7 +62,12 @@ fi
 # land under a stable "Uncategorized (auto-added)" section so a manual reorg of
 # the index can't silently drop them (the old flat-append + substring grep is
 # what orphaned files before). memory_index_add_line returns 0 when it adds.
-if memory_index_add_line "$MEMORY_MD" "$FILENAME" "$DESCRIPTION"; then
+# A memory already listed in the cold index (MEMORY_FULL.md) is indexed; adding
+# it to the hot MEMORY.md too would duplicate it and grow the always-loaded file.
+FULL_MD="$(dirname "$MEMORY_MD")/MEMORY_FULL.md"
+if [[ -f "$FULL_MD" ]] && grep -qF "](${FILENAME})" "$FULL_MD"; then
+    :
+elif memory_index_add_line "$MEMORY_MD" "$FILENAME" "$DESCRIPTION"; then
     memory_push_index "update MEMORY.md: add ${FILENAME}"
     echo "[save-memory] Updated MEMORY.md index"
 fi
