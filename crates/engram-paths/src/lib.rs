@@ -115,6 +115,13 @@ pub fn slugify(path: &Path) -> String {
 }
 
 /// `<config dir>/projects/<slug>/memory` — the canonical markdown store.
+/// A slug is joined onto `projects/` as a directory name, so it must be exactly
+/// one ordinary path component: anything else (`..`, `/abs`, `a/b`) would make a
+/// store path that leaves the projects root and reads someone else's memories.
+pub fn is_store_component(slug: &str) -> bool {
+    !slug.is_empty() && slug != "." && slug != ".." && !slug.contains(['/', '\\', '\0'])
+}
+
 pub fn store_dir(config: &Path, slug: &str) -> PathBuf {
     config
         .parent()

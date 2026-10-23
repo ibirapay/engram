@@ -29,6 +29,11 @@ struct Args {
     // unusable as typed.
     #[arg(long, allow_hyphen_values = true)]
     slug: Option<String>,
+    /// Which agent identity's graph to write. Required on an install that
+    /// defines tenants: every node this writes carries the tenant, and the
+    /// Graphiti group it reads legacy facts from is derived from it.
+    #[arg(long, env = "ENGRAM_TENANT")]
+    tenant: Option<String>,
     #[arg(long, default_value_t = 25)]
     limit: usize,
     #[arg(long)]
@@ -103,8 +108,23 @@ impl<T: Into<String>> From<T> for SyncError {
 
 async fn run(args: Args) -> Result<usize, SyncError> {
     let config_path = engram_paths::config_path(args.config);
-    let slug = engram_paths::resolve_slug(args.slug.as_deref());
-    let config = Config::load(&config_path).map_err(|error| error.to_string())?;
+    // Derive::Environment: this runs as a daemon job with an arbitrary working
+    // directory, so the store must not be inferred from one.
+    let engram_tenant::Resolved {
+        config,
+        tenant,
+        slug,
+    } = engram_tenant::resolve_for_cli(
+        &config_path,
+        args.tenant.as_deref(),
+        args.slug.as_deref(),
+        engram_tenant::Derive::Environment,
+    )?;
+    // Authorises every graph call below, and carries both the slug and the
+    // tenant into each statement.
+    let scope = tenant
+        .graph_scope(&slug)
+        .map_err(|error| error.to_string())?;
     if !config.local_enabled {
         return Err("local_enabled is false".into());
     }
@@ -130,12 +150,14 @@ async fn run(args: Args) -> Result<usize, SyncError> {
     // BEFORE the provider gates below. Gating it was a real obstruction: the
     // migration this release documents was unreachable on exactly the read-only
     // native install that needs it most.
-    if args.import_legacy_embeddings || args.bootstrap_from_legacy {
+    // Tenanted, the legacy group was relabelled per tenant (engram-tenant-migrate)
+    // and every legacy read below is confined to it, so the group IS the boundary.
+    if (args.import_legacy_embeddings || args.bootstrap_from_legacy) && !config.tenancy_enabled() {
         require_pinned_store(&slug, engram_paths::pinned_slug().as_deref())?;
     }
     if args.import_legacy_embeddings {
         client
-            .import_legacy_fact_embeddings(&slug)
+            .import_legacy_fact_embeddings(&scope)
             .await
             .map_err(|error| error.to_string())?;
         return Ok(0);
@@ -180,7 +202,7 @@ async fn run(args: Args) -> Result<usize, SyncError> {
             &config,
             &embeddings,
             &config_path,
-            &slug,
+            &scope,
             &space,
             &memories,
         )
@@ -194,7 +216,7 @@ async fn run(args: Args) -> Result<usize, SyncError> {
     if full_pass {
         let present: Vec<String> = memories.iter().map(|memory| memory.file.clone()).collect();
         client
-            .prune_missing_memories(&slug, &present)
+            .prune_missing_memories(&scope, &present)
             .await
             .map_err(|error| error.to_string())?;
     }
@@ -212,7 +234,7 @@ async fn run(args: Args) -> Result<usize, SyncError> {
     // batched write up front, no model calls, and a no-op once values match.
     client
         .set_native_memory_mtimes(
-            &slug,
+            &scope,
             &memories
                 .iter()
                 .map(|memory| (memory.file.clone(), memory.source_mtime))
@@ -229,7 +251,7 @@ async fn run(args: Args) -> Result<usize, SyncError> {
         }
         let sha = memory_sha(&space, memory);
         if client
-            .native_memory_is_current(&slug, &memory.file, &sha, &space)
+            .native_memory_is_current(&scope, &memory.file, &sha, &space)
             .await
             .map_err(|error| error.to_string())?
         {
@@ -242,7 +264,7 @@ async fn run(args: Args) -> Result<usize, SyncError> {
             &config,
             &reasoning,
             &embeddings,
-            &slug,
+            &scope,
             &space,
             &sha,
             memory,
@@ -328,18 +350,18 @@ async fn bootstrap_from_legacy(
     config: &Config,
     embeddings: &OpenAiCompatibleClient,
     config_path: &std::path::Path,
-    slug: &str,
+    scope: &engram_tenant::GraphScope,
     space: &str,
     memories: &[engram_store::Memory],
 ) -> Result<usize, SyncError> {
-    let dir = engram_paths::store_dir(config_path, slug);
+    let dir = engram_paths::store_dir(config_path, scope.slug());
     let files: Vec<String> = memories.iter().map(|memory| memory.file.clone()).collect();
     let sources = client
-        .legacy_sources(&files)
+        .legacy_sources(scope, &files)
         .await
         .map_err(|error| error.to_string())?;
     let existing: std::collections::HashSet<String> = client
-        .native_files(slug)
+        .native_files(scope)
         .await
         .map_err(|error| error.to_string())?
         .into_iter()
@@ -365,7 +387,7 @@ async fn bootstrap_from_legacy(
     let mut by_file: std::collections::HashMap<String, Vec<engram_graph::LegacyFact>> =
         std::collections::HashMap::new();
     for fact in client
-        .legacy_verified_facts(&episodes)
+        .legacy_verified_facts(scope, &episodes)
         .await
         .map_err(|error| error.to_string())?
     {
@@ -375,7 +397,12 @@ async fn bootstrap_from_legacy(
     for (memory, _) in &verified {
         let mut facts = Vec::new();
         for legacy in by_file.remove(&memory.file).unwrap_or_default() {
-            let fact = match redacted_fact(&legacy.text, &legacy.subject, &legacy.object) {
+            let fact = match redacted_fact(
+                &legacy.text,
+                &legacy.subject,
+                &legacy.object,
+                &legacy.legacy_name,
+            ) {
                 None => engram_graph::BootstrapFact {
                     text: legacy.text,
                     subject: legacy.subject,
@@ -385,7 +412,7 @@ async fn bootstrap_from_legacy(
                     redacted: false,
                     valid_until: legacy.valid_until,
                 },
-                Some((text, subject, object)) => {
+                Some((text, subject, object, legacy_name)) => {
                     let vector = embeddings
                         .embedding(&config.embed.model, &config.document_text(&text))
                         .await
@@ -395,7 +422,7 @@ async fn bootstrap_from_legacy(
                         text,
                         subject,
                         object,
-                        legacy_name: engram_secrets::redact(&legacy.legacy_name).0,
+                        legacy_name,
                         embedding: Some(vector),
                         redacted: true,
                         valid_until: legacy.valid_until,
@@ -410,7 +437,7 @@ async fn bootstrap_from_legacy(
         let (safe_body, _) = engram_secrets::redact(&memory.body);
         client
             .upsert_native_memory(
-                slug,
+                scope,
                 &memory.file,
                 &safe_name,
                 &safe_description,
@@ -421,7 +448,7 @@ async fn bootstrap_from_legacy(
             .map_err(|error| error.to_string())?;
         client
             .commit_bootstrapped_memory(
-                slug,
+                scope,
                 &memory.file,
                 &facts,
                 &memory_sha(space, memory),
@@ -458,11 +485,19 @@ fn valid_wins(facts: Vec<engram_graph::BootstrapFact>) -> Vec<engram_graph::Boot
 
 /// The redacted `(text, subject, object)` of a fact, or None when nothing in it
 /// looks secret.
-fn redacted_fact(text: &str, subject: &str, object: &str) -> Option<(String, String, String)> {
+/// The relation name counts too: it is stored in the searchable fulltext index,
+/// so a secret that lives only there must not pass through verbatim.
+fn redacted_fact(
+    text: &str,
+    subject: &str,
+    object: &str,
+    name: &str,
+) -> Option<(String, String, String, String)> {
     let (safe_text, a) = engram_secrets::redact(text);
     let (safe_subject, b) = engram_secrets::redact(subject);
     let (safe_object, c) = engram_secrets::redact(object);
-    (a + b + c > 0).then_some((safe_text, safe_subject, safe_object))
+    let (safe_name, d) = engram_secrets::redact(name);
+    (a + b + c + d > 0).then_some((safe_text, safe_subject, safe_object, safe_name))
 }
 
 #[cfg(test)]
@@ -505,11 +540,14 @@ mod bootstrap_tests {
     #[test]
     fn a_secret_in_any_part_of_a_fact_is_redacted() {
         let secret = "api_key=sk-proj-abcdefghijklmnopqrstuvwxyz1234";
-        assert!(redacted_fact("plain fact", "a", "b").is_none());
-        let (text, _, _) = redacted_fact(&format!("uses {secret}"), "a", "b").unwrap();
+        assert!(redacted_fact("plain fact", "a", "b", "USES").is_none());
+        let (text, _, _, _) = redacted_fact(&format!("uses {secret}"), "a", "b", "USES").unwrap();
         assert!(!text.contains("sk-proj-"), "{text}");
-        let (_, _, object) = redacted_fact("plain", "svc", secret).unwrap();
+        let (_, _, object, _) = redacted_fact("plain", "svc", secret, "USES").unwrap();
         assert!(!object.contains("sk-proj-"), "{object}");
+        // a secret only in the relation name still triggers redaction
+        let (_, _, _, name) = redacted_fact("plain", "a", "b", secret).unwrap();
+        assert!(!name.contains("sk-proj-"), "{name}");
     }
 
     #[test]
@@ -537,7 +575,7 @@ async fn sync_memory(
     config: &Config,
     reasoning: &OpenAiCompatibleClient,
     embeddings: &OpenAiCompatibleClient,
-    slug: &str,
+    scope: &engram_tenant::GraphScope,
     space: &str,
     sha: &str,
     memory: &engram_store::Memory,
@@ -596,7 +634,7 @@ async fn sync_memory(
 
     client
         .upsert_native_memory(
-            slug,
+            scope,
             &memory.file,
             &safe_name,
             &safe_description,
@@ -606,7 +644,7 @@ async fn sync_memory(
         .await
         .map_err(|error| error.to_string())?;
     client
-        .replace_native_facts(slug, &memory.file, &extracted)
+        .replace_native_facts(scope, &memory.file, &extracted)
         .await
         .map_err(|error| error.to_string())?;
 
@@ -621,16 +659,16 @@ async fn sync_memory(
         fact_vectors.push((fact.as_str(), vector));
     }
     client
-        .set_native_fact_embeddings(slug, &memory.file, &fact_vectors)
+        .set_native_fact_embeddings(scope, &memory.file, &fact_vectors)
         .await
         .map_err(|error| error.to_string())?;
     client
-        .replace_native_triples(slug, &memory.file, &triples)
+        .replace_native_triples(scope, &memory.file, &triples)
         .await
         .map_err(|error| error.to_string())?;
     // Last: everything above committed, so this memory really is current.
     client
-        .mark_native_memory_current(slug, &memory.file, sha, space)
+        .mark_native_memory_current(scope, &memory.file, sha, space)
         .await
         .map_err(|error| error.to_string())
 }

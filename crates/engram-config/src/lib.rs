@@ -17,6 +17,10 @@ use std::{collections::BTreeMap, fs, path::Path};
 use thiserror::Error;
 use url::Url;
 
+/// Graphiti's historical single group, shared by every memory inserted before
+/// tenancy. Reserved: a tenant with this name would read every unmigrated fact.
+pub const LEGACY_GRAPH_GROUP: &str = "canonical";
+
 pub const CONFIG_VERSION: u32 = 1;
 
 /// Embedding providers implemented by the Rust crates. Anything else is a valid
@@ -50,6 +54,53 @@ pub struct Config {
     pub graph: Graph,
     #[serde(default)]
     pub recall: Recall,
+    /// Agent identities, each owning one Obsidian vault and a set of memory
+    /// stores. See [`Config::tenancy_enabled`] for what an EMPTY map means —
+    /// it is load-bearing, not a degenerate case.
+    ///
+    /// A `BTreeMap` rather than a `HashMap` so the daemon's per-tenant loop and
+    /// every error message that lists tenants are deterministically ordered.
+    #[serde(default)]
+    pub tenants: BTreeMap<String, TenantConfig>,
+}
+
+/// One agent identity: which memory stores it owns, and which vault it reads.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TenantConfig {
+    /// The memory stores (`projects/<slug>/memory`) this tenant owns. A slug
+    /// may belong to exactly one tenant — see [`Config::validate`].
+    #[serde(default)]
+    pub slugs: Vec<String>,
+    /// Absolute path to this tenant's Obsidian vault.
+    ///
+    /// Optional: a tenant may own memory stores and no vault at all. That is
+    /// not a placeholder for the sake of it — it is the state every tenant is
+    /// in during the migration, before any vault exists, and the tenant model
+    /// has to be usable then.
+    #[serde(default)]
+    pub vault: String,
+    /// The one subtree of the vault an agent may write to, relative to the
+    /// vault root. Everything else is read-only to the agent.
+    #[serde(default = "default_agent_subtree")]
+    pub agent_subtree: String,
+    /// Opt-in LLM fact extraction over wiki sections.
+    ///
+    /// Off by default because the cost is one generation call per section of
+    /// every page, repeated whenever a page changes. Structural indexing
+    /// (`[[links]]`, headings, tags) is pure parsing and always on.
+    #[serde(default)]
+    pub extract_facts: bool,
+}
+
+impl Default for TenantConfig {
+    fn default() -> Self {
+        Self {
+            slugs: Vec::new(),
+            vault: String::new(),
+            agent_subtree: default_agent_subtree(),
+            extract_facts: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -96,6 +147,11 @@ pub struct VectorStore {
     pub url: String,
     #[serde(default = "default_collection")]
     pub collection: String,
+    /// Base name for the wiki corpus, kept separate from `collection` because
+    /// the two hold different shapes: one point per memory file versus many
+    /// chunks per wiki document. Both are suffixed per tenant.
+    #[serde(default = "default_wiki_collection")]
+    pub wiki_collection: String,
     #[serde(default)]
     pub timeout_seconds: u64,
     /// Qdrant Cloud. Sent as the `api-key` header.
@@ -212,6 +268,9 @@ fn default_qdrant_url() -> String {
 fn default_collection() -> String {
     "engram_memory".into()
 }
+fn default_wiki_collection() -> String {
+    "engram_wiki".into()
+}
 fn default_k_rrf() -> f64 {
     60.0
 }
@@ -226,6 +285,9 @@ fn default_max_facts() -> usize {
 }
 fn default_timeout_ms() -> u64 {
     2500
+}
+fn default_agent_subtree() -> String {
+    "_agent".into()
 }
 fn default_recall_timeout_ms() -> u64 {
     15_000
@@ -252,6 +314,7 @@ impl Default for VectorStore {
             enabled: false,
             url: default_qdrant_url(),
             collection: default_collection(),
+            wiki_collection: default_wiki_collection(),
             timeout_seconds: 0,
             api_key: Secret::default(),
         }
@@ -469,6 +532,142 @@ impl Config {
         if !self.graph.neo4j_http_url.is_empty() {
             endpoint(&self.graph.neo4j_http_url, "graph.neo4j_http_url")?;
         }
+        self.validate_tenants()?;
+        Ok(())
+    }
+
+    /// Whether this install uses tenancy at all.
+    ///
+    /// An empty `tenants:` map is not a degenerate case, it is the upgrade
+    /// path: every existing `engram.yaml` has no such block, and those installs
+    /// must keep working exactly as before (slug-scoped, no tenant required).
+    /// Once an operator declares even one tenant, `--tenant` becomes mandatory
+    /// on every binary — including when only one tenant exists, because
+    /// "obviously the only one" is precisely the kind of default that makes a
+    /// cross-tenant read possible later.
+    pub fn tenancy_enabled(&self) -> bool {
+        !self.tenants.is_empty()
+    }
+
+    /// Which tenant owns `slug`, if tenancy is in use.
+    pub fn tenant_of_slug(&self, slug: &str) -> Option<&str> {
+        self.tenants
+            .iter()
+            .find(|(_, tenant)| tenant.slugs.iter().any(|owned| owned == slug))
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// Configured slugs that no tenant claims — what the migration has to get
+    /// an answer for before it can run.
+    pub fn unassigned_slugs<'a>(&self, present: &[&'a str]) -> Vec<&'a str> {
+        present
+            .iter()
+            .copied()
+            .filter(|slug| self.tenant_of_slug(slug).is_none())
+            .collect()
+    }
+
+    fn validate_tenants(&self) -> Result<(), ConfigError> {
+        let invalid = |message: String| ConfigError::Invalid(message);
+        // slug -> the tenant that claimed it first, so a duplicate names both.
+        let mut owners: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut vaults: BTreeMap<std::path::PathBuf, &str> = BTreeMap::new();
+        for (name, tenant) in &self.tenants {
+            if name.trim().is_empty() {
+                return Err(invalid("a tenant name may not be empty".into()));
+            }
+            // Lowercase alphanumerics and dashes only. The name becomes a Qdrant
+            // collection suffix and a Neo4j property value, both case-sensitive:
+            // allowing `Work` and `work` would make two tenants that look like
+            // one in every log line and config listing.
+            if let Some(bad) = name
+                .chars()
+                .find(|ch| !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && *ch != '-')
+            {
+                return Err(invalid(format!(
+                    "tenant '{name}' contains {bad:?}; names may use only lowercase letters, digits and '-'"
+                )));
+            }
+            if name == LEGACY_GRAPH_GROUP {
+                return Err(invalid(format!(
+                    "tenant name '{name}' is reserved: it is the legacy shared graph group, \
+                     so that tenant would read every unmigrated identity's facts"
+                )));
+            }
+            if tenant.slugs.is_empty() && tenant.vault.trim().is_empty() {
+                return Err(invalid(format!(
+                    "tenant '{name}' owns no slugs and has no vault; it would never serve anything"
+                )));
+            }
+            for slug in &tenant.slugs {
+                let slug = slug.trim();
+                if slug.is_empty() {
+                    return Err(invalid(format!("tenant '{name}' lists an empty slug")));
+                }
+                if !engram_paths::is_store_component(slug) {
+                    return Err(invalid(format!(
+                        "tenant '{name}' slug '{slug}' must be one directory name \
+                         (no '/', '\\', '.' or '..')"
+                    )));
+                }
+                // THE isolation rule. Two tenants sharing a store is exactly the
+                // cross-tenant read this whole model exists to prevent, so it is
+                // a config error rather than a last-writer-wins resolution.
+                if let Some(first) = owners.insert(slug, name) {
+                    return Err(invalid(format!(
+                        "slug '{slug}' is claimed by both '{first}' and '{name}'; \
+                         a memory store belongs to exactly one tenant"
+                    )));
+                }
+            }
+            let vault = tenant.vault.trim();
+            if !vault.is_empty() {
+                if !Path::new(vault).is_absolute() {
+                    return Err(invalid(format!(
+                        "tenant '{name}' vault must be an absolute path, got '{vault}'"
+                    )));
+                }
+                // Compared as real paths: `/v` vs `/v/work`, or two names for one
+                // directory via a symlink, would let one tenant index the other's
+                // files. It must exist now: a path validated before it exists can
+                // later be created as a symlink into another tenant's vault.
+                let real = Path::new(vault).canonicalize().map_err(|error| {
+                    invalid(format!(
+                        "tenant '{name}' vault '{vault}' must be an existing directory: {error}"
+                    ))
+                })?;
+                for (other, first) in &vaults {
+                    if real.starts_with(other) || other.starts_with(&real) {
+                        return Err(invalid(format!(
+                            "vault '{vault}' overlaps the vault of '{first}' ({}); \
+                             tenant vaults must be disjoint directories",
+                            other.display()
+                        )));
+                    }
+                }
+                vaults.insert(real, name);
+            }
+            let subtree = tenant.agent_subtree.trim();
+            if subtree.is_empty() {
+                return Err(invalid(format!(
+                    "tenant '{name}' agent_subtree may not be empty; \
+                     it is the only place an agent may write"
+                )));
+            }
+            // A subtree that escapes the vault would make the write boundary
+            // meaningless, so reject the shape outright rather than relying on
+            // the runtime check in engram-tenant to catch it every time.
+            if Path::new(subtree).is_absolute()
+                || subtree
+                    .split(['/', '\\'])
+                    .any(|part| part == ".." || part == "~")
+            {
+                return Err(invalid(format!(
+                    "tenant '{name}' agent_subtree '{subtree}' must be a relative path \
+                     inside the vault, with no '..'"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -617,6 +816,24 @@ fn endpoint(value: &str, name: &str) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fixtures name vaults like `/vaults/work`; validation now requires them to
+    /// exist, so create each under a private temp root and point the YAML there.
+    fn real_vaults(yaml: &str) -> String {
+        let root = std::env::temp_dir().join(format!("engram-test-vaults-{}", std::process::id()));
+        let mut out = String::new();
+        for line in yaml.lines() {
+            match line.split_once("vault: ") {
+                Some((head, path)) if path.starts_with("/v") => {
+                    let real = root.join(path.trim_start_matches('/'));
+                    std::fs::create_dir_all(&real).unwrap();
+                    out += &format!("{head}vault: {}\n", real.display());
+                }
+                _ => out += &format!("{line}\n"),
+            }
+        }
+        out
+    }
 
     #[test]
     fn llama_cpp_embedding_profile_keeps_its_space() {
@@ -914,6 +1131,182 @@ mod tests {
         );
         assert_eq!(creds.password.expose(), "from-yaml");
         assert_eq!(creds.http_url, None);
+    }
+
+    /// The upgrade path. Every `engram.yaml` in existence has no `tenants:`
+    /// block, and those installs must keep working untouched — so an empty map
+    /// means "tenancy off", never "no tenant matched".
+    #[test]
+    fn an_absent_tenants_block_leaves_tenancy_off() {
+        let config: Config = serde_yaml::from_str("backend: ollama\n").unwrap();
+        config.validate().unwrap();
+        assert!(!config.tenancy_enabled());
+        assert_eq!(config.tenant_of_slug("-root"), None);
+    }
+
+    /// The isolation rule, as a config error.
+    ///
+    /// Two tenants sharing a memory store IS the cross-tenant read the tenant
+    /// model exists to prevent. Resolving it by last-writer-wins would produce
+    /// exactly the leak, quietly, so it has to fail the load.
+    #[test]
+    fn a_memory_store_belongs_to_exactly_one_tenant() {
+        let shared: Config = serde_yaml::from_str(
+            "tenants:\n  work:\n    slugs: ['-root-a', '-root-shared']\n  \
+             homelab:\n    slugs: ['-root-b', '-root-shared']\n",
+        )
+        .unwrap();
+        let error = shared
+            .validate()
+            .expect_err("a shared slug must not load at all");
+        let error = format!("{error}");
+        assert!(error.contains("-root-shared"), "{error}");
+        // and it must name BOTH claimants, or the operator cannot fix it
+        assert!(
+            error.contains("work") && error.contains("homelab"),
+            "{error}"
+        );
+
+        // the same two tenants with disjoint stores are fine
+        let clean: Config = serde_yaml::from_str(
+            "tenants:\n  work:\n    slugs: ['-root-a']\n  homelab:\n    slugs: ['-root-b']\n",
+        )
+        .unwrap();
+        clean.validate().unwrap();
+        assert!(clean.tenancy_enabled());
+        assert_eq!(clean.tenant_of_slug("-root-a"), Some("work"));
+        assert_eq!(clean.tenant_of_slug("-root-b"), Some("homelab"));
+        assert_eq!(clean.tenant_of_slug("-root-never-assigned"), None);
+    }
+
+    /// A shared vault is the same leak by the other door.
+    #[test]
+    fn a_vault_belongs_to_exactly_one_tenant() {
+        let config: Config = serde_yaml::from_str(&real_vaults(
+            "tenants:\n  work:\n    vault: /vaults/shared\n  homelab:\n    vault: /vaults/shared\n",
+        ))
+        .unwrap();
+        let error = format!("{}", config.validate().unwrap_err());
+        assert!(error.contains("overlaps"), "{error}");
+
+        // nested: the outer tenant would index the inner one's files
+        let nested: Config = serde_yaml::from_str(&real_vaults(
+            "tenants:\n  work:\n    vault: /vaults\n  homelab:\n    vault: /vaults/home\n",
+        ))
+        .unwrap();
+        let error = format!("{}", nested.validate().unwrap_err());
+        assert!(error.contains("overlaps"), "{error}");
+
+        // a symlink is the same directory under another name
+        let root = std::env::temp_dir().join(format!("engram-vault-alias-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        let aliased: Config = serde_yaml::from_str(&format!(
+            "tenants:\n  work:\n    vault: {}\n  homelab:\n    vault: {}\n",
+            root.join("real").display(),
+            root.join("alias").display()
+        ))
+        .unwrap();
+        let result = aliased.validate();
+        // a vault that does not exist yet, under the alias
+        let unborn: Config = serde_yaml::from_str(&format!(
+            "tenants:\n  work:\n    vault: {}\n  homelab:\n    vault: {}\n",
+            root.join("real/later").display(),
+            root.join("alias/later/inner").display()
+        ))
+        .unwrap();
+        let unborn = unborn.validate();
+        let _ = fs::remove_dir_all(&root);
+        assert!(format!("{}", result.unwrap_err()).contains("overlaps"));
+        // a vault validated before it exists could later become a symlink into
+        // another tenant's vault, so a missing one is refused outright
+        assert!(format!("{}", unborn.unwrap_err()).contains("existing directory"));
+
+        // siblings sharing a prefix are disjoint
+        let siblings: Config = serde_yaml::from_str(&real_vaults(
+            "tenants:\n  work:\n    vault: /vaults/work\n  homelab:\n    vault: /vaults/work2\n",
+        ))
+        .unwrap();
+        siblings.validate().unwrap();
+    }
+
+    #[test]
+    fn tenant_names_and_paths_are_constrained() {
+        for (yaml, expect) in [
+            // uppercase would make `Work` and `work` two tenants that read as one
+            ("tenants:\n  Work:\n    slugs: ['-a']\n", "lowercase"),
+            ("tenants:\n  wo rk:\n    slugs: ['-a']\n", "lowercase"),
+            // a relative vault resolves against whatever cwd the binary had
+            ("tenants:\n  work:\n    vault: vaults/work\n", "absolute"),
+            // an empty tenant is a typo, not a configuration
+            ("tenants:\n  work: {}\n", "never serve anything"),
+            ("tenants:\n  work:\n    slugs: ['']\n", "empty slug"),
+            // the legacy shared group: this tenant would read every unmigrated fact
+            ("tenants:\n  canonical:\n    slugs: ['-a']\n", "reserved"),
+            // a slug is joined onto projects/ as ONE directory name
+            (
+                "tenants:\n  work:\n    slugs: ['..']\n",
+                "one directory name",
+            ),
+            (
+                "tenants:\n  work:\n    slugs: ['../other']\n",
+                "one directory name",
+            ),
+            (
+                "tenants:\n  work:\n    slugs: ['/etc']\n",
+                "one directory name",
+            ),
+            // a subtree that escapes the vault voids the write boundary
+            (
+                "tenants:\n  work:\n    vault: /v\n    agent_subtree: '../outside'\n",
+                "relative path",
+            ),
+            (
+                "tenants:\n  work:\n    vault: /v\n    agent_subtree: '/etc'\n",
+                "relative path",
+            ),
+            (
+                "tenants:\n  work:\n    vault: /v\n    agent_subtree: ''\n",
+                "may not be empty",
+            ),
+        ] {
+            let config: Config = serde_yaml::from_str(&real_vaults(yaml)).unwrap();
+            let error = format!(
+                "{}",
+                config.validate().expect_err(&format!("accepted {yaml:?}"))
+            );
+            assert!(
+                error.contains(expect),
+                "for {yaml:?} wanted {expect:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_agent_subtree_defaults_without_being_written_out() {
+        let config: Config =
+            serde_yaml::from_str(&real_vaults("tenants:\n  work:\n    vault: /vaults/work\n"))
+                .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.tenants["work"].agent_subtree, "_agent");
+        assert!(
+            !config.tenants["work"].extract_facts,
+            "LLM extraction over every section is opt-in"
+        );
+    }
+
+    /// The migration must not guess which tenant an existing store belongs to.
+    #[test]
+    fn unassigned_slugs_are_reported_rather_than_adopted() {
+        let config: Config =
+            serde_yaml::from_str("tenants:\n  work:\n    slugs: ['-root-MJSV']\n").unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.unassigned_slugs(&["-root-MJSV", "-root", "-root-bbhost"]),
+            vec!["-root", "-root-bbhost"]
+        );
+        assert!(config.unassigned_slugs(&["-root-MJSV"]).is_empty());
     }
 
     #[test]
