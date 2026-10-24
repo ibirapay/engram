@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — Rust embedding server
+
+### Added
+- **`engram-embed`**: a Rust drop-in for the local fastembed server on
+  127.0.0.1:11435 (same nomic-embed-text-v1.5 model, same `/health`, `/api/embed`
+  and `/v1/embeddings` JSON). Truncates at **2048 tokens** (`--max-length` /
+  `ENGRAM_EMBED_MAX_LENGTH`): the Python server truncated at 8192 and one long
+  memory body grew it to 11-12 GB, which OOM-killed the host on 2026-10-24.
+  Vectors under the cutoff match the Python server at cosine 1.000000; memories
+  longer than 2048 tokens get a different vector, so rebuild the vector index once
+  after switching.
+
 ## Unreleased — migrate the legacy graph to the Rust native backend
 
 ### Added

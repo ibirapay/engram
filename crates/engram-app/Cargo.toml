@@ -18,6 +18,8 @@ engram-store = { path = "../engram-store" }
 engram-tenant = { path = "../engram-tenant" }
 engram-vector = { path = "../engram-vector" }
 engram-wiki = { path = "../engram-wiki" }
+# CPU embedder for engram-embed (same nomic ONNX model the Python fastembed server served).
+fastembed = { version = "7.5", default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
 # For flock(2). Already in the dependency graph transitively; the config lock
 # needs kernel-held advisory locking, which std does not expose.
 libc = "0.2"
