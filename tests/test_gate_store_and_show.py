@@ -65,6 +65,19 @@ def test_cli_approve_only_pending_same_store_and_show_scans():
     assert shown["secret_scan"]["umbrella_content"] is None, shown["secret_scan"]
     assert shown["secret_scan"]["leak.md"], f"secret not flagged: {shown['secret_scan']}"
 
+    # Fail closed: a file that is not there was not scanned, and the save-memory
+    # override must not make the scan pass silently.
+    gone = {**prop, "id": "merge_apply-t3", "params": {**prop["params"], "absorbed": ["gone.md"]}}
+    (mem / ".approvals" / "pending" / "merge_apply-t3.json").write_text(json.dumps(gone))
+    r, _ = _cli(home, "-tenant-a", "--show", "merge_apply-t3")
+    assert json.loads(r.stdout)["secret_scan"]["gone.md"], "missing file reported clean"
+    os.environ["MEMORY_ALLOW_SECRET"] = "1"
+    try:
+        r, _ = _cli(home, "-tenant-a", "--show", "merge_apply-t1")
+    finally:
+        del os.environ["MEMORY_ALLOW_SECRET"]
+    assert json.loads(r.stdout)["secret_scan"]["leak.md"], "MEMORY_ALLOW_SECRET silenced the scan"
+
     r, _ = _cli(home, "-tenant-a", "--approve", "orphan_prune-t2")
     assert r.returncode == 1 and "refused: belongs to store -tenant-b" in r.stdout, r.stdout
     assert (mem / ".approvals" / "pending" / "orphan_prune-t2.json").exists(), "foreign proposal moved"

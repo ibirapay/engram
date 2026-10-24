@@ -144,9 +144,14 @@ def _secret_lines(path):
     forwards content to a remote channel treats an unscanned file as unsafe."""
     import subprocess
     lib = Path(__file__).with_name("memory_lib.sh")
+    # memory_scan_secret reports "clean" for a missing file and under the save-memory
+    # override, neither of which is a scan.
+    if not Path(path).is_file():
+        return "missing (not scanned)"
+    env = {k: v for k, v in os.environ.items() if k != "MEMORY_ALLOW_SECRET"}
     try:
         r = subprocess.run(["bash", "-c", 'source "$1" && memory_scan_secret "$2"', "_", str(lib), str(path)],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=30, env=env)
     except Exception:
         return "scan unavailable"
     if r.returncode == 1 and lib.is_file():
