@@ -21,7 +21,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, State, rejection::BytesRejection},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
 use clap::Parser;
@@ -37,6 +37,8 @@ use std::{
 /// A memory description, not a document — same cap as the Python server.
 const MAX_BODY: usize = 1 << 20;
 const DEFAULT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
+/// Callers send one text (recall, indexer); the cap only bounds request time.
+const MAX_INPUTS: usize = 64;
 
 #[derive(Parser)]
 struct Args {
@@ -146,27 +148,53 @@ fn load(
 
 /// `input` may be one string or a batch (Ollama accepts both); non-string batch
 /// items are stringified, as the Python server's `str(t)` did.
-fn texts(body: Result<Bytes, BytesRejection>) -> Result<Vec<String>, Reply> {
+fn texts(headers: &HeaderMap, body: Result<Bytes, BytesRejection>) -> Result<Vec<String>, Reply> {
+    // A browser can only send JSON here after a CORS preflight this server never
+    // answers, so requiring it keeps web pages from driving the CPU-bound model.
+    let json_body = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("application/json")
+        });
+    if !json_body {
+        return Err(error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "content-type must be application/json",
+        ));
+    }
     let body = body.map_err(|rejection| error(rejection.status(), rejection.body_text()))?;
     if body.is_empty() {
         return Err(error(StatusCode::PAYLOAD_TOO_LARGE, "bad content-length"));
     }
     let request: Value = serde_json::from_slice(&body)
         .map_err(|e| error(StatusCode::BAD_REQUEST, format!("bad request: {e}")))?;
-    match request.get("input") {
-        Some(Value::String(text)) => Ok(vec![text.clone()]),
-        Some(Value::Array(items)) => Ok(items
+    let texts: Vec<String> = match request.get("input") {
+        Some(Value::String(text)) => vec![text.clone()],
+        Some(Value::Array(items)) => items
             .iter()
             .map(|item| match item {
                 Value::String(text) => text.clone(),
                 other => other.to_string(),
             })
-            .collect()),
-        _ => Err(error(
-            StatusCode::BAD_REQUEST,
-            "input must be a string or list",
-        )),
+            .collect(),
+        _ => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "input must be a string or list",
+            ));
+        }
+    };
+    if texts.len() > MAX_INPUTS {
+        return Err(error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("at most {MAX_INPUTS} inputs per request"),
+        ));
     }
+    Ok(texts)
 }
 
 async fn embed(app: Arc<App>, texts: Vec<String>) -> Result<Vec<Vec<f32>>, Reply> {
@@ -175,7 +203,9 @@ async fn embed(app: Arc<App>, texts: Vec<String>) -> Result<Vec<Vec<f32>>, Reply
             .model
             .lock()
             .map_err(|_| "embedding model lock poisoned".to_string())?;
-        model.embed(texts, None).map_err(|e| e.to_string())
+        // One text per ONNX run, as the Python server did: a batch is padded to its
+        // longest member, so memory would grow with batch x max_length^2.
+        model.embed(texts, Some(1)).map_err(|e| e.to_string())
     })
     .await;
     match joined {
@@ -195,8 +225,12 @@ async fn health(State(app): State<Arc<App>>) -> Reply {
     )
 }
 
-async fn ollama(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Reply {
-    let texts = match texts(body) {
+async fn ollama(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Reply {
+    let texts = match texts(&headers, body) {
         Ok(texts) => texts,
         Err(reply) => return reply,
     };
@@ -210,8 +244,12 @@ async fn ollama(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>
     }
 }
 
-async fn openai(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Reply {
-    let texts = match texts(body) {
+async fn openai(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Reply {
+    let texts = match texts(&headers, body) {
         Ok(texts) => texts,
         Err(reply) => return reply,
     };
@@ -284,8 +322,50 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    fn parse_as(content_type: Option<&'static str>, body: &str) -> Result<Vec<String>, StatusCode> {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = content_type {
+            headers.insert(CONTENT_TYPE, axum::http::HeaderValue::from_static(value));
+        }
+        texts(&headers, Ok(Bytes::from(body.to_string()))).map_err(|(code, _)| code)
+    }
+
     fn parse(body: &str) -> Result<Vec<String>, StatusCode> {
-        texts(Ok(Bytes::from(body.to_string()))).map_err(|(code, _)| code)
+        parse_as(Some("application/json"), body)
+    }
+
+    #[test]
+    fn only_json_requests_reach_the_model() -> Result<(), String> {
+        let body = r#"{"input":"a"}"#;
+        assert_eq!(
+            parse_as(None, body),
+            Err(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
+        // What a cross-origin <form> or no-preflight fetch can send.
+        assert_eq!(
+            parse_as(Some("text/plain"), body),
+            Err(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
+        assert_eq!(
+            parse_as(Some("application/x-www-form-urlencoded"), body),
+            Err(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
+        assert_eq!(
+            parse_as(Some("Application/JSON; charset=utf-8"), body),
+            Ok(vec!["a".to_string()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn input_count_is_capped() -> Result<(), String> {
+        let batch = |n: usize| format!(r#"{{"input":{}}}"#, serde_json::json!(vec!["x"; n]));
+        assert_eq!(parse(&batch(MAX_INPUTS)).map(|t| t.len()), Ok(MAX_INPUTS));
+        assert_eq!(
+            parse(&batch(MAX_INPUTS + 1)),
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+        Ok(())
     }
 
     #[test]
