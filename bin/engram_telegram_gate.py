@@ -23,7 +23,8 @@ Queue: <store>/.approvals/{pending,approved,applied,rejected,expired}/<id>.json
 CLI:
   engram_telegram_gate.py --poll         # handle callbacks + expire + apply approved (one pass)
   engram_telegram_gate.py --list         # show pending proposals
-  engram_telegram_gate.py --approve <id> # local approval (no phone needed)
+  engram_telegram_gate.py --show <id>    # proposal JSON + files + secret scan (read via THIS store)
+  engram_telegram_gate.py --approve <id> # local approval (no phone needed); pending + same store only
   engram_telegram_gate.py --reject <id>
   engram_telegram_gate.py --notify "msg" # fire a plain Telegram message (undo notices, digest)
 """
@@ -114,8 +115,71 @@ def validate_memory_doc(doc: str):
 
 
 def _id(op, params):
-    h = hashlib.sha256(f"{op}:{json.dumps(params, sort_keys=True)}".encode()).hexdigest()[:12]
+    # The store slug is part of the id: an orphan_prune's params are just a filename,
+    # so without it two tenants with the same file name produced the same id.
+    h = hashlib.sha256(f"{SLUG}:{op}:{json.dumps(params, sort_keys=True)}".encode()).hexdigest()[:12]
     return f"{op}-{h}"
+
+
+def _store_ok(prop):
+    """A proposal applies only to the store that queued it. Proposals written before
+    the `store` field existed carry none; they were per-store already (Q lives under
+    MEM), so they stay valid."""
+    return prop.get("store") in (None, SLUG)
+
+
+def _describe(prop):
+    """One human line naming the memory files an op touches, never just its id."""
+    pr = prop.get("params") or {}
+    if prop.get("op") == "merge_apply":
+        return f"absorb {', '.join(pr.get('absorbed') or [])} into {pr.get('umbrella')}"
+    if prop.get("op") in ("orphan_prune", "skill_install", "suspect_restore"):
+        return f"{prop['op']} {pr.get('name')}"
+    return prop.get("op", "?")
+
+
+def _secret_lines(path):
+    """memory_lib.sh's memory_scan_secret on one file: the line numbers of possible
+    secrets, None when clean. Fails CLOSED ("scan unavailable") so a caller that
+    forwards content to a remote channel treats an unscanned file as unsafe."""
+    import subprocess
+    lib = Path(__file__).with_name("memory_lib.sh")
+    # memory_scan_secret reports "clean" for a missing file and under the save-memory
+    # override, neither of which is a scan.
+    if not Path(path).is_file():
+        return "missing (not scanned)"
+    env = {k: v for k, v in os.environ.items() if k != "MEMORY_ALLOW_SECRET"}
+    try:
+        r = subprocess.run(["bash", "-c", 'source "$1" && memory_scan_secret "$2"', "_", str(lib), str(path)],
+                           capture_output=True, text=True, timeout=30, env=env)
+    except Exception:
+        return "scan unavailable"
+    if r.returncode == 1 and lib.is_file():
+        return None
+    return r.stdout.strip() or "scan unavailable"
+
+
+def show(pid):
+    """The proposal as the walkthrough must present it: read through THIS gate (same
+    store it approves in) plus a secret scan of every file and of the proposed text,
+    so nothing flagged is summarized into Telegram."""
+    st, p = _find(pid)
+    if not p:
+        return None
+    prop = json.loads(p.read_text())
+    pr = prop.get("params") or {}
+    files = list(pr.get("absorbed") or []) + [f for f in (pr.get("umbrella"), pr.get("name")) if f]
+    scan = {f: _secret_lines(MEM / f) for f in files}
+    if pr.get("umbrella_content"):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as t:
+            t.write(pr["umbrella_content"])
+        try:
+            scan["umbrella_content"] = _secret_lines(t.name)
+        finally:
+            os.unlink(t.name)
+    return {**prop, "state": st, "store_ok": _store_ok(prop), "describe": _describe(prop),
+            "secret_scan": scan}
 
 
 def _find(pid):
@@ -193,7 +257,7 @@ def propose(op, params, preview, files=None, codex_verdict=None, ttl_h=DEFAULT_T
     st, _ = _find(pid)
     if st in ("pending", "approved", "applied"):
         return pid                       # already in flight / done — don't spam
-    prop = {"id": pid, "op": op, "params": params, "preview": preview,
+    prop = {"id": pid, "op": op, "store": SLUG, "params": params, "preview": preview,
             "source_hashes": source_hashes(files), "codex_verdict": codex_verdict,
             "created_at": _now(), "expires_at": _now() + ttl_h * 3600}
     prop["telegram_msg_id"] = _send_proposal(pid, prop)
@@ -211,7 +275,9 @@ def _move(pid, to_state):
 
 
 def _apply_one(prop):
-    """Dispatch an approved op to its handler. Re-check source freshness first."""
+    """Dispatch an approved op to its handler. Re-check store and source freshness first."""
+    if not _store_ok(prop):
+        return False, f"belongs to store {prop.get('store')}, not {SLUG} — dropped"
     cur = source_hashes(list((prop.get("source_hashes") or {}).keys()))
     if cur != prop.get("source_hashes"):
         return False, "sources changed since proposal — dropped"
@@ -264,7 +330,7 @@ def poll_once():
         prop = json.loads(p.read_text())
         if _now() > prop.get("expires_at", 0):
             _move(prop["id"], "expired")
-            notify(f"⏰ proposal expired (dropped): {prop['op']} — {prop['id']}")
+            notify(f"⏰ proposal expired unanswered (dropped, nothing changed): {_describe(prop)} — {prop['id']}")
     # 3. apply approved
     applied = []
     for p in sorted(_dir("approved").glob("*.json")):
@@ -624,18 +690,29 @@ def main():
         print(f"probation purged {sweep()} merge backup(s) to .trash"); return
     if "--notify" in a:
         notify(a[a.index("--notify") + 1]); return
-    if "--approve" in a:
-        pid = a[a.index("--approve") + 1]
-        print("approved" if _move(pid, "approved") else "not found"); return
-    if "--reject" in a:
-        pid = a[a.index("--reject") + 1]
-        print("rejected" if _move(pid, "rejected") else "not found"); return
+    for flag, state in (("--approve", "approved"), ("--reject", "rejected")):
+        if flag in a:
+            pid = a[a.index(flag) + 1]
+            st, p = _find(pid)
+            if not p:
+                print("not found"); sys.exit(1)
+            if st != "pending":
+                print(f"already {st}"); sys.exit(1)
+            prop = json.loads(p.read_text())
+            if not _store_ok(prop):
+                print(f"refused: belongs to store {prop.get('store')}, this gate is {SLUG}"); sys.exit(1)
+            _move(pid, state); print(state); return
+    if "--show" in a:
+        d = show(a[a.index("--show") + 1])
+        if d is None:
+            print("not found"); sys.exit(1)
+        print(json.dumps(d, indent=1, ensure_ascii=False)); return
     if "--list" in a:
         ps = sorted(_dir("pending").glob("*.json"))
         print(f"{len(ps)} pending proposal(s):")
         for p in ps:
             d = json.loads(p.read_text())
-            print(f"  {d['id']}  {d['op']}  exp={d['expires_at']-_now()}s\n    {d['preview'][:100]}")
+            print(f"  {d['id']}  {_describe(d)}  exp={d['expires_at']-_now()}s\n    {d['preview'][:100]}")
         return
     if "--poll" in a:
         for pid, ok, detail in poll_once():
