@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — memory-tidy: clear report, store-bound approvals
+
+### Fixed
+- **`/memory-tidy` reports name the memories.** Cards and the final report name every
+  file with its description and say what becomes what ("absorb X into Y"), in plain
+  words; a pass that changed nothing says so. Expiry notices name the files too
+  (they printed only a hash, so one pair expired three times unseen).
+- **Approval gate is bound to its store.** Proposal ids hash the store slug, each
+  proposal records `store`, and apply/`--approve`/`--reject` refuse another store's
+  proposal. The skill reads proposals through the new `--show <id>` instead of a
+  hard-coded queue path.
+- **`--approve` only takes a pending proposal**: it used to move one from any state,
+  so an expired proposal could be approved and applied.
+- **Secret scan before Telegram.** `--show` runs `memory_scan_secret` on every file
+  and on the proposed text (fails closed); flagged content is never summarized into
+  the card.
+- The skill runs the scripts with `~/.claude/vector/venv/bin/python`: plain `python3`
+  lacks PyYAML and misreported `auto_curate.enabled: false`.
+- The installed skill's step-by-step walkthrough, never committed, is now in the repo.
+
 ## Unreleased — Rust embedding server
 
 ### Added
