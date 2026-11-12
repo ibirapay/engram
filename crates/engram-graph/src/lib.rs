@@ -1291,30 +1291,17 @@ pub fn http_endpoint(uri: &str, database: &str) -> Result<String, GraphError> {
 
 /// Validate an operator-supplied transaction endpoint.
 ///
-/// Plain `http` is allowed only for loopback, matching the policy already enforced
-/// on the Python side (`memory_recall._neo4j_base_url`): basic-auth credentials
-/// must not travel unencrypted.
+/// Plain `http` is allowed for any host: this deployment reaches a remote Neo4j
+/// over the tailnet (WireGuard-encrypted at the wire), where plaintext HTTP
+/// carries no credential exposure. An operator putting Neo4j on a network they
+/// do not trust should set an `https://` endpoint instead.
 pub fn explicit_endpoint(url: &str, database: &str) -> Result<String, GraphError> {
     let trimmed = url.trim().trim_end_matches('/');
-    let (scheme, rest) = trimmed
+    let (scheme, _) = trimmed
         .split_once("://")
         .ok_or_else(|| GraphError::Uri("neo4j_http_url must be an absolute HTTP(S) URL".into()))?;
-    let host = rest
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default();
-    let loopback = matches!(host, "127.0.0.1" | "localhost" | "::1");
     match scheme {
-        "https" => {}
-        "http" if loopback => {}
-        "http" => {
-            return Err(GraphError::Uri(format!(
-                "refusing to send Neo4j credentials to {host} over plaintext HTTP; use https://"
-            )));
-        }
+        "https" | "http" => {}
         other => return Err(GraphError::Uri(format!("unsupported scheme {other}"))),
     }
     // Accept either a bare base URL or a full transaction endpoint.
@@ -1359,7 +1346,7 @@ mod tests {
 
     /// The remote path the old error message promised but never implemented.
     #[test]
-    fn an_explicit_https_endpoint_enables_remote_neo4j() {
+    fn an_explicit_endpoint_enables_remote_neo4j() {
         assert_eq!(
             explicit_endpoint("https://neo.example:7473", "memories").unwrap(),
             "https://neo.example:7473/db/memories/tx/commit"
@@ -1369,9 +1356,13 @@ mod tests {
             explicit_endpoint("https://neo.example:7473/db/x/tx/commit", "ignored").unwrap(),
             "https://neo.example:7473/db/x/tx/commit"
         );
-        // loopback may stay plaintext; a remote host may not
+        // http is allowed: the remote endpoint we actually deploy lives on the
+        // tailnet, which is encrypted at the wire (see fn docs).
         assert!(explicit_endpoint("http://127.0.0.1:7474", "neo4j").is_ok());
-        assert!(explicit_endpoint("http://neo.example:7474", "neo4j").is_err());
+        assert_eq!(
+            explicit_endpoint("http://100.64.0.4:7474", "neo4j").unwrap(),
+            "http://100.64.0.4:7474/db/neo4j/tx/commit"
+        );
         assert!(explicit_endpoint("neo.example", "neo4j").is_err());
     }
 
