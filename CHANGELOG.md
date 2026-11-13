@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — remove the wiki tools from the MCP server
+
+### Removed
+- **`wiki_search` / `wiki_fetch` / `wiki_write` are no longer MCP tools.** On an install
+  without a `tenants:` block they could only answer `tenant '(untenanted)' has no vault
+  configured` — main has no vault, so the three tools were dead weight in every prompt
+  and models kept reaching for them (including to fetch plain memory files, which
+  `memory_recall` already serves). The wiki subsystem itself is untouched: the indexer,
+  the daemon task, atlas and SilverBullet still serve any install that DOES configure a
+  tenant vault; only the MCP exposure is gone. Bring it back by re-adding the three
+  tool schemas and handlers to `engram-mcp.rs` when a host actually has a vault.
+
 ## Unreleased — memory-tidy: clear report, store-bound approvals
 
 ### Fixed
