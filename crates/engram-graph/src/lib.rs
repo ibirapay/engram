@@ -217,22 +217,43 @@ RETURN r.fact AS fact LIMIT $lim";
 /// from, so it matches them exactly the way the legacy query matched `Entity.name`
 /// (equality, so filler words never hit). Without it a bootstrapped store recalls
 /// zero facts on the hook's fast path.
+/// Facts about the query's tokens, ranked. The rules the original lacked:
+/// whole-WORD matching only (bare CONTAINS let "esta" match "restarts");
+/// the CONTAINS clauses are prefilters for the regex, which the engine would
+/// otherwise evaluate per triple per token; an EXACT subject/object match
+/// (score 2.0) outranks a partial (1.0); at most 3 facts per token per
+/// branch, chosen by score and fact text — not by traversal order — so one
+/// chatty entity cannot fill the whole budget; and facts corroborated by
+/// more query tokens (`support`) come first. The old form was
+/// `RETURN DISTINCT fact LIMIT $lim`: an arbitrary 6, the source of the
+/// off-topic graph-fact noise.
+/// ponytail: no diacritic folding on either side here — the graph's
+/// subject/object are model-extracted and mostly ASCII; if accent-extracted
+/// triples show up, store a folded property at extraction time.
 const NATIVE_FACTS_FOR_TOKENS: &str = "\
 UNWIND $names AS name \
 CALL { \
   WITH name \
+  WITH name, '(?s).*([^\\\\p{L}\\\\p{N}]|^)\\\\Q' + toLower(name) + '\\\\E([^\\\\p{L}\\\\p{N}]|$).*' AS pat \
   MATCH (m:EngramMemory {tenant: $tenant, slug: $slug})-[:HAS_TRIPLE]->(t:EngramTriple {tenant: $tenant, status: 'active'}) \
   WHERE t.valid_until IS NULL \
     AND (toLower(t.subject) CONTAINS toLower(name) OR toLower(t.object) CONTAINS toLower(name)) \
-  RETURN t.subject + ' ' + t.relation + ' ' + t.object AS fact \
+    AND (toLower(t.subject) =~ pat OR toLower(t.object) =~ pat) \
+  WITH t.subject + ' ' + t.relation + ' ' + t.object AS fact, \
+       CASE WHEN toLower(t.subject) = toLower(name) OR toLower(t.object) = toLower(name) THEN 2.0 ELSE 1.0 END AS score \
+  WITH fact, max(score) AS score ORDER BY score DESC, fact LIMIT 3 \
+  RETURN fact, score \
   UNION \
   WITH name \
   MATCH (m:EngramMemory {tenant: $tenant, slug: $slug})-[:HAS_FACT]->(f:EngramFact {tenant: $tenant}) \
   WHERE f.valid_until IS NULL \
     AND (toLower(f.subject) = toLower(name) OR toLower(f.object) = toLower(name)) \
-  RETURN f.text AS fact \
+  WITH f.text AS fact ORDER BY fact LIMIT 3 \
+  RETURN fact, 2.0 AS score \
 } \
-RETURN DISTINCT fact LIMIT $lim";
+WITH fact, max(score) AS score, count(*) AS support \
+RETURN fact \
+ORDER BY score DESC, support DESC, fact LIMIT $lim";
 
 const LEGACY_SEMANTIC_FILES: &str = "\
 MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity) WHERE e.group_id = $tenant \
