@@ -13,8 +13,8 @@ call is delegated to a model. Two different operations come out of that:
   * COMPRESS   — members say the same thing differently, so an umbrella is generated.
                  This IS lossy; `sentence_coverage` is a rejection heuristic, NOT proof
                  of losslessness (it is lexical prefix matching, so two rewordings of
-                 one fact never "cover" each other). Safety here comes from the Codex/
-                 human gate plus REVERSIBILITY, not from the score.
+                 one fact never "cover" each other). Safety here comes from the self-
+                 review/human gate plus REVERSIBILITY, not from the score.
   * RECOVERABLE — absorbed sources go to .quarantine/ (undo) and are de-indexed via
                  delete_memory.sh, which snapshots to .trash/ (90-day undo) first.
   * BOUNDED    — at most `max_merges_per_run` clusters per run.
@@ -51,27 +51,23 @@ AC_DEFAULTS = {
     "merge_threshold": 0.92,      # cosine >= this to auto-merge (stricter than the 0.86 finder)
     "max_merges_per_run": 2,
     # Who reviews a merge before it can auto-apply:
-    #   auto   (default) — use Codex if it's installed; otherwise fall back to HUMAN
-    #                      (every merge -> Telegram approval queue). Best for portability:
-    #                      most users have Claude but NOT Codex.
-    #   codex  — force Codex review (near-lossless+clean auto-applies, else human queue).
-    #   human  — NO Codex; EVERY merge goes to the human Telegram queue (nothing auto-
-    #            applies). Safe default when you have only one agent.
+    #   self   (default) — engram's OWN generate backend (the same dependency harvest
+    #                      and distill already use, so this adds no new one). No
+    #                      external reviewer CLIs at all (owner rule 2026-11-21:
+    #                      engram depends on nothing but itself).
+    #   human  — no model review; EVERY merge goes to the human Telegram queue (nothing
+    #            auto-applies). Portable escape hatch for a store that distrusts its
+    #            own model.
     # There is intentionally no "no reviewer, just auto-apply" mode — a compressed merge
-    # always gets either Codex or a human before it touches the store.
-    "review_gate": "auto",
+    # always gets either the store's own model or a human before it touches the store.
+    "review_gate": "self",
     # Autonomous mode: NO human queue anywhere. A COMPRESS merge auto-applies when
-    # Codex says APPROVE (lossy coverage allowed — safety is REVERSIBILITY: sources
-    # stay in .quarantine/ for 30 days); any other verdict is SKIPPED, not queued.
-    # Orphan prunes apply straight to .trash/ (90-day undo). FAIL-CLOSED: with no
-    # Codex reviewer available an autonomous run mutates NOTHING (it does not fall
-    # back to a human queue).
+    # the self-review says APPROVE (lossy coverage allowed — safety is REVERSIBILITY:
+    # sources stay in .quarantine/ for 30 days); any other verdict is SKIPPED, not
+    # queued. Orphan prunes apply straight to .trash/ (90-day undo). FAIL-CLOSED: if
+    # the store's own backend cannot return a parseable verdict, an autonomous run
+    # mutates NOTHING (it does not fall back to a human queue).
     "autonomous": False,
-    # When the primary reviewer FAILS MECHANICALLY (no CLI, rate-limited, unparseable
-    # output) the verdict goes to a Claude-headless fallback once — the owner's
-    # standing review rule (Codex first, Claude when Codex is down). A real REJECT
-    # never falls back. Safety does not depend on the reviewer: quarantine + reconcile.
-    "fallback_reviewer": True,
     # Orphan pruning: PROPOSE (never auto) stale memories with no merge target for a
     # one-tap Telegram prune. frequency==0 means "never discussed", NOT "worthless" (a
     # disaster-recovery runbook is freq-0 for a year), so this is human-gated by design
@@ -79,23 +75,18 @@ AC_DEFAULTS = {
     "prune_orphans": True,
     "orphan_age_days": 90,
     "max_prunes_per_run": 5,
-    # When Codex DOES review: auto-apply only a near-LOSSLESS merge (a fact outside
-    # Codex's slice could be dropped otherwise); everything lossy -> the human queue.
+    # Non-automatic self-review mode: auto-apply only a near-LOSSLESS merge (a fact
+    # outside the reviewer's truncated slice could be dropped otherwise); lossy -> queue.
     "min_auto_coverage": 0.90,
 }
 
 
 def _resolve_gate(ac) -> str:
-    """codex | human. 'auto' -> codex iff the advisor script AND the codex CLI are both
-    present; else human (Telegram approval). So a user without Codex still gets a safe
-    reviewer (themselves, one tap) instead of unreviewed auto-merges."""
-    import shutil
-    g = (ac.get("review_gate") or "auto").lower()
-    if g in ("codex", "human"):
-        return g
-    return "codex" if (ADVISOR.exists() and shutil.which("codex")) else "human"
-
-ADVISOR = HOME / ".claude" / "skills" / "code-advisor" / "scripts" / "code_advisor.py"
+    """self | human. The reviewer is the store's own generate backend — engram has no
+    external reviewer dependency of any kind. 'human' stays as the portable escape
+    hatch: every merge queues to a person instead. Legacy 'codex'/'auto' config values
+    map to self (never to a CLI)."""
+    return "human" if (ac.get("review_gate") or "self").lower() == "human" else "self"
 
 
 def ac_cfg(cfg):
@@ -328,7 +319,7 @@ def main():
             print(f"[auto-curate] skip mixed-type cluster {files}")
     typed = typed[:ac["max_merges_per_run"]]
 
-    gate_mode = _resolve_gate(ac)     # "codex" or "human"
+    gate_mode = _resolve_gate(ac)     # "self" or "human"
     print(f"# memory_auto_curate — apply={apply} enabled={ac['enabled']} "
           f"threshold={ac['merge_threshold']} cap={ac['max_merges_per_run']} review_gate={gate_mode}")
     print(f"near-dup clusters this run: {len(typed)}")
@@ -369,7 +360,7 @@ def main():
             if gate_mode == "human" and not ac.get("autonomous"):  # explicit no-auto policy
                 # (autonomous DOES apply supersede: byte-identical keeper, zero model judgment)
                 gate.propose("merge_apply", params, f"Supersede (lossless). {preview}",
-                             files=files, codex_verdict="supersede-deterministic")
+                             files=files, verdict="supersede-deterministic")
                 print("  QUEUED (human gate)"); queued += 1
                 continue
             ok, detail = gate._apply_merge(params)
@@ -395,7 +386,7 @@ def main():
         if not okdoc:
             print(f"· {files}: HOLD (malformed umbrella: {whydoc}) — skipping"); continue
         # Credential RECONCILIATION (replaces the blanket secret-HOLD, 2026-11-12):
-        # every REMOTE hop (distill prompt, Codex blob) already redacts AGGRESSIVELY,
+        # every REMOTE hop (distill prompt, review blob) already redacts AGGRESSIVELY,
         # so a credential in the cluster is not a leak risk — the real risk is the
         # umbrella silently DROPPING one. So a cluster merges even when it touches
         # credentials, as long as each credential found in any source still appears
@@ -423,19 +414,20 @@ def main():
         if not apply:
             print(f"  would: {preview}"); continue
         cov = report.get("sentence_coverage", 0.0)
-        # HUMAN gate (no Codex): every merge goes to the Telegram approval queue.
+        # HUMAN gate (no model review): every merge goes to the Telegram approval queue.
         if gate_mode == "human":
             if ac.get("autonomous"):
-                print(f"· {files}: SKIP (autonomous but no Codex reviewer) — fail-closed"); continue
-            gate.propose("merge_apply", params, f"Needs your approval (no Codex). {preview}",
-                         files=files, codex_verdict="human-gate")
-            print("  QUEUED for human approval (human gate — no Codex)"); queued += 1
+                print(f"· {files}: SKIP (autonomous but human gate) — fail-closed"); continue
+            gate.propose("merge_apply", params, f"Needs your approval (human gate). {preview}",
+                         files=files, verdict="human-gate")
+            print("  QUEUED for human approval (human gate)"); queued += 1
             continue
-        # CODEX gate: auto-apply only a near-LOSSLESS + clean merge; lossy or non-clean
-        # -> human queue. coverage is on the FULL sources (not Codex's truncated slice).
-        # autonomous mode widens this: Codex APPROVE alone is enough (reversibility,
+        # SELF gate: the store's own backend reviews. Non-autonomous auto-applies only
+        # a near-LOSSLESS + clean merge; lossy or non-clean -> human queue. Coverage is
+        # computed on the FULL sources, never on the reviewer's truncated slice.
+        # autonomous mode widens this: an APPROVE alone is enough (reversibility,
         # not coverage, is the safety), everything else is SKIPPED below.
-        verdict = _codex_verdict(doc, files, ac)
+        verdict = _self_verdict(doc, files)
         if verdict == "APPROVE" and (ac.get("autonomous") or cov >= ac["min_auto_coverage"]):
             ok, detail = gate._apply_merge(params)
             # Report the ACTUAL outcome — this used to print AUTO-APPLIED before
@@ -448,13 +440,13 @@ def main():
                 done += 1
         else:
             if verdict != "APPROVE":                    # name the REAL reason — cov may be fine
-                why = f"Codex {verdict}"
+                why = f"self-review {verdict}"
             else:
                 why = f"lossy compression (cov={cov} < {ac['min_auto_coverage']})"
             if ac.get("autonomous"):
                 print(f"· {files}: SKIP ({why}) — not queued"); continue
             gate.propose("merge_apply", params, f"Needs approval — {why}. {preview}",
-                         files=files, codex_verdict=verdict)
+                         files=files, verdict=verdict)
             print(f"  QUEUED for human approval ({why})"); queued += 1
 
     pruned = _orphan_prune_pass(cfg, ac, store, gate, apply) if ac.get("prune_orphans") else 0
@@ -526,30 +518,14 @@ def _strict_verdict(stdout: str) -> str:
     return "REJECT" if verdicts else "DEFER-no-verdict"
 
 
-def _claude_fallback_verdict(task, blob) -> str:
-    """Fallback reviewer per the owner's standing rule (Codex first; Claude headless
-    when Codex is logged out/rate-limited/absent). Same strict token gate. NOTE the
-    weaker independence — the generation backend is also Claude — the hard safety is
-    unchanged: 30-day quarantine + the reconciliation guard, not reviewer variety."""
-    import shutil
-    if not shutil.which("claude"):
-        return "DEFER-no-claude"
-    try:
-        r = subprocess.run(
-            ["claude", "-p", "--output-format", "text", "--no-session-persistence"],
-            input=f"{task}\n\n{blob}", capture_output=True, text=True, timeout=240)
-    except Exception as e:
-        return f"DEFER-claude-{type(e).__name__}"
-    if r.returncode != 0:
-        return "DEFER-claude-rc"
-    return _strict_verdict(r.stdout)
-
-
-def _codex_verdict(umbrella_doc, source_files, ac) -> str:
-    """Ask the Codex advisor whether the compressed umbrella loses information vs its
-    sources or introduces a secret. Returns APPROVE only on an explicit clean verdict.
-    A MECHANICAL failure (no advisor, rate-limited, no token) routes to the fallback
-    reviewer (Claude headless) when fallback_reviewer is on; a real REJECT stays."""
+def _self_verdict(umbrella_doc, source_files) -> str:
+    """Ask ENGRAM'S OWN generate backend (role 'verify' — the same dependency harvest
+    and distill already use) whether the compressed umbrella loses information vs its
+    sources or introduces a secret. APPROVE only on the exact strict token; anything
+    unparseable or raised is DEFER-* (fail-closed → skipped/queued as before).
+    Independence is limited — the reviewer shares the writing model's blind spots —
+    but the hard safety never came from reviewer variety: 30-day quarantine and the
+    credential reconciliation do that."""
     task = ("Does this umbrella drop any durable fact from the sources, or add a secret/"
             "hallucination? Reply a final line exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT'.")
     # Redact EVERYTHING before it reaches the advisor subprocess/backend/logs — the
@@ -559,21 +535,12 @@ def _codex_verdict(umbrella_doc, source_files, ac) -> str:
     srcs = "\n\n".join(f"### {f}\n{engram_secrets.redact((MEM/f).read_text(errors='ignore')[:2000])[0]}"
                        for f in source_files)
     blob = f"PROPOSED UMBRELLA:\n{safe_umbrella[:4000]}\n\nSOURCES IT REPLACES:\n{srcs[:6000]}"
-    fb = bool(ac.get("fallback_reviewer", True))
-    if not ADVISOR.exists():
-        return _claude_fallback_verdict(task, blob) if fb else "DEFER-no-advisor"
     try:
-        r = subprocess.run(
-            [sys.executable, str(ADVISOR), "--mode", "review", "--stdin", "--task", task],
-            input=blob, capture_output=True, text=True, timeout=180)
+        import engram_llm
+        out = engram_llm.generate(f"{task}\n\n{blob}", role="verify")
     except Exception as e:
-        return _claude_fallback_verdict(task, blob) if fb else f"DEFER-{type(e).__name__}"
-    if r.returncode != 0:
-        return _claude_fallback_verdict(task, blob) if fb else "DEFER-advisor-rc"
-    v = _strict_verdict(r.stdout)
-    if v.startswith("DEFER") and fb:      # token gate got nothing parseable — try fallback once
-        return _claude_fallback_verdict(task, blob)
-    return v
+        return f"DEFER-{type(e).__name__}"
+    return _strict_verdict(out)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,8 @@ variable does not survive between tool calls). Plain `python3` has no PyYAML, ca
 
 What it does:
 - **Merges near-duplicate memories** (same type, very similar text) into one umbrella
-  memory. Merges are *reviewed* (Codex if installed, else queued for the user) and
+  memory. Merges are *reviewed* (by the store's own model — fail-closed: no clear
+  APPROVE, no merge) and
   *reversible*: absorbed sources go to `.quarantine/` for a 30-day probation.
 - **Proposes stale orphans** (old, never-recalled, no merge target) for pruning. Never
   auto-deleted; approved prunes go to `.trash/` (90-day undo).

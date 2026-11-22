@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """engram_telegram_gate.py — async human-approval queue for the risky autonomous
-memory ops (skill installs, purges, permanent deletes, Codex-deferred merges).
+memory ops (skill installs, purges, permanent deletes, self-review-deferred merges).
 
 Design (Fable 2026-07-11): the daemon PROPOSES; a human APPROVES with one tap on
 Telegram; a dumb dispatcher APPLIES. The daemon never blocks — propose is
@@ -242,7 +242,7 @@ def _send_proposal(pid, prop):
     kb = {"inline_keyboard": [[{"text": "✅ Approve", "callback_data": f"a:{pid}"},
                                {"text": "❌ Reject", "callback_data": f"r:{pid}"}]]}
     txt = (f"🧠 engram proposal — {prop['op']}\n\n{prop['preview']}\n\n"
-           f"Codex: {prop.get('codex_verdict', 'n/a')} · expires in {DEFAULT_TTL_H}h")
+           f"review: {prop.get('verdict', 'n/a')} · expires in {DEFAULT_TTL_H}h")
     res = _tg("sendMessage", chat_id=CHAT_ID, text=txt, reply_markup=kb)
     if res and res.get("ok"):
         return res["result"]["message_id"]
@@ -250,7 +250,7 @@ def _send_proposal(pid, prop):
 
 
 # ---- Proposal lifecycle ----------------------------------------------------
-def propose(op, params, preview, files=None, codex_verdict=None, ttl_h=DEFAULT_TTL_H):
+def propose(op, params, preview, files=None, verdict=None, ttl_h=DEFAULT_TTL_H):
     """Queue an op for human approval. Returns the proposal id (idempotent: the same
     op+params re-proposes at most once; an already-queued/decided id is left as-is)."""
     pid = _id(op, params)
@@ -258,7 +258,7 @@ def propose(op, params, preview, files=None, codex_verdict=None, ttl_h=DEFAULT_T
     if st in ("pending", "approved", "applied"):
         return pid                       # already in flight / done — don't spam
     prop = {"id": pid, "op": op, "store": SLUG, "params": params, "preview": preview,
-            "source_hashes": source_hashes(files), "codex_verdict": codex_verdict,
+            "source_hashes": source_hashes(files), "verdict": verdict,
             "created_at": _now(), "expires_at": _now() + ttl_h * 3600}
     prop["telegram_msg_id"] = _send_proposal(pid, prop)
     (_dir("pending") / f"{pid}.json").write_text(json.dumps(prop, indent=1))

@@ -29,7 +29,7 @@ the handful of ops that genuinely need you.
 |---|---|---|
 | `daemon.intervals.maintenance` | `315360000` (~off) | `21600` (every 6h) — runs harvest→graduate→score |
 | `auto_graduate.enabled` | `false` | `true` — durable `user-direct` facts enter recall (deterministic gates) |
-| `auto_curate.enabled` | `false` | `true` — merge near-duplicates (Codex-reviewed, reversible) |
+| `auto_curate.enabled` | `false` | `true` — merge near-duplicates (self-reviewed by the store's own backend, reversible) |
 | `skill_autoinstall.enabled` | `false` | `true` — proven memories → skills (via approval) |
 
 All gates are deterministic and **fail-closed**; the LLM is value-only, never a safety
@@ -62,7 +62,7 @@ with `engram_telegram_gate.py --approve <id>`.
 - **Auto-apply + one-tap UNDO** (reversible judgment): near-lossless consolidations —
   sources go to `.quarantine/` (30-day probation, restorable), you get an Undo button.
 - **Async APPROVE required** (irreversible/behavioral, 72h→drop): **skill installs**,
-  **lossy/Codex-deferred merges**, **orphan prunes**, **suspect restores**, index rewrites.
+  **lossy/self-review-deferred merges**, **orphan prunes**, **suspect restores**, index rewrites.
 - **Terminal-only** (never proposed remotely): changes to the gates or thresholds
   themselves (the system must never propose loosening its own leash), and anything
   touching secrets / `daemon.env`.
@@ -72,12 +72,14 @@ with `engram_telegram_gate.py --approve <id>`.
 - **Weekly digest** on Telegram: what the daemon did autonomously, and what's pending.
 - **Recoverability**: deletes → `.trash/` (90 days); merges → `.quarantine/` (30-day
   probation) then `.trash/`. Nothing is destroyed without a long undo window.
-- **Codex** reviews risky ops before they apply, but it's **optional** — most users
-  run only Claude. For auto-curate, `auto_curate.review_gate` controls it:
-  - `auto` (default) — use Codex **if installed**, else fall back to a **human Telegram
-    approval** for every merge. So without Codex you still get a safe reviewer (you,
-    one tap), never an unreviewed auto-merge.
-  - `codex` — force Codex; `human` — force the Telegram gate for every merge.
+- **Self-review** (the store's own generate backend, role `verify`) reviews risky ops
+  before they apply. There is no external reviewer CLI anywhere — engram depends on
+  nothing but itself (owner rule 2026-11-21). For auto-curate,
+  `auto_curate.review_gate` controls it:
+  - `self` (default) — engram's own backend judges each merge with the strict
+    VERDICT token; unparseable = fail-closed (never applied).
+  - `human` — the Telegram approval queue for every merge. Legacy `auto`/`codex`
+    values map to `self`.
   Skill installs never needed Codex — they always require your approval.
 - **Kill-switches**: set any `*.enabled: false` (takes effect next tick);
   `touch ~/.claude/skills/auto/.disabled` to freeze skill installs;

@@ -503,7 +503,7 @@ def task_maintenance():
 def task_curate():
     """CONSOLIDATE (weekly): auto-merge near-duplicate memories. Same slow time-constant
     as distill — near-dups accrue as new memories graduate over days, and each merge is
-    Codex-reviewed (needs generate) + reversible. No-op unless auto_curate.enabled=true.
+    self-reviewed by its own backend (needs generate) + reversible. No-op unless auto_curate.enabled=true.
     Uses the vector venv (qdrant-client) for the ANN clustering."""
     if not (cfg().get("auto_curate") or {}).get("enabled"):
         return
