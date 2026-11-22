@@ -157,6 +157,20 @@ pub struct VectorStore {
     /// Qdrant Cloud. Sent as the `api-key` header.
     #[serde(default)]
     pub api_key: Secret,
+    /// `vector_store.recall` — read by the Python side for years; the Rust
+    /// path parsed none of it, so a documented relevance floor silently did
+    /// nothing here.
+    #[serde(default)]
+    pub recall: VectorRecall,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct VectorRecall {
+    /// Minimum cosine for a vector hit to count at all. 0.0 = no floor
+    /// (the historical behaviour). `default_k` from the yaml is not modelled:
+    /// nothing reads it in any leg.
+    #[serde(default)]
+    pub threshold: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -317,6 +331,7 @@ impl Default for VectorStore {
             wiki_collection: default_wiki_collection(),
             timeout_seconds: 0,
             api_key: Secret::default(),
+            recall: VectorRecall::default(),
         }
     }
 }

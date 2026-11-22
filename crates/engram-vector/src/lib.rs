@@ -11,6 +11,11 @@ pub struct QdrantClient {
     base_url: String,
     collection: String,
     client: Client,
+    /// Cosine floor for searches from this client. 0.0 = no floor. Set from
+    /// `vector_store.recall.threshold` by [`QdrantClient::for_tenant`] for the
+    /// memory corpus — the Python side honoured that key; the Rust side parsed
+    /// it nowhere and injected every weak hit RRF could rank.
+    min_score: f64,
 }
 
 #[derive(Debug, Error)]
@@ -211,12 +216,16 @@ impl QdrantClient {
             Corpus::Memory => tenant.memory_collection(),
             Corpus::Wiki => tenant.wiki_collection(),
         };
-        Self::with_credentials(
+        let mut client = Self::with_credentials(
             config.vector_store.url.clone(),
             collection.to_string(),
             config.vector_store.api_key.present(),
             config.vector_store.timeout_seconds,
-        )
+        );
+        if corpus == Corpus::Memory {
+            client.min_score = config.vector_store.recall.threshold.max(0.0);
+        }
+        client
     }
 
     pub fn with_credentials(
@@ -245,6 +254,7 @@ impl QdrantClient {
             base_url: base_url.into().trim_end_matches('/').into(),
             collection: collection.into(),
             client: builder.build().unwrap_or_else(|_| Client::new()),
+            min_score: 0.0,
         }
     }
     /// `scope.space` is the active [`engram_config::Config::embedding_space_id`].
@@ -270,6 +280,11 @@ impl QdrantClient {
     ) -> Result<Vec<Hit>, VectorError> {
         let mut body = serde_json::json!({"query": vector, "limit": limit, "with_payload": true});
         body["filter"] = search_filter(scope);
+        if self.min_score > 0.0 {
+            // The field is `score_threshold`. `min_score` parses and does
+            // nothing — verified against this server (1.20.2) 2026-11-21.
+            body["score_threshold"] = serde_json::json!(self.min_score);
+        }
         let response = self
             .client
             .post(format!(

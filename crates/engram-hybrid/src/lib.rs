@@ -9,7 +9,7 @@
 use engram_config::Config;
 use engram_graph::GraphClient;
 use engram_models::OpenAiCompatibleClient;
-use engram_retrieval::{bm25, rrf};
+use engram_retrieval::{bm25, rrf, rrf_weighted};
 use engram_store::{Memory, load};
 use engram_tenant::{GraphScope, Tenant};
 use engram_vector::{Corpus, QdrantClient, Scope};
@@ -314,9 +314,16 @@ async fn recall_with_backend(
         graph.files.clone()
     } else {
         // Weights and the RRF constant come from config; they were hardcoded to
-        // equal weighting and 60.0 while engram.yaml documented both.
-        rrf(
+        // equal weighting and 60.0 while engram.yaml documented both. The order
+        // of the rankings below must match the weight lookup.
+        let weight_of = |leg: &str| config.recall.hybrid.weights.get(leg).copied().unwrap_or(1.0);
+        rrf_weighted(
             &[keyword.clone(), vector.clone(), graph.files.clone()],
+            &[
+                weight_of("keyword"),
+                weight_of("vector"),
+                weight_of("graph"),
+            ],
             k,
             config.recall.hybrid.k_rrf,
         )
@@ -677,6 +684,9 @@ fn graph_query_tokens(query: &str) -> Vec<String> {
     query
         .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
         .filter(|word| word.len() >= 4 && seen.insert(word.to_lowercase()))
+        // Same function-word filter the BM25 leg uses: "esta"/"como" reached
+        // the fact query and matched "restarts" through a substring.
+        .filter(|word| !engram_retrieval::is_stopword(word))
         .take(32)
         .map(str::to_string)
         .collect()
