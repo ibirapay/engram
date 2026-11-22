@@ -60,9 +60,22 @@ AC_DEFAULTS = {
     # There is intentionally no "no reviewer, just auto-apply" mode — a compressed merge
     # always gets either Codex or a human before it touches the store.
     "review_gate": "auto",
+    # Autonomous mode: NO human queue anywhere. A COMPRESS merge auto-applies when
+    # Codex says APPROVE (lossy coverage allowed — safety is REVERSIBILITY: sources
+    # stay in .quarantine/ for 30 days); any other verdict is SKIPPED, not queued.
+    # Orphan prunes apply straight to .trash/ (90-day undo). FAIL-CLOSED: with no
+    # Codex reviewer available an autonomous run mutates NOTHING (it does not fall
+    # back to a human queue).
+    "autonomous": False,
+    # When the primary reviewer FAILS MECHANICALLY (no CLI, rate-limited, unparseable
+    # output) the verdict goes to a Claude-headless fallback once — the owner's
+    # standing review rule (Codex first, Claude when Codex is down). A real REJECT
+    # never falls back. Safety does not depend on the reviewer: quarantine + reconcile.
+    "fallback_reviewer": True,
     # Orphan pruning: PROPOSE (never auto) stale memories with no merge target for a
     # one-tap Telegram prune. frequency==0 means "never discussed", NOT "worthless" (a
-    # disaster-recovery runbook is freq-0 for a year), so this is human-gated by design.
+    # disaster-recovery runbook is freq-0 for a year), so this is human-gated by design
+    # — unless autonomous: true, which prunes directly to .trash.
     "prune_orphans": True,
     "orphan_age_days": 90,
     "max_prunes_per_run": 5,
@@ -353,7 +366,8 @@ def main():
             print(f"\n· {files} -> {keeper}  [SUPERSEDE — lossless]")
             if not apply:
                 print(f"  would: {preview}"); continue
-            if gate_mode == "human":                   # respect an explicit no-auto policy
+            if gate_mode == "human" and not ac.get("autonomous"):  # explicit no-auto policy
+                # (autonomous DOES apply supersede: byte-identical keeper, zero model judgment)
                 gate.propose("merge_apply", params, f"Supersede (lossless). {preview}",
                              files=files, codex_verdict="supersede-deterministic")
                 print("  QUEUED (human gate)"); queued += 1
@@ -374,15 +388,26 @@ def main():
         # appending everything. sentence_coverage is recorded, not gated.
         final, report = mdv.distill_cluster(umbrella.stem, files, cfg=cfg, preserve_sources=False)
         body = _body_of(final)
-        # Secret-scan desc+body AND every source: if any holds a credential, do NOT
-        # consolidate (leave as-is) — never route secret-bearing text onward.
-        if (not body.strip() or engram_secrets.looks_secret(f"{desc}\n{body}")
-                or any(engram_secrets.looks_secret((MEM/f).read_text(errors="ignore")) for f in files)):
-            print(f"· {files}: HOLD (empty umbrella or secret in cluster) — skipping"); continue
+        if not body.strip():
+            print(f"· {files}: HOLD (empty umbrella) — skipping"); continue
         doc = f"---\nname: {umbrella.stem}\ndescription: {desc}\nmetadata:\n  type: {typ}\n---\n\n{body}"
         okdoc, whydoc = gate.validate_memory_doc(doc)
         if not okdoc:
             print(f"· {files}: HOLD (malformed umbrella: {whydoc}) — skipping"); continue
+        # Credential RECONCILIATION (replaces the blanket secret-HOLD, 2026-11-12):
+        # every REMOTE hop (distill prompt, Codex blob) already redacts AGGRESSIVELY,
+        # so a credential in the cluster is not a leak risk — the real risk is the
+        # umbrella silently DROPPING one. So a cluster merges even when it touches
+        # credentials, as long as each credential found in any source still appears
+        # verbatim in the final doc. Only CREDENTIAL_RE (high-precision) counts —
+        # txids/EVM-addresses/UUIDs are public data the aggressive scanner used to
+        # block on, which is why secret-bearing clusters never consolidated.
+        missing = sorted({c for f in files
+                          for c in engram_secrets.credentials((MEM / f).read_text(errors="ignore"))
+                          if c not in doc})
+        if missing:
+            print(f"· {files}: HOLD (umbrella drops {len(missing)} credential(s): "
+                  f"{[c[:50] for c in missing[:3]]}) — skipping"); continue
         absorbed = [f for f in files if f != umbrella.name]
         # transaction id so a second merge on the same umbrella can't clobber the
         # first merge's backup (each merge's originals live under their own dir)
@@ -400,14 +425,18 @@ def main():
         cov = report.get("sentence_coverage", 0.0)
         # HUMAN gate (no Codex): every merge goes to the Telegram approval queue.
         if gate_mode == "human":
+            if ac.get("autonomous"):
+                print(f"· {files}: SKIP (autonomous but no Codex reviewer) — fail-closed"); continue
             gate.propose("merge_apply", params, f"Needs your approval (no Codex). {preview}",
                          files=files, codex_verdict="human-gate")
             print("  QUEUED for human approval (human gate — no Codex)"); queued += 1
             continue
         # CODEX gate: auto-apply only a near-LOSSLESS + clean merge; lossy or non-clean
         # -> human queue. coverage is on the FULL sources (not Codex's truncated slice).
-        verdict = _codex_verdict(doc, files)
-        if cov >= ac["min_auto_coverage"] and verdict == "APPROVE":
+        # autonomous mode widens this: Codex APPROVE alone is enough (reversibility,
+        # not coverage, is the safety), everything else is SKIPPED below.
+        verdict = _codex_verdict(doc, files, ac)
+        if verdict == "APPROVE" and (ac.get("autonomous") or cov >= ac["min_auto_coverage"]):
             ok, detail = gate._apply_merge(params)
             # Report the ACTUAL outcome — this used to print AUTO-APPLIED before
             # checking ok, so a refused or partial merge still read as success.
@@ -418,8 +447,12 @@ def main():
                                  f"🧠 auto-merged (near-lossless): {preview}\nTap UNDO to reverse.")
                 done += 1
         else:
-            why = (f"lossy compression (cov={cov} < {ac['min_auto_coverage']})"
-                   if cov < ac["min_auto_coverage"] else f"Codex {verdict}")
+            if verdict != "APPROVE":                    # name the REAL reason — cov may be fine
+                why = f"Codex {verdict}"
+            else:
+                why = f"lossy compression (cov={cov} < {ac['min_auto_coverage']})"
+            if ac.get("autonomous"):
+                print(f"· {files}: SKIP ({why}) — not queued"); continue
             gate.propose("merge_apply", params, f"Needs approval — {why}. {preview}",
                          files=files, codex_verdict=verdict)
             print(f"  QUEUED for human approval ({why})"); queued += 1
@@ -465,22 +498,60 @@ def _orphan_prune_pass(cfg, ac, store, gate, apply) -> int:
     n = 0
     for name in prunable[:int(ac.get("max_prunes_per_run", 5))]:
         preview = f"Prune stale orphan {name}: aged ≥{int(age_min)}d, never recalled, no merge target. → .trash (recoverable)."
-        if apply:
+        if apply and ac.get("autonomous"):
+            # autonomous: prune straight to .trash/ (90-day undo), no Telegram proposal
+            r = subprocess.run(["bash", str(DELETE), name], capture_output=True, text=True, timeout=60)
+            print(f"  PRUNED: {name}" if r.returncode == 0 else f"  prune FAILED: {name}: {r.stderr.strip()[:150]}")
+        elif apply:
             gate.propose("orphan_prune", {"name": name}, preview, files=[name])
         else:
             print(f"  would propose prune: {name}")
         n += 1
     if prunable:
-        print(f"[orphan-prune] {len(prunable)} orphan(s); proposed {n} (cap {ac.get('max_prunes_per_run', 5)})")
+        mode = "pruned" if ac.get("autonomous") else "proposed"
+        print(f"[orphan-prune] {len(prunable)} orphan(s); {mode} {n} (cap {ac.get('max_prunes_per_run', 5)})")
     return n
 
 
-def _codex_verdict(umbrella_doc, source_files) -> str:
+def _strict_verdict(stdout: str) -> str:
+    """Strict token rules — injected source text could try to spoof a verdict.
+    Require: exactly ONE verdict token anywhere, it is APPROVE, and it is on the LAST
+    non-empty line. Anything else is not an approval (fail-closed)."""
+    import re as _re
+    verdicts = _re.findall(r"VERDICT:\s*(APPROVE|REJECT)", stdout or "", _re.I)
+    lines = [ln.strip() for ln in (stdout or "").splitlines() if ln.strip()]
+    last = lines[-1].upper() if lines else ""
+    if len(verdicts) == 1 and verdicts[0].upper() == "APPROVE" and last == "VERDICT: APPROVE":
+        return "APPROVE"
+    return "REJECT" if verdicts else "DEFER-no-verdict"
+
+
+def _claude_fallback_verdict(task, blob) -> str:
+    """Fallback reviewer per the owner's standing rule (Codex first; Claude headless
+    when Codex is logged out/rate-limited/absent). Same strict token gate. NOTE the
+    weaker independence — the generation backend is also Claude — the hard safety is
+    unchanged: 30-day quarantine + the reconciliation guard, not reviewer variety."""
+    import shutil
+    if not shutil.which("claude"):
+        return "DEFER-no-claude"
+    try:
+        r = subprocess.run(
+            ["claude", "-p", "--output-format", "text", "--no-session-persistence"],
+            input=f"{task}\n\n{blob}", capture_output=True, text=True, timeout=240)
+    except Exception as e:
+        return f"DEFER-claude-{type(e).__name__}"
+    if r.returncode != 0:
+        return "DEFER-claude-rc"
+    return _strict_verdict(r.stdout)
+
+
+def _codex_verdict(umbrella_doc, source_files, ac) -> str:
     """Ask the Codex advisor whether the compressed umbrella loses information vs its
-    sources or introduces a secret. Returns APPROVE only on an explicit clean verdict;
-    DEFER on anything else (fail-closed → routes to the human queue)."""
-    if not ADVISOR.exists():
-        return "DEFER-no-advisor"
+    sources or introduces a secret. Returns APPROVE only on an explicit clean verdict.
+    A MECHANICAL failure (no advisor, rate-limited, no token) routes to the fallback
+    reviewer (Claude headless) when fallback_reviewer is on; a real REJECT stays."""
+    task = ("Does this umbrella drop any durable fact from the sources, or add a secret/"
+            "hallucination? Reply a final line exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT'.")
     # Redact EVERYTHING before it reaches the advisor subprocess/backend/logs — the
     # whole umbrella doc (its frontmatter description may hold a secret) AND every
     # source. A scanner-missed credential in a legacy memory must not leak.
@@ -488,26 +559,21 @@ def _codex_verdict(umbrella_doc, source_files) -> str:
     srcs = "\n\n".join(f"### {f}\n{engram_secrets.redact((MEM/f).read_text(errors='ignore')[:2000])[0]}"
                        for f in source_files)
     blob = f"PROPOSED UMBRELLA:\n{safe_umbrella[:4000]}\n\nSOURCES IT REPLACES:\n{srcs[:6000]}"
+    fb = bool(ac.get("fallback_reviewer", True))
+    if not ADVISOR.exists():
+        return _claude_fallback_verdict(task, blob) if fb else "DEFER-no-advisor"
     try:
         r = subprocess.run(
-            [sys.executable, str(ADVISOR), "--mode", "review", "--stdin",
-             "--task", ("Does this umbrella drop any durable fact from the sources, or add a secret/"
-                        "hallucination? Reply a final line exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT'.")],
+            [sys.executable, str(ADVISOR), "--mode", "review", "--stdin", "--task", task],
             input=blob, capture_output=True, text=True, timeout=180)
     except Exception as e:
-        return f"DEFER-{type(e).__name__}"
+        return _claude_fallback_verdict(task, blob) if fb else f"DEFER-{type(e).__name__}"
     if r.returncode != 0:
-        return "DEFER-advisor-rc"
-    import re as _re
-    # Injected source text could try to surface a spoofed verdict token. Require:
-    # exactly ONE verdict anywhere, it is APPROVE, and it is on the LAST non-empty
-    # line. Anything else -> DEFER to the human queue (fail-closed).
-    verdicts = _re.findall(r"VERDICT:\s*(APPROVE|REJECT)", r.stdout or "", _re.I)
-    lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
-    last = lines[-1].upper() if lines else ""
-    if len(verdicts) == 1 and verdicts[0].upper() == "APPROVE" and last == "VERDICT: APPROVE":
-        return "APPROVE"
-    return "REJECT" if verdicts else "DEFER-no-verdict"
+        return _claude_fallback_verdict(task, blob) if fb else "DEFER-advisor-rc"
+    v = _strict_verdict(r.stdout)
+    if v.startswith("DEFER") and fb:      # token gate got nothing parseable — try fallback once
+        return _claude_fallback_verdict(task, blob)
+    return v
 
 
 if __name__ == "__main__":
