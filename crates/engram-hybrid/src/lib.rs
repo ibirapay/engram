@@ -316,7 +316,15 @@ async fn recall_with_backend(
         // Weights and the RRF constant come from config; they were hardcoded to
         // equal weighting and 60.0 while engram.yaml documented both. The order
         // of the rankings below must match the weight lookup.
-        let weight_of = |leg: &str| config.recall.hybrid.weights.get(leg).copied().unwrap_or(1.0);
+        let weight_of = |leg: &str| {
+            config
+                .recall
+                .hybrid
+                .weights
+                .get(leg)
+                .copied()
+                .unwrap_or(1.0)
+        };
         rrf_weighted(
             &[keyword.clone(), vector.clone(), graph.files.clone()],
             &[

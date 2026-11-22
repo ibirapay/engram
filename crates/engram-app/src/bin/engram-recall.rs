@@ -1,5 +1,5 @@
 use clap::Parser;
-use engram_hybrid::recall;
+use engram_hybrid::{recall, recall_fast};
 use engram_tenant::{Derive, resolve_for_cli};
 use std::path::PathBuf;
 
@@ -21,6 +21,11 @@ struct Args {
     tenant: Option<String>,
     #[arg(long, default_value_t = 6)]
     k: usize,
+    /// Run the prompt HOOK's recall (local keyword + vector + one fact query), not
+    /// the full Graphiti one. This is the only way to see what the hook will inject
+    /// for a prompt without sending the prompt.
+    #[arg(long)]
+    fast: bool,
     query: String,
 }
 
@@ -42,15 +47,26 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    match recall(
-        &config_path,
-        &resolved.tenant,
-        &resolved.slug,
-        &args.query,
-        args.k,
-    )
-    .await
-    {
+    let output = if args.fast {
+        recall_fast(
+            &config_path,
+            &resolved.tenant,
+            &resolved.slug,
+            &args.query,
+            args.k,
+        )
+        .await
+    } else {
+        recall(
+            &config_path,
+            &resolved.tenant,
+            &resolved.slug,
+            &args.query,
+            args.k,
+        )
+        .await
+    };
+    match output {
         Ok(output) => println!("{}", serde_json::to_string_pretty(&output).unwrap()),
         Err(error) => {
             eprintln!("{error}");

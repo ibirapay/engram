@@ -314,6 +314,16 @@ vector_store:
   recall:
     default_k: 6                 # default k for vector search / recall hits
     threshold: 0.0               # min cosine for a search hit (0 = no floor)
+                                 # 0 (no floor) is the safe default for a store nobody has measured,
+                                 # but on a populated store it is NOT neutral: recall fuses the legs by
+                                 # RANK (RRF counts votes, not confidence), so a leg of pure noise
+                                 # still votes, and two weak votes outrank one exact match. Measure
+                                 # yours: run `engram-recall --fast "<a prompt with no real match>"`
+                                 # and "<one it should answer>" against the live store and set the
+                                 # floor between the two top scores. On the reference store
+                                 # (nomic-embed-v1.5, ~900 memories) no-match prompts topped out at
+                                 # 0.57-0.66 and real matches at 0.68-0.73, so 0.67 separates them.
+
   duplicate_finder:
     use_vector_store: true       # light pass uses Qdrant ANN instead of O(n^2) cosine when enabled
 

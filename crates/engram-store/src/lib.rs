@@ -29,9 +29,7 @@ pub fn load(dir: impl AsRef<Path>) -> Result<Vec<Memory>, StoreError> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("md")
-            || path.file_name().and_then(|value| value.to_str()) == Some("MEMORY.md")
-        {
+        if path.extension().and_then(|value| value.to_str()) != Some("md") || is_index(&path) {
             continue;
         }
         let source_mtime = entry
@@ -62,6 +60,18 @@ pub fn load(dir: impl AsRef<Path>) -> Result<Vec<Memory>, StoreError> {
     }
     memories.sort_by(|left, right| left.file.cmp(&right.file));
     Ok(memories)
+}
+
+/// The store's own derived indexes — `MEMORY.md`, `MEMORY_FULL.md` — are lists of
+/// every memory's name and description. They are not memories. Only `MEMORY.md` was
+/// ever excluded, so the full index was read as one more document: every topic word
+/// in the store exists in it (91 KB of them), which lets it win a BM25 ranking, and
+/// it drags up the average document length that every real memory is normalised
+/// against. Derived, regenerable, and named `MEMORY*` by both index writers.
+fn is_index(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.starts_with("MEMORY") && name.ends_with(".md"))
 }
 
 /// Parse a memory's YAML frontmatter into a flat key/value map plus its body.
@@ -137,6 +147,22 @@ fn scalar(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The derived index is not a memory. `MEMORY_FULL.md` — 91 KB of every
+    /// memory's name and description — was being ranked as if it were one, and it
+    /// raised the average document length every real memory is normalised against.
+    #[test]
+    fn skips_every_derived_index_file() {
+        for name in ["MEMORY.md", "MEMORY_FULL.md"] {
+            assert!(
+                is_index(Path::new(name)),
+                "{name} must not load as a memory"
+            );
+        }
+        for name in ["memory_notes.md", "reference_memory_audit.md"] {
+            assert!(!is_index(Path::new(name)), "{name} is a memory");
+        }
+    }
 
     #[test]
     fn parses_canonical_frontmatter() {

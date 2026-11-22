@@ -47,6 +47,19 @@ pub trait Indexable {
     fn id(&self) -> String;
     /// Everything searchable about the record, concatenated.
     fn text(&self) -> String;
+    /// (weight, text) per field. A term in a NAME or a DESCRIPTION is stronger
+    /// evidence that this record IS the thing the query asks about than the same
+    /// term in a body that merely mentions it, so the weight multiplies that term's
+    /// idf. Records without fields — a wiki chunk — take the default.
+    ///
+    /// This replaces the old trick of repeating name ×3 and description ×2 into one
+    /// string. That trick does nothing under BM25: tf saturation (k1 = 1.2) flattens
+    /// tf 3 to within a few percent of tf 1, so the field weighting was inert — and
+    /// the repetition inflated avgdl, which weakened length normalization for every
+    /// other document in the corpus.
+    fn fields(&self) -> Vec<(f64, String)> {
+        vec![(1.0, self.text())]
+    }
 }
 
 impl Indexable for Memory {
@@ -54,14 +67,14 @@ impl Indexable for Memory {
         self.file.clone()
     }
     fn text(&self) -> String {
-        // Field weighting by repetition: name ×3, description ×2, body ×1. A
-        // term in the title/description is a stronger signal than the same term
-        // buried in the body — the same lever `memory_keyword._doc_tokens`
-        // applies on the Python side, which this path had silently dropped.
-        format!(
-            "{} {} {} {} {} {}",
-            self.name, self.name, self.name, self.description, self.description, self.body
-        )
+        format!("{} {} {}", self.name, self.description, self.body)
+    }
+    fn fields(&self) -> Vec<(f64, String)> {
+        vec![
+            (3.0, self.name.clone()),
+            (2.0, self.description.clone()),
+            (1.0, self.body.clone()),
+        ]
     }
 }
 
@@ -69,37 +82,79 @@ pub fn bm25(memories: &[Memory], query: &str, limit: usize) -> Vec<Hit> {
     rank(memories, query, limit)
 }
 
+/// One record as the ranker sees it: its length (for BM25's length normalization),
+/// the term frequencies (tf and df), and the strongest field weight each term
+/// earned. Only the counts are kept as tokens — the token stream itself is never
+/// read again, and cloning 500 tokens per record x 895 records per prompt is the
+/// whole cost of keeping it.
+struct Ranked {
+    id: String,
+    len: usize,
+    counts: HashMap<String, usize>,
+    weight: HashMap<String, f64>,
+}
+
+impl Ranked {
+    fn new<T: Indexable>(record: &T) -> Self {
+        let mut ranked = Self {
+            id: record.id(),
+            len: 0,
+            counts: HashMap::new(),
+            weight: HashMap::new(),
+        };
+        for (weight, text) in record.fields() {
+            for term in tokenize(&text) {
+                ranked.len += 1;
+                *ranked.counts.entry(term.clone()).or_insert(0) += 1;
+                let best = ranked.weight.entry(term).or_insert(0.0);
+                *best = best.max(weight);
+            }
+        }
+        ranked
+    }
+}
+
 /// BM25 over any [`Indexable`] collection.
 pub fn rank<T: Indexable>(records: &[T], query: &str, limit: usize) -> Vec<Hit> {
-    let documents: Vec<Vec<String>> = records.iter().map(|r| tokenize(&r.text())).collect();
-    let terms = tokenize(query);
+    let documents: Vec<Ranked> = records.iter().map(Ranked::new).collect();
+    // Deduped, in query order: a word the user happened to type twice is one
+    // signal, not two, and a stable order keeps the score summable bit-for-bit.
+    let mut terms: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for term in tokenize(query) {
+        if seen.insert(term.clone()) {
+            terms.push(term);
+        }
+    }
     if terms.is_empty() || documents.is_empty() {
         return Vec::new();
     }
-    let average = documents.iter().map(Vec::len).sum::<usize>() as f64 / documents.len() as f64;
-    let mut frequency = HashMap::new();
+    let average = documents.iter().map(|d| d.len).sum::<usize>() as f64 / documents.len() as f64;
+    let mut frequency: HashMap<&str, usize> = HashMap::new();
     for document in &documents {
-        for term in document.iter().collect::<HashSet<_>>() {
+        // Counted from the term map, so a word repeated 40 times in one body
+        // does not make itself look rare.
+        for term in document.counts.keys() {
             *frequency.entry(term.as_str()).or_insert(0usize) += 1;
         }
     }
     let mut hits: Vec<Hit> = documents
         .iter()
-        .enumerate()
-        .map(|(index, document)| {
+        .map(|document| {
             let mut score = 0.0;
             for term in &terms {
-                let count = document.iter().filter(|word| *word == term).count() as f64;
+                let count = *document.counts.get(term.as_str()).unwrap_or(&0) as f64;
                 if count == 0.0 {
                     continue;
                 }
                 let docs = *frequency.get(term.as_str()).unwrap_or(&0) as f64;
                 let idf = ((documents.len() as f64 - docs + 0.5) / (docs + 0.5) + 1.0).ln();
-                score += idf * count * 2.2
-                    / (count + 1.2 * (1.0 - 0.75 + 0.75 * document.len() as f64 / average));
+                let field = *document.weight.get(term.as_str()).unwrap_or(&1.0);
+                score += field * idf * count * 2.2
+                    / (count + 1.2 * (1.0 - 0.75 + 0.75 * document.len as f64 / average));
             }
             Hit {
-                file: records[index].id(),
+                file: document.id.clone(),
                 score,
             }
         })
@@ -117,7 +172,35 @@ pub fn rank<T: Indexable>(records: &[T], query: &str, limit: usize) -> Vec<Hit> 
 
 fn tokenize(text: &str) -> Vec<String> {
     text.split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
-        .filter(|part| part.len() > 1)
+        // Two characters or more, counted in CHARS: `len()` counts bytes, so "é"
+        // and "à" used to pass here, fold to "e"/"a", and then vote as if they
+        // were the common function words they are.
+        .filter(|part| part.chars().nth(1).is_some())
+        .flat_map(|part| {
+            // A compound id is indexed BOTH ways: whole, so an exact id query
+            // ("api-1", "pdv-relay") still lands the file that literally contains
+            // it, and by its parts, so "robosats" matches the memory NAMED
+            // `reference-robosats-gateway`. Emitting only the whole token — what
+            // this did — threw away the name and description weight for every
+            // kebab/snake name in the store, i.e. the whole point of the field
+            // weighting above: a query for the topic word could only ever match
+            // bodies, and an unrelated document that happened to use a
+            // conversational word outranked the memory the query names.
+            //
+            // This matches `bin/memory_keyword.py` for '_' and '-'. It does NOT
+            // match it for '.' '/' ':', which THIS tokenizer has always split
+            // ("127.0.0.1:6333" → "127" "0" "0" "1" "6333") while Python joins
+            // them into one token. Unchanged here, because nothing measured this
+            // afternoon depended on it; it is a known parity gap, not a new one.
+            let mut words = vec![part];
+            if part.contains(['_', '-']) {
+                words.extend(
+                    part.split(['_', '-'])
+                        .filter(|inner| inner.chars().nth(1).is_some()),
+                );
+            }
+            words
+        })
         .filter_map(|part| {
             // Check the stopword BEFORE trusting the fold, and exempt acronyms
             // written in full capitals: "DAS" (the Simples guia), "NAS", "SIM"
@@ -155,14 +238,18 @@ const STOPWORDS: &[&str] = &[
     "suas", "nosso", "nossa", "dele", "dela", "deles", "delas", "ele", "ela", "eles", "elas",
     "voce", "você", "ti", "lhe", "lhes", "foi", "ser", "sao", "esta", "este", "essa", "esse",
     "isso", "isto", "estao", "estão", "está", "tava", "muito", "pouco", "tambem", "também",
-    "ainda", "nao", "não", "sim", "quando", "onde", "sobre", "sob", "ate", "até", "pois",
-    "porque", "são", "quanto", "quanta", "quantos", "quantas", "eu", "pra", "pro", "pelo",
-    "pela", "pelos", "pelas", "num", "dum",
-    // en
+    "ainda", "nao", "não", "sim", "quando", "onde", "sobre", "sob", "ate", "até", "pois", "porque",
+    "são", "quanto", "quanta", "quantos", "quantas", "eu", "pra", "pro", "pelo", "pela", "pelos",
+    "pelas", "num", "dum",
+    // One-character function words that arrive ACCENTED: the length filter counts
+    // chars now (it counted bytes), and these fold to "e"/"a"/"ja"/"ha" — so they
+    // are listed in their real shape, per the contract above. "já"/"há" are plain
+    // function words in this store's prompts ("o que já temos pronto").
+    "é", "à", "às", "há", "já", "ja", "ha", // en
     "the", "an", "of", "to", "in", "on", "for", "with", "without", "that", "this", "these",
     "those", "it", "its", "is", "are", "was", "were", "been", "being", "have", "has", "had",
-    "does", "did", "what", "which", "how", "why", "all", "any", "some", "not", "and", "or",
-    "but", "then", "than", "can", "will", "should", "would", "could",
+    "does", "did", "what", "which", "how", "why", "all", "any", "some", "not", "and", "or", "but",
+    "then", "than", "can", "will", "should", "would", "could",
 ];
 
 pub fn is_stopword(word: &str) -> bool {
@@ -235,12 +322,7 @@ mod tests {
     fn rrf_weight_can_demote_a_leg() {
         // "a" leads the first ranking; a weight of 0 on that ranking must hand
         // the win to "b", which the second ranking put first.
-        let hits = rrf_weighted(
-            &[vec!["a".into()], vec!["b".into()]],
-            &[0.0, 1.0],
-            2,
-            60.0,
-        );
+        let hits = rrf_weighted(&[vec!["a".into()], vec!["b".into()]], &[0.0, 1.0], 2, 60.0);
         assert_eq!(hits[0].file, "b");
     }
     #[test]
@@ -292,8 +374,87 @@ mod tests {
                 source_mtime: 0,
             },
         ];
-        assert_eq!(bm25(&memories, "quanto custa a energia do moises de da", 2)[0].file, "bill.md");
+        assert_eq!(
+            bm25(&memories, "quanto custa a energia do moises de da", 2)[0].file,
+            "bill.md"
+        );
     }
+    #[test]
+    fn a_compound_name_is_searchable_whole_and_by_its_parts() {
+        // The root cause, asserted directly instead of through a ranking: the
+        // memory NAMES in this store are kebab/snake ids, and if the whole name is
+        // one token the topic word never reaches the field the ranker weights most.
+        let words = tokenize("reference-robosats-gateway");
+        assert!(words.contains(&"reference-robosats-gateway".to_string()));
+        assert!(words.contains(&"robosats".to_string()));
+        // Exact ids still match whole ("api-1" is the documented case) and a
+        // single-character part is not emitted.
+        let words = tokenize("api-1");
+        assert!(words.contains(&"api-1".to_string()));
+        assert!(words.contains(&"api".to_string()));
+        assert!(!words.contains(&"1".to_string()));
+    }
+
+    #[test]
+    fn a_memory_named_for_the_topic_beats_prose_that_merely_uses_it() {
+        // The owner's failure, in two documents. "robosats" appears ONLY inside the
+        // kebab name — nowhere else — so the old tokenizer could not see it at all
+        // and the prompt's conversational words won.
+        let memories = vec![
+            Memory {
+                file: "reference-robosats-gateway.md".into(),
+                name: "reference-robosats-gateway".into(),
+                description: "P2P swap coordinator on the gateway".into(),
+                memory_type: "reference".into(),
+                body: "coordinator onion, rs-tn wrapper".into(),
+                source_mtime: 0,
+            },
+            Memory {
+                file: "channel-export.md".into(),
+                name: "channel export".into(),
+                description: "how to export our own channel".into(),
+                memory_type: "feedback".into(),
+                body: "vamos continuar com o projeto quando houver tempo".into(),
+                source_mtime: 0,
+            },
+        ];
+        let hits = bm25(&memories, "vamos continuar com robosats coordinator", 2);
+        assert_eq!(hits[0].file, "reference-robosats-gateway.md");
+    }
+
+    #[test]
+    fn a_repeated_query_word_is_one_signal_not_two() {
+        let memories = vec![
+            Memory {
+                file: "a.md".into(),
+                name: "stratum".into(),
+                description: "stratum".into(),
+                memory_type: "project".into(),
+                body: "one mention".into(),
+                source_mtime: 0,
+            },
+            Memory {
+                file: "b.md".into(),
+                name: "other".into(),
+                description: "unrelated".into(),
+                memory_type: "project".into(),
+                body: "unrelated".into(),
+                source_mtime: 0,
+            },
+        ];
+        // "stratum" once and twice must rank "a" first by the same margin: the
+        // duplicate must not double its own term's weight.
+        let once = bm25(&memories, "stratum other", 2);
+        let twice = bm25(&memories, "stratum stratum other", 2);
+        assert_eq!(once[0].file, "a.md");
+        assert_eq!(twice[0].file, "a.md");
+        let ratio = |hits: &Vec<Hit>| hits[0].score / hits[1].score;
+        assert!(
+            (ratio(&once) - ratio(&twice)).abs() < 0.01,
+            "duplicate changed the ranking: {once:?} vs {twice:?}"
+        );
+    }
+
     #[test]
     fn title_matches_outrank_body_matches() {
         // Same term, twice in the corpus: the memory that has it in the NAME
@@ -304,7 +465,8 @@ mod tests {
                 name: "Kiosk panel".into(),
                 description: "screen".into(),
                 memory_type: "project".into(),
-                body: "stratum proxy configured, stratum proxy defaults, stratum proxy notes".into(),
+                body: "stratum proxy configured, stratum proxy defaults, stratum proxy notes"
+                    .into(),
                 source_mtime: 0,
             },
             Memory {
