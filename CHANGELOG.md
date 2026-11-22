@@ -1,8 +1,108 @@
 # Changelog
 
-## Unreleased — remove the wiki tools from the MCP server
+## 1.2.0 — the Rust engine, tenanted identities, and recall that answers the prompt
 
-### Removed
+Everything merged since 1.1.0 (2026-08-15): the Rust core (markdown retrieval, hybrid recall,
+native graph, vector indexing, an embedding server, the lifecycle runner), multi-tenant agent
+identities and the wiki corpus over them, atlas + SilverBullet + shared web auth, encrypted
+off-host backups, `update.sh`, and **two rounds of recall precision** — the difference between
+injecting *something* and injecting *what the prompt asked for*.
+
+Read the recall sections first if you only read one thing: they change what lands in context on
+every prompt. The multi-tenant sections change how a store is addressed, so read those before
+migrating anything shared. `./update.sh` is the safe way to move a live install (dry-run first);
+switching to `engram-embed` requires rebuilding the vector index once — see that section.
+
+### recall: the prompt-hook injection now answers the prompt (two rounds)
+
+The hook injects on **every** prompt, so an injection that is merely present is a bug.
+Two rounds, each measured before and after against the live store (885 then 895 memories):
+
+- **2026-11-21.** The BM25 tokenizer had no accent folding (`moises` vs `Moisés`) and no
+  function-word filter, so `de/da/do/eu/quanto/custa` put an unrelated TeamSpeak memory
+  (23.8) above the energy-bill memory the prompt named (16.0). Now: Latin diacritics folded,
+  a pt/en function-word list applied **before** the fold (so `nó` = Lightning node survives)
+  with an ALL-CAPS exemption (DAS/NAS/SIM are content). The graph leg's
+  `DISTINCT fact LIMIT 6` (unordered, bare `CONTAINS`, so `esta` matched `restarts`) became
+  word-boundary regex with an exact>partial score and deterministic ordering.
+  `recall.hybrid.weights` and `vector_store.recall.threshold` were documented and parsed but
+  **inert in Rust** — both are honoured now. Qdrant gotcha: on `/points/query` the field is
+  `score_threshold`; **`min_score` parses and does nothing** (verified against server 1.20.2).
+- **2026-11-22 — the first round was not enough.** A prompt that NAMED four memories injected
+  none of them. `tokenize()` emitted a compound id as one token, so `reference-robosats-gateway`
+  was a single token and the query word `robosats` could never reach the **name** — the field the
+  ranker weights most. It now emits the whole token *and* its parts. The `name×3 / desc×2`
+  "field weighting" copied from Python is **inert under BM25** (term frequency saturates) and only
+  inflates `avgdl`, which penalises every real memory; field weighting is now real boosts in
+  `Indexable::fields()`. Query terms are deduped; the length filter counts characters, not bytes.
+  `engram-store::load()` skipped only `MEMORY.md`, so the 91 KB `MEMORY_FULL.md` was ranked as if
+  it were a memory — `is_index()` excludes `MEMORY*.md`.
+- **Fusion is not a tuning knob.** RRF counts votes, not confidence: with `k_rrf=60` and 8
+  candidates per leg, any document in two legs (≥2/68) outranks any document in one (≤1/61).
+  The lever is a **floor per leg**. `vector_store.recall.threshold` is calibrated on this store at
+  **0.67** (no-match prompts top out at 0.572/0.657 cosine; real matches score 0.683–0.725).
+- **New tooling:** `engram-recall --fast "<prompt>"` runs the hook's own recall (it prints JSON;
+  there is no `--json` flag) — the only way to see the legs without sending the prompt.
+  `tests/recall_precision_eval.sh` asserts **outcomes** on five real operator prompts (which
+  memories must appear, which are forbidden) and prints which binary it is testing, because a stale
+  binary once silently passed it.
+- **Measured outcome:** the prompt that named `robosats` went from 0/4 to **4/4** at lexical
+  58.8 / 45.3 / 38.5 / 32.4 with everything else under 19.
+
+### auto-curate reviews itself — no external review CLI
+
+The auto-curate gate was the last hard external dependency in the live pipeline: an advisor CLI
+with a headless-LLM fallback, and autonomous mode was **fail-closed without it** — on any advisor
+outage the nightly curate silently mutated nothing. `review_gate` is now `self` (default) or
+`human`, and self-review calls `engram_llm.generate(role='verify')` — the same backend harvest,
+distill and extraction already use, so it adds no dependency at all. The safety contract is
+unchanged and still fail-closed: one `VERDICT` token on the last line or DEFER (an injected memory
+can never spoof an approval), full redaction of the umbrella and its sources before the model sees
+them, credential reconciliation before the review. Real safety stays reversibility: `.quarantine/`
+30d, `.trash/` 90d. Legacy `review_gate: codex|auto` maps to `self`.
+
+### `memory_auto_curate.py` re-execs under the vector venv
+
+The manual path ran under system `python3`, which has no `qdrant-client`; the import failure was
+caught as "vector store unavailable — nothing to do" **with exit 0**, so the curator had been doing
+nothing since 2026-09-24 while its caller reported success. It now re-execs once under
+`ENGRAM_VECTOR_PYTHON` / `~/.claude/vector/venv` when the client is not importable
+(`ENGRAM_CURATE_REEXEC` guards the loop) and an unreachable store **exits 2** with the error on stderr.
+
+### the cold memory index is index, not memory
+
+A store may split its index into a hot `MEMORY.md` (loaded every session) and a cold
+`MEMORY_FULL.md`. The scripts only knew the hot one: `memory_audit.sh` reported every cold memory as
+"not indexed" (663 of 781 on a real store) and audited `MEMORY_FULL.md` itself as a malformed
+memory, so a review set of 672 files hid ~19 real findings; `save_memory.sh` re-added cold memories
+to the always-loaded index; `delete_memory.sh` left dangling lines. Also `memory_index_remove_line`
+silently kept a line when it was the last in the file (`grep -v` exits 1 when it selects nothing,
+which skipped the `mv` while still reporting success). The Rust store now excludes `MEMORY*.md`
+from the scan entirely, so the derived index can never win a ranking.
+
+### plain HTTP to Neo4j on a network you already trust
+
+`neo4j_http_url` rejected a remote `http://` with "use https://". The recall clients reach Neo4j
+over the tailnet, which is WireGuard-encrypted at the wire, and rustls/webpki roots make a private
+CA unusable. An explicit endpoint is now allowed on plain http (scheme shape still validated);
+https stays the right answer on a network the operator does not trust.
+
+### Known at this release
+
+- **No abstain rule.** A prompt with nothing relevant still gets `recall.inject.k` memories
+  (measured: lexical top 12.0 where real prompts reach 30–58). The graph leg has no score at all,
+  only `recall.inject.max_facts`, so an abstain rule must gate three producers, not two. → #51
+- **The keyword leg has no floor** (the vector leg does). A relative floor (~0.4× the leg's own
+  top) separates cleanly on the prompts in the eval. → #52
+- **`bin/memory_keyword.py` / `bin/memory_recall.py` are a second, worse implementation** of the
+  ranking — no accent folding, no field boosts, the vector leg ignores the threshold. Used by the
+  TUI and `engram_api.py`, not by the prompt hook or the MCP tools. → #53
+- **Tokenizer parity gap, documented in code:** `.` `/` `:` are separators in Rust and joined by
+  Python (`127.0.0.1:6333` is five tokens here, one there).
+
+### remove the wiki tools from the MCP server
+
+#### Removed
 - **`wiki_search` / `wiki_fetch` / `wiki_write` are no longer MCP tools.** On an install
   without a `tenants:` block they could only answer `tenant '(untenanted)' has no vault
   configured` — main has no vault, so the three tools were dead weight in every prompt
@@ -12,9 +112,9 @@
   tenant vault; only the MCP exposure is gone. Bring it back by re-adding the three
   tool schemas and handlers to `engram-mcp.rs` when a host actually has a vault.
 
-## Unreleased — memory-tidy: clear report, store-bound approvals
+### memory-tidy: clear report, store-bound approvals
 
-### Fixed
+#### Fixed
 - **`/memory-tidy` reports name the memories.** Cards and the final report name every
   file with its description and say what becomes what ("absorb X into Y"), in plain
   words; a pass that changed nothing says so. Expiry notices name the files too
@@ -32,9 +132,9 @@
   lacks PyYAML and misreported `auto_curate.enabled: false`.
 - The installed skill's step-by-step walkthrough, never committed, is now in the repo.
 
-## Unreleased — Rust embedding server
+### Rust embedding server
 
-### Added
+#### Added
 - **`engram-embed`**: a Rust drop-in for the local fastembed server on
   127.0.0.1:11435 (same nomic-embed-text-v1.5 model, same `/health`, `/api/embed`
   and `/v1/embeddings` JSON). Truncates at **2048 tokens** (`--max-length` /
@@ -44,9 +144,9 @@
   longer than 2048 tokens get a different vector, so rebuild the vector index once
   after switching.
 
-## Unreleased — migrate the legacy graph to the Rust native backend
+### migrate the legacy graph to the Rust native backend
 
-### Added
+#### Added
 - **`engram-native-graph-sync --bootstrap-from-legacy`** seeds the native graph from
   the legacy Graphiti one **without calling a model**, where re-extracting a store
   on a local 8 GB GPU would take ~16 h. Check first that the legacy
@@ -70,7 +170,7 @@
   Reference store (677 memories): 606 memories, 6,099 facts (106 redacted, 515
   historical) in ~30 s; the rest are left for the normal extracting sync.
 
-### Fixed
+#### Fixed
 - **Legacy recall served superseded facts as current.** Graphiti never deletes a
   contradicted fact, it stamps `invalid_at`/`expired_at`; no legacy read query
   (Python fast leg, Rust fast/semantic/keyword legs) checked either, so every
@@ -91,9 +191,9 @@
 - **Extraction timeout comes from `llama_cpp.timeout_seconds`,** not a fixed 90 s
   that a local model (~85 s per extraction) failed at random.
 
-## Unreleased — API authentication
+### API authentication
 
-### Security
+#### Security
 - **Both local APIs require a token.** Every route on `engram-app` (:8787) except
   `/healthz`, and every route on `engram_api`/Atlas (:8765) except the page shell
   and `/login`, was unauthenticated, including config rewrites and memory
@@ -110,9 +210,9 @@
 - **Atlas config backups and temp files are created 0600** instead of at the
   umask default, which left every credential world-readable.
 
-## Unreleased — `update.sh`
+### `update.sh`
 
-### Added
+#### Added
 - **`update.sh`**, dry-run by default, `--apply` to act: a safe fast-forward pull, then
   `install.sh` with the daemon mode the box already uses. It restores
   `~/.claude/engram-local-overrides/`, rebuilds and restarts the Atlas and the Rust API
@@ -120,7 +220,7 @@
   failure it prints the rollback. Tested in `tests/test_update.sh`, isolated from the
   caller's real services.
 
-## Unreleased — fix the 24/7 graph re-harvest loop (per-tenant ingest state)
+### fix the 24/7 graph re-harvest loop (per-tenant ingest state)
 
 The local model was being called around the clock. Root cause: the graph ingest's
 on-disk state — the extraction cache, `insert_state.json` (the per-file "done" set)
@@ -134,7 +234,7 @@ on the next cycle — forever. Only the one store that happened to match the def
 (measured: 2324 generation attempts for 113 distinct prompts, same ones re-sent
 ~24×, `insert_state.json` frozen for days).
 
-### Fixed
+#### Fixed
 
 - **Per-slug ingest state** — new `graph/mg_state.py` scopes the extraction cache,
   `insert_state.json` and `sync_state.json` under `state/<slug>/`. `graph_sync.py`,
@@ -155,13 +255,13 @@ Side note unchanged here: the `:8090` generation server flaps up/down; while it 
 down, extraction cannot make progress (clean "nothing extracted"), and when it is
 up each store now ingests once and goes quiet.
 
-## Unreleased — atlas tenant awareness + per-tenant Wiki link
+### atlas tenant awareness + per-tenant Wiki link
 
 atlas knew nothing about tenants: the Scope selector listed raw project slugs with no
 hint of which tenant owned them, there was no view of a tenant's collections/group/
 vault, and the per-tenant SilverBullet vaults were unreachable from the dashboard.
 
-### Added
+#### Added
 
 - **`GET /api/atlas/tenants`** (`atlas_api.py`) — the configured tenants and, for each,
   the stores (slugs) it owns, its Qdrant collections, Graphiti group, vault, memory
@@ -183,13 +283,13 @@ vault, and the per-tenant SilverBullet vaults were unreachable from the dashboar
 - `tests/test_atlas_tenants.py` — pins the tenant-model contract the tab reads and the
   wiki-URL shape.
 
-## Unreleased — LLM call audit + atlas "LLM Calls" tab
+### LLM call audit + atlas "LLM Calls" tab
 
 There was no record of what engram sent to the generation model, so a loop (the same
 prompt re-sent over and over) was invisible. This adds a content-free audit of every
 generation call and a UI tab that streams them and flags exact repeats.
 
-### Added
+#### Added
 
 - **`bin/engram_llm_audit.py`** — append-only JSONL at `~/.claude/logs/llm_events.jsonl`,
   one line per generation *attempt*: `proc`, `backend`, `model`, `role`, `kind`
@@ -214,7 +314,7 @@ generation call and a UI tab that streams them and flags exact repeats.
 
 Reviewed by codex (APPROVE-WITH-CHANGES; all points folded in).
 
-## Unreleased — one recall path (stop the duplicate embedding calls)
+### one recall path (stop the duplicate embedding calls)
 
 Recall was exposed by three MCP servers at once — `engram-graph` (Graphiti+vector+
 keyword), `engram-vector` (vector/fused) and `engram-rust` (the Rust hybrid). The
@@ -223,7 +323,7 @@ query **twice per call** (its graph leg and its in-process Qdrant leg each calle
 embedding model on the same text). On a local llama/bge-m3 endpoint that showed up as
 every recall hitting the model in duplicate.
 
-### Changed
+#### Changed
 
 - **`engram-rust` is now the single recall path.** `memory_recall` /
   `memory_recall_hybrid` are served only by the Rust `engram-mcp` server, which embeds
@@ -242,7 +342,7 @@ every recall hitting the model in duplicate.
   and docs (README/CONFIG/ARCHITECTURE/engram.yaml.example/vector docs) point recall at
   `engram-rust`.
 
-## Unreleased — shared web authentication (atlas + SilverBullet)
+### shared web authentication (atlas + SilverBullet)
 
 engram's own binaries have no auth and need none — the API (127.0.0.1:8787), CLI,
 MCP and daemon are loopback/local. But the atlas dashboard is published through
@@ -250,7 +350,7 @@ the Traefik gateway at `engram.home.arpa` with NO auth, and its config editor ca
 rewrite engram.yaml — so over the LAN it was open. This adds one web credential,
 shared with the SilverBullet editors, enforced only at the web layer.
 
-### Added — `install.sh --web-auth`
+#### Added — `install.sh --web-auth`
 
 - One `user:password`, provided once or generated, written to
   `~/.config/engram/silverbullet.env` (mode 600) and applied to two sinks:
@@ -263,7 +363,7 @@ shared with the SilverBullet editors, enforced only at the web layer.
 - `silverbullet/engram-web-auth.example.yml`, a CONFIG.md section, and
   `tests/test_web_auth.sh`.
 
-### Reviewed by codex; blockers fixed
+#### Reviewed by codex; blockers fixed
 
 - **Missing gateway mount** — the gateway mounts individual files, not the parent
   dir, so a separate htpasswd would be invisible in the traefik container. The
@@ -282,14 +382,14 @@ shared with the SilverBullet editors, enforced only at the web layer.
   backup first and refuses a lossy rewrite of a commented file (prefers ruamel,
   else prints the exact lines to add).
 
-### Honest limitations (documented, not papered over)
+#### Honest limitations (documented, not papered over)
 
 Shared credentials, not SSO — no shared session, and Traefik basicAuth has no
 lockout (SilverBullet's own login does). `SB_USER` is visible via `docker
 inspect` to anyone with Docker/root access, inherent to basicAuth. No engram-app
 code change — web auth lives entirely at the gateway and the web apps.
 
-## Unreleased — SilverBullet: browser editor over the vaults
+### SilverBullet: browser editor over the vaults
 
 The vaults are plain markdown on a headless server, which is why "edit remotely"
 kept needing a sync bridge (Obsidian is local-first; Obsidian Sync can't reach a
@@ -299,7 +399,7 @@ layer. engram stays the indexer and the agents' writer; SilverBullet is the
 human's editor, and the loop closes: write a runbook in the browser, an agent
 recalls it and files a finding into `_agent/`, you review that in the browser.
 
-### Added
+#### Added
 
 - **`silverbullet/`** — a compose file (one service per tenant, each mounting
   ONLY its own vault; loopback-bound; work tenants `SB_READ_ONLY`), a Traefik
@@ -310,7 +410,7 @@ recalls it and files a finding into `_agent/`, you review that in the browser.
   up the selected instances.
 - `ARCHITECTURE.md` §4d-bis and a `CONFIG.md` section.
 
-### Verified empirically against a live SilverBullet container
+#### Verified empirically against a live SilverBullet container
 
 - SilverBullet edits plain `.md` in place — files seeded on disk by engram/agents
   are served unchanged, and pages created in the editor land as plain `.md`.
@@ -323,7 +423,7 @@ recalls it and files a finding into `_agent/`, you review that in the browser.
   unreachable — the per-tenant boundary holding one level lower than the DB
   filters.
 
-### Posture
+#### Posture
 
 Tailnet-only (loopback + Traefik over Tailscale, no public entrypoint, no
 funnel); work vaults read-only by default (an editor-layer control, not a
@@ -331,14 +431,14 @@ filesystem lock); auth via SilverBullet's own `SB_USER`. Off unless
 `--silverbullet` is passed. The Rust/engram pipeline is untouched beyond the
 one-line walker test and the backup exclude.
 
-## Unreleased — encrypted off-host backups (Backblaze B2 / any S3)
+### encrypted off-host backups (Backblaze B2 / any S3)
 
 The source-of-truth data — the `.md` memory stores (~4 MB) and the Obsidian
 vaults — had no off-host copy. This adds a daily, encrypted, retained backup of
 exactly that authoritative set; the Qdrant/Neo4j indexes are left out because
 they rebuild from it.
 
-### Added
+#### Added
 
 - **`bin/engram_backup.py`** — a restic wrapper, operator-runnable and
   daemon-called (the graph_sync.py shape). Subcommands `init` / `backup` /
@@ -358,7 +458,7 @@ they rebuild from it.
   bucket/endpoint/keys, generates and prints the restic password once if none is
   given, and inits the repo.
 
-### Security properties, asserted by the round-trip test
+#### Security properties, asserted by the round-trip test
 
 `tests/test_backup_roundtrip.sh` (skips when restic is absent) seeds two memory
 stores and a vault, backs up, deletes the source, restores to a staging dir, and
@@ -374,19 +474,19 @@ neither the log nor `engram.yaml`.
 - **Restore never clobbers live data** — it stages into a directory for the
   operator to review and move deliberately.
 
-### Scope
+#### Scope
 
 Memories + vaults + `engram.yaml` + `graph/.env`. Transcripts (`*.jsonl`) and
 the rebuildable indexes are excluded. One whole-system repo. Daemon-only — the
 Rust workspace is untouched. Off by default; dormant until an operator provides a
 bucket.
 
-## Unreleased — the Obsidian wiki corpus (stages 3-6)
+### the Obsidian wiki corpus (stages 3-6)
 
 A second corpus over a different shape of document, and the half of the feature
 the tenancy work existed to make safe.
 
-### Added
+#### Added
 
 - **`engram-wiki` crate** — walk, parse, chunk. All pure: `walk` reads a
   directory, everything else transforms strings, so the chunker is unit-tested
@@ -429,7 +529,7 @@ the tenancy work existed to make safe.
   an identity, and several of a tenant's stores would each trigger a full
   re-walk of the same vault.
 
-### Isolation
+#### Isolation
 
 Wiki recall is a SEPARATE entry point from `recall`, not a leg inside it. Fusing
 them would let a 40-chunk page outvote every memory in the store, and the prompt
@@ -443,7 +543,7 @@ not merely before indexing, because a credential in a synced vault has left the
 box whatever the index holds. Writes are temp-file + fsync + rename, so Obsidian
 never renders a half-written page.
 
-### Fixed — found by running it
+#### Fixed — found by running it
 
 - **The MCP server refused to start for a tenant owning several stores.** It
   resolved the identity AND a default store up front, so a tenant whose stores
@@ -458,7 +558,7 @@ never renders a half-written page.
   rather than saying so; a setup step and a search that found nothing looked
   identical to a caller.
 
-### Deployed
+#### Deployed
 
 Four vaults at `/vaults/<tenant>` (`homelab`, `mjsv`, `bbhost`, `dseclab`), each
 with `Notes/`, `Runbooks/`, an agent-writable `_agent/`, and a README describing
@@ -467,12 +567,12 @@ finding, the incremental pass indexed only that document, search returned it as
 the top hit, a canary planted in one vault was unreachable from another, and a
 credential written by an agent reached disk redacted.
 
-## Unreleased — multi-tenant agent identities (stage 3: deployment)
+### multi-tenant agent identities (stage 3: deployment)
 
 Applied to the live install: four identities (`bbhost`, `dseclab`, `mjsv`,
 `homelab`), 13 stores, migrated and verified.
 
-### Changed — the identity follows the store
+#### Changed — the identity follows the store
 
 The stage 1 rule, "declaring a tenant makes `--tenant` required on every binary",
 was right about safety and wrong about where the boundary is. Deploying it
@@ -490,7 +590,7 @@ store can be determined, and cross-checks when both are given. A store no tenant
 claims is still refused rather than adopted, and there is still no default *tenant*
 when none can be derived.
 
-### Fixed — found by deploying it
+#### Fixed — found by deploying it
 
 - **`--group` to an old recall script corrupted the query**, rather than being
   ignored: its parser folded the flag's value into the search text, so "qdrant
@@ -527,7 +627,7 @@ when none can be derived.
   budget — so recall degrades to keyword + graph instead of to silence, and says
   so in the leg status.
 
-### Migration result
+#### Migration result
 
 - 71 Qdrant points copied to `engram_memory__homelab`, verified; source collection
   left intact, plus a Qdrant snapshot taken beforehand.
@@ -540,7 +640,7 @@ when none can be derived.
 - All 12 cross-tenant store pairings refused; the hook injects each identity's own
   memories, derived from the session's project directory.
 
-### Note
+#### Note
 
 With `graph.backend: graphiti_compat` the keyword and vector legs are disabled by
 design, so a tenant whose Graphiti group is not yet populated returns NO results
@@ -550,12 +650,12 @@ rather than a regression — but the three new tenants need an index build (the
 daemon now does this per tenant). The prompt hook is unaffected: it uses fast mode,
 which runs BM25 over the markdown store.
 
-## Unreleased — multi-tenant agent identities (stage 2: migration)
+### multi-tenant agent identities (stage 2: migration)
 
 `engram-tenant-migrate` moves a pre-tenancy install onto tenants. Dry run by
 default; refuses rather than guesses.
 
-### What it does, and why each step differs
+#### What it does, and why each step differs
 
 - **Qdrant** points are COPIED into the tenant's collection with their vectors
   carried across verbatim, not re-embedded. Re-embedding 71 points is cheap, but
@@ -576,7 +676,7 @@ default; refuses rather than guesses.
   no query can reach them. The markdown store is authoritative; `--rebuild`
   regenerates the index.
 
-### Corrected from the stage 1 notes
+#### Corrected from the stage 1 notes
 
 The earlier changelog said the Graphiti migration had to be a re-insert because
 entity nodes are shared. That reasoning holds in general and does not apply to
@@ -585,7 +685,7 @@ this install: all 884 entities, 71 episodes and 899 relationships sit in
 a relabel is exact and free. The re-insert path is still implemented as the
 refusal branch, for the case where a group genuinely spans identities.
 
-### Guards
+#### Guards
 
 - Refuses while any store on disk belongs to no tenant, and names them. A store
   no tenant owns has no collection to be written to, and adopting it into
@@ -601,13 +701,13 @@ refusal branch, for the case where a group genuinely spans identities.
   writing a group binds the group it writes. An exemption that only subtracts a
   check is how the earlier carve-out hid a live leak.
 
-## Unreleased — multi-tenant agent identities (stage 1)
+### multi-tenant agent identities (stage 1)
 
 Groundwork for a multi-tenant Obsidian wiki corpus. This stage adds the tenant
 model and its enforcement, and in doing so closes a cross-tenant leak that was
 already live.
 
-### Fixed — the graph leg crossed projects
+#### Fixed — the graph leg crossed projects
 
 - **Graphiti had no partition at all.** Every memory in every store was inserted
   with the single literal `group_id = "canonical"` (`graph/mg_config.py`), and
@@ -633,7 +733,7 @@ already live.
   only `--k`'s value by a string comparison. Any other flag's value joined the
   query text. Now parsed properly, with value-taking flags declared.
 
-### Added — tenants
+#### Added — tenants
 
 - **`engram-tenant` crate and `bin/engram_tenant.py`**, the two halves of one
   model, pinned against each other by `tests/test_tenant_parity.py` — the same
@@ -660,7 +760,7 @@ already live.
 - **`--tenant` on every binary**, and a per-tenant daemon loop with per-tenant
   error isolation, so one identity's unreachable backend does not stop the others.
 
-### Changed — breaking
+#### Changed — breaking
 
 - **`graph.backend: native` indexes need a rebuild**: node identity now includes
   the tenant.
@@ -676,7 +776,7 @@ already live.
   is no longer expressible as absent; it was an `Option` that one call site
   happened to fill in, which is a guarantee resting on a call site.
 
-### Known limitations
+#### Known limitations
 
 - The legacy keyword leg rides Graphiti's `edge_name_and_fact` fulltext index,
   which cannot be partitioned — it ranks across every group and applies its limit
@@ -689,7 +789,7 @@ already live.
   per-request tenant parameter would turn a loopback dashboard into a way to read
   any identity's memories over HTTP.
 
-### Found by running it, not by testing it
+#### Found by running it, not by testing it
 
 Passing `--group` to the *installed* (older) `memory_graph_recall.py` did not get
 ignored as assumed — its parser folded the value into the query, so a search for
@@ -701,89 +801,13 @@ must echo the group it filtered on or the leg is refused. No unit test could hav
 caught this — every fixture implements the new parser — so the regression test
 asserts the child's argv rather than its records.
 
-## Unreleased — `update.sh`
-
-### Added
-- **`update.sh`**, dry-run by default, `--apply` to act: a safe fast-forward pull, then
-  `install.sh` with the daemon mode the box already uses. It restores
-  `~/.claude/engram-local-overrides/`, rebuilds and restarts the Atlas and the Rust API
-  when they are installed, and checks that the recall hook still injects memories. On
-  failure it prints the rollback. Tested in `tests/test_update.sh`, isolated from the
-  caller's real services.
-
-## Unreleased — migrate the legacy graph to the Rust native backend
-
-### Added
-- **`engram-native-graph-sync --bootstrap-from-legacy`** seeds the native graph from
-  the legacy Graphiti one **without calling a model**, where re-extracting a store
-  on a local 8 GB GPU would take ~16 h. Check first that the legacy
-  `fact_embedding`s are in the configured embedding space.
-  - **Scoped:** it (and `--import-legacy-embeddings`) refuses unless the target is
-    the `engram.env`-pinned store, failing closed with no pin. The legacy graph is
-    one unscoped group built from that store.
-  - **Verified:** a memory qualifies only if its file is byte-identical to one
-    legacy episode (`Episodic.source_md`), and only that episode's facts are used,
-    so an older ingested version never contributes.
-  - **Redacted before writing:** facts are read out, redacted with the shared
-    secret detector (text, entity names, relation name) and re-embedded from the
-    redacted text in Rust; raw legacy facts never touch the native graph.
-  - **History kept, never resurrected:** superseded facts (Graphiti
-    `invalid_at`/`expired_at`) are imported with `valid_until`, so recall skips
-    them; when a claim exists both live and superseded, the live copy wins.
-  - **Atomic and resumable:** each memory's facts and commit marker are one
-    transaction. An interrupted run leaves fact-less, unstamped nodes that the next
-    run resumes; nodes carrying facts from elsewhere are left alone.
-
-  Reference store (677 memories): 606 memories, 6,099 facts (106 redacted, 515
-  historical) in ~30 s; the rest are left for the normal extracting sync.
-
-### Fixed
-- **Legacy recall served superseded facts as current.** Graphiti never deletes a
-  contradicted fact, it stamps `invalid_at`/`expired_at`; no legacy read query
-  (Python fast leg, Rust fast/semantic/keyword legs) checked either, so every
-  version of history was recalled at once (632 of 6,720 edges on the reference
-  store). All now require both to be null.
-- **Both recall hooks redact graph facts before injecting them.** Facts reach the
-  model verbatim, and legacy graph facts never passed the save-time secret guard.
-  The Python hook injects nothing if its redactor cannot be imported.
-- **The Rust recall hook injected no graph facts.** It printed only facts attributed
-  to a returned memory; the fast leg's facts are unattributed (`Output::facts`).
-  Same section and per-session dedup as the Python hook now.
-- **Imported legacy facts were invisible to the fast leg,** which read triples
-  only. Imported facts keep their edge's entity names and match them exactly, as
-  the legacy query matched `Entity.name`.
-- **Legacy graph facts reached every project.** The legacy graph is one unscoped
-  group built from the `engram.env`-pinned store; both the Python and Rust fast legs
-  now serve its facts only to that store. Native facts are slug-scoped already.
-- **Extraction timeout comes from `llama_cpp.timeout_seconds`,** not a fixed 90 s
-  that a local model (~85 s per extraction) failed at random.
-
-## Unreleased — API authentication
-
-### Security
-- **Both local APIs require a token.** Every route on `engram-app` (:8787) except
-  `/healthz`, and every route on `engram_api`/Atlas (:8765) except the page shell
-  and `/login`, was unauthenticated, including config rewrites and memory
-  create/delete. A loopback bind did not protect them from a browser tab
-  (DNS rebinding). The token lives in `~/.claude/engram-api.token` (0600), created
-  race-free by whichever server starts first; scripts use `Authorization: Bearer`,
-  the browser gets an HttpOnly SameSite=Strict cookie from the `/login` POST form.
-  The token is never accepted in a URL (history, proxy logs, Referer).
-- **A config save that moves an endpoint drops that endpoint's `api_key`.** The
-  writers preserved unmodelled keys, so repointing `llama_cpp.url`/`embed.url`
-  sent the stored bearer token to the new host.
-- **`/api/v1/recall?slug=` is validated.** It was joined straight into
-  `projects/<slug>/memory`, so `../..` searched markdown anywhere on disk.
-- **Atlas config backups and temp files are created 0600** instead of at the
-  umask default, which left every credential world-readable.
-
-## Unreleased — PR #34 stabilization (Rust foundation + Graphiti compatibility)
+### PR #34 stabilization (Rust foundation + Graphiti compatibility)
 
 Remediation of the PR #34 review. The theme: the Rust layer was written against one
 host — running as root, loopback Neo4j, unauthenticated Qdrant, one embedding
 endpoint — and everything that was true there and false elsewhere was hard-coded.
 
-### Fixed — portability
+#### Fixed — portability
 - **One resolver for config, home, graph dir and slug** (new `engram-paths` crate).
   Twenty-odd sites hard-coded `/root/.claude` or the `-root` memory slug, so any
   other user silently got the wrong config, graph environment and an *empty* memory
@@ -804,7 +828,7 @@ endpoint — and everything that was true there and false elsewhere was hard-cod
   whenever the binary existed — so Ollama and FastEmbed installs had indexing routed
   to a binary that cannot do it. Those configurations stay on the Python path.
 
-### Fixed — correctness
+#### Fixed — correctness
 - **Obsolete native triples are actually retired.** The predicate used Cypher's
   *string* `CONTAINS` against a list, which evaluates to `null`, so nothing was ever
   selected for retirement. Every Cypher statement now lives in a named constant with
@@ -841,7 +865,7 @@ endpoint — and everything that was true there and false elsewhere was hard-cod
   Now: an exclusive lock, a revision re-check under it, unique private temp and
   backup files, preserved mode, fsync of file and directory.
 
-### Fixed — safety
+#### Fixed — safety
 - **Credentials are carried and never serialized.** `llama_cpp.api_key`,
   `embed.api_key`, `vector_store.api_key` and the Neo4j user/password were dropped
   by the Rust config model, so authenticated endpoints and Qdrant Cloud got
@@ -861,7 +885,7 @@ endpoint — and everything that was true there and false elsewhere was hard-cod
 - **`local_enabled`** — the documented master kill-switch — is honoured by the Rust
   index and sync paths, which previously checked only `vector_store.enabled`.
 
-### Changed
+#### Changed
 - The recall hook runs in **fast mode** (local BM25 + vector + one graph fact
   query). The full path measures ~3.5s against a populated graph, past the 2.5s
   per-prompt budget, so a hook on it would inject nothing. `recall.timeout_ms`
@@ -889,12 +913,12 @@ endpoint — and everything that was true there and false elsewhere was hard-cod
   keyword/vector legs to preserve Graphiti's ordering, and is not hybrid fusion.
 - Workspace crates declare Apache-2.0, matching `LICENSE`.
 
-### Removed
+#### Removed
 - `engram-graph-compat`, an unused second compatibility implementation that turned
   every failure into an empty success. The bounded spawn in `engram-hybrid` is the
   single path.
 
-### Testing
+#### Testing
 - `tests/run_all.sh` runs the whole suite (Rust + Python + shell); there was no
   single entry point before. GitHub Actions (`.github/workflows/ci.yml`) runs fmt,
   clippy `-D warnings`, `cargo test --locked`, the Python and shell suites, and the
@@ -908,7 +932,7 @@ endpoint — and everything that was true there and false elsewhere was hard-cod
   it measured set overlap and could pass while the ordering — the only thing
   compatibility mode exists to preserve — was wrong.
 
-### Fixed — second review pass
+#### Fixed — second review pass
 
 A follow-up review found that several of the fixes above were incomplete. What a
 fix *looks* like and what it *does* are different claims, and these were the gap.
@@ -952,7 +976,7 @@ fix *looks* like and what it *does* are different claims, and these were the gap
   fingerprint implementations are pinned equal by a literal asserted from both
   sides.
 
-### Fixed — third review pass
+#### Fixed — third review pass
 
 Two of the second-pass fixes were themselves wrong, and the review found a further
 set. The pattern worth naming: three of these were *over-corrections* — a fix that
@@ -1035,7 +1059,7 @@ overshot the bug.
   two implementations it mirrors. `backend: Ollama` resolved to Ollama in both and
   to FastEmbed in the gate.
 
-### Fixed — found by the non-root install test
+#### Fixed — found by the non-root install test
 
 The review asked for a clean install under an unprivileged user. It was worth it:
 the portability work above was all correct, and two bugs it could not have caught
@@ -1057,7 +1081,7 @@ turned up immediately.
   missing value followed by an unknown flag, and the documented invocation was
   unusable as typed.
 
-### Fixed — second Copilot review
+#### Fixed — second Copilot review
 
 The fresh review resolved 24 of its earlier findings and raised five more. All
 five were real, and two of them were holes left by this remediation itself.
@@ -1090,7 +1114,7 @@ five were real, and two of them were holes left by this remediation itself.
   store that does not exist injects nothing, silently, with exit 0, looking exactly
   like "no relevant memories".
 
-### Fixed — found by deploying to a live host
+#### Fixed — found by deploying to a live host
 
 - **`install.sh` refreshes the `engram-app` copy a systemd unit actually runs.**
   There are two parallel unit sets: the installer writes *user* units pointing at
@@ -1113,7 +1137,7 @@ five were real, and two of them were holes left by this remediation itself.
   covers both cases and asserts the invariant: the Graphiti path is used and the
   native writer is not.
 
-### Known limitations
+#### Known limitations
 
 Stated rather than silently carried:
 
@@ -1147,7 +1171,7 @@ Stated rather than silently carried:
   incremental run over the new memory alone does not. There is no `--rebuild` flag
   on `engram-native-graph-sync`.
 
-### Changed — operational notes for this release
+#### Changed — operational notes for this release
 
 - **A native backend that Rust cannot serve now skips the graph sync** instead of
   falling back to the Graphiti writer. Writing the index nothing is reading
