@@ -13,8 +13,8 @@ call is delegated to a model. Two different operations come out of that:
   * COMPRESS   — members say the same thing differently, so an umbrella is generated.
                  This IS lossy; `sentence_coverage` is a rejection heuristic, NOT proof
                  of losslessness (it is lexical prefix matching, so two rewordings of
-                 one fact never "cover" each other). Safety here comes from the Codex/
-                 human gate plus REVERSIBILITY, not from the score.
+                 one fact never "cover" each other). Safety here comes from the self-
+                 review/human gate plus REVERSIBILITY, not from the score.
   * RECOVERABLE — absorbed sources go to .quarantine/ (undo) and are de-indexed via
                  delete_memory.sh, which snapshots to .trash/ (90-day undo) first.
   * BOUNDED    — at most `max_merges_per_run` clusters per run.
@@ -51,38 +51,42 @@ AC_DEFAULTS = {
     "merge_threshold": 0.92,      # cosine >= this to auto-merge (stricter than the 0.86 finder)
     "max_merges_per_run": 2,
     # Who reviews a merge before it can auto-apply:
-    #   auto   (default) — use Codex if it's installed; otherwise fall back to HUMAN
-    #                      (every merge -> Telegram approval queue). Best for portability:
-    #                      most users have Claude but NOT Codex.
-    #   codex  — force Codex review (near-lossless+clean auto-applies, else human queue).
-    #   human  — NO Codex; EVERY merge goes to the human Telegram queue (nothing auto-
-    #            applies). Safe default when you have only one agent.
+    #   self   (default) — engram's OWN generate backend (the same dependency harvest
+    #                      and distill already use, so this adds no new one). No
+    #                      external reviewer CLIs at all (owner rule 2026-11-21:
+    #                      engram depends on nothing but itself).
+    #   human  — no model review; EVERY merge goes to the human Telegram queue (nothing
+    #            auto-applies). Portable escape hatch for a store that distrusts its
+    #            own model.
     # There is intentionally no "no reviewer, just auto-apply" mode — a compressed merge
-    # always gets either Codex or a human before it touches the store.
-    "review_gate": "auto",
+    # always gets either the store's own model or a human before it touches the store.
+    "review_gate": "self",
+    # Autonomous mode: NO human queue anywhere. A COMPRESS merge auto-applies when
+    # the self-review says APPROVE (lossy coverage allowed — safety is REVERSIBILITY:
+    # sources stay in .quarantine/ for 30 days); any other verdict is SKIPPED, not
+    # queued. Orphan prunes apply straight to .trash/ (90-day undo). FAIL-CLOSED: if
+    # the store's own backend cannot return a parseable verdict, an autonomous run
+    # mutates NOTHING (it does not fall back to a human queue).
+    "autonomous": False,
     # Orphan pruning: PROPOSE (never auto) stale memories with no merge target for a
     # one-tap Telegram prune. frequency==0 means "never discussed", NOT "worthless" (a
-    # disaster-recovery runbook is freq-0 for a year), so this is human-gated by design.
+    # disaster-recovery runbook is freq-0 for a year), so this is human-gated by design
+    # — unless autonomous: true, which prunes directly to .trash.
     "prune_orphans": True,
     "orphan_age_days": 90,
     "max_prunes_per_run": 5,
-    # When Codex DOES review: auto-apply only a near-LOSSLESS merge (a fact outside
-    # Codex's slice could be dropped otherwise); everything lossy -> the human queue.
+    # Non-automatic self-review mode: auto-apply only a near-LOSSLESS merge (a fact
+    # outside the reviewer's truncated slice could be dropped otherwise); lossy -> queue.
     "min_auto_coverage": 0.90,
 }
 
 
 def _resolve_gate(ac) -> str:
-    """codex | human. 'auto' -> codex iff the advisor script AND the codex CLI are both
-    present; else human (Telegram approval). So a user without Codex still gets a safe
-    reviewer (themselves, one tap) instead of unreviewed auto-merges."""
-    import shutil
-    g = (ac.get("review_gate") or "auto").lower()
-    if g in ("codex", "human"):
-        return g
-    return "codex" if (ADVISOR.exists() and shutil.which("codex")) else "human"
-
-ADVISOR = HOME / ".claude" / "skills" / "code-advisor" / "scripts" / "code_advisor.py"
+    """self | human. The reviewer is the store's own generate backend — engram has no
+    external reviewer dependency of any kind. 'human' stays as the portable escape
+    hatch: every merge queues to a person instead. Legacy 'codex'/'auto' config values
+    map to self (never to a CLI)."""
+    return "human" if (ac.get("review_gate") or "self").lower() == "human" else "self"
 
 
 def ac_cfg(cfg):
@@ -315,7 +319,7 @@ def main():
             print(f"[auto-curate] skip mixed-type cluster {files}")
     typed = typed[:ac["max_merges_per_run"]]
 
-    gate_mode = _resolve_gate(ac)     # "codex" or "human"
+    gate_mode = _resolve_gate(ac)     # "self" or "human"
     print(f"# memory_auto_curate — apply={apply} enabled={ac['enabled']} "
           f"threshold={ac['merge_threshold']} cap={ac['max_merges_per_run']} review_gate={gate_mode}")
     print(f"near-dup clusters this run: {len(typed)}")
@@ -353,9 +357,10 @@ def main():
             print(f"\n· {files} -> {keeper}  [SUPERSEDE — lossless]")
             if not apply:
                 print(f"  would: {preview}"); continue
-            if gate_mode == "human":                   # respect an explicit no-auto policy
+            if gate_mode == "human" and not ac.get("autonomous"):  # explicit no-auto policy
+                # (autonomous DOES apply supersede: byte-identical keeper, zero model judgment)
                 gate.propose("merge_apply", params, f"Supersede (lossless). {preview}",
-                             files=files, codex_verdict="supersede-deterministic")
+                             files=files, verdict="supersede-deterministic")
                 print("  QUEUED (human gate)"); queued += 1
                 continue
             ok, detail = gate._apply_merge(params)
@@ -374,15 +379,26 @@ def main():
         # appending everything. sentence_coverage is recorded, not gated.
         final, report = mdv.distill_cluster(umbrella.stem, files, cfg=cfg, preserve_sources=False)
         body = _body_of(final)
-        # Secret-scan desc+body AND every source: if any holds a credential, do NOT
-        # consolidate (leave as-is) — never route secret-bearing text onward.
-        if (not body.strip() or engram_secrets.looks_secret(f"{desc}\n{body}")
-                or any(engram_secrets.looks_secret((MEM/f).read_text(errors="ignore")) for f in files)):
-            print(f"· {files}: HOLD (empty umbrella or secret in cluster) — skipping"); continue
+        if not body.strip():
+            print(f"· {files}: HOLD (empty umbrella) — skipping"); continue
         doc = f"---\nname: {umbrella.stem}\ndescription: {desc}\nmetadata:\n  type: {typ}\n---\n\n{body}"
         okdoc, whydoc = gate.validate_memory_doc(doc)
         if not okdoc:
             print(f"· {files}: HOLD (malformed umbrella: {whydoc}) — skipping"); continue
+        # Credential RECONCILIATION (replaces the blanket secret-HOLD, 2026-11-12):
+        # every REMOTE hop (distill prompt, review blob) already redacts AGGRESSIVELY,
+        # so a credential in the cluster is not a leak risk — the real risk is the
+        # umbrella silently DROPPING one. So a cluster merges even when it touches
+        # credentials, as long as each credential found in any source still appears
+        # verbatim in the final doc. Only CREDENTIAL_RE (high-precision) counts —
+        # txids/EVM-addresses/UUIDs are public data the aggressive scanner used to
+        # block on, which is why secret-bearing clusters never consolidated.
+        missing = sorted({c for f in files
+                          for c in engram_secrets.credentials((MEM / f).read_text(errors="ignore"))
+                          if c not in doc})
+        if missing:
+            print(f"· {files}: HOLD (umbrella drops {len(missing)} credential(s): "
+                  f"{[c[:50] for c in missing[:3]]}) — skipping"); continue
         absorbed = [f for f in files if f != umbrella.name]
         # transaction id so a second merge on the same umbrella can't clobber the
         # first merge's backup (each merge's originals live under their own dir)
@@ -398,16 +414,21 @@ def main():
         if not apply:
             print(f"  would: {preview}"); continue
         cov = report.get("sentence_coverage", 0.0)
-        # HUMAN gate (no Codex): every merge goes to the Telegram approval queue.
+        # HUMAN gate (no model review): every merge goes to the Telegram approval queue.
         if gate_mode == "human":
-            gate.propose("merge_apply", params, f"Needs your approval (no Codex). {preview}",
-                         files=files, codex_verdict="human-gate")
-            print("  QUEUED for human approval (human gate — no Codex)"); queued += 1
+            if ac.get("autonomous"):
+                print(f"· {files}: SKIP (autonomous but human gate) — fail-closed"); continue
+            gate.propose("merge_apply", params, f"Needs your approval (human gate). {preview}",
+                         files=files, verdict="human-gate")
+            print("  QUEUED for human approval (human gate)"); queued += 1
             continue
-        # CODEX gate: auto-apply only a near-LOSSLESS + clean merge; lossy or non-clean
-        # -> human queue. coverage is on the FULL sources (not Codex's truncated slice).
-        verdict = _codex_verdict(doc, files)
-        if cov >= ac["min_auto_coverage"] and verdict == "APPROVE":
+        # SELF gate: the store's own backend reviews. Non-autonomous auto-applies only
+        # a near-LOSSLESS + clean merge; lossy or non-clean -> human queue. Coverage is
+        # computed on the FULL sources, never on the reviewer's truncated slice.
+        # autonomous mode widens this: an APPROVE alone is enough (reversibility,
+        # not coverage, is the safety), everything else is SKIPPED below.
+        verdict = _self_verdict(doc, files)
+        if verdict == "APPROVE" and (ac.get("autonomous") or cov >= ac["min_auto_coverage"]):
             ok, detail = gate._apply_merge(params)
             # Report the ACTUAL outcome — this used to print AUTO-APPLIED before
             # checking ok, so a refused or partial merge still read as success.
@@ -418,10 +439,14 @@ def main():
                                  f"🧠 auto-merged (near-lossless): {preview}\nTap UNDO to reverse.")
                 done += 1
         else:
-            why = (f"lossy compression (cov={cov} < {ac['min_auto_coverage']})"
-                   if cov < ac["min_auto_coverage"] else f"Codex {verdict}")
+            if verdict != "APPROVE":                    # name the REAL reason — cov may be fine
+                why = f"self-review {verdict}"
+            else:
+                why = f"lossy compression (cov={cov} < {ac['min_auto_coverage']})"
+            if ac.get("autonomous"):
+                print(f"· {files}: SKIP ({why}) — not queued"); continue
             gate.propose("merge_apply", params, f"Needs approval — {why}. {preview}",
-                         files=files, codex_verdict=verdict)
+                         files=files, verdict=verdict)
             print(f"  QUEUED for human approval ({why})"); queued += 1
 
     pruned = _orphan_prune_pass(cfg, ac, store, gate, apply) if ac.get("prune_orphans") else 0
@@ -465,22 +490,44 @@ def _orphan_prune_pass(cfg, ac, store, gate, apply) -> int:
     n = 0
     for name in prunable[:int(ac.get("max_prunes_per_run", 5))]:
         preview = f"Prune stale orphan {name}: aged ≥{int(age_min)}d, never recalled, no merge target. → .trash (recoverable)."
-        if apply:
+        if apply and ac.get("autonomous"):
+            # autonomous: prune straight to .trash/ (90-day undo), no Telegram proposal
+            r = subprocess.run(["bash", str(DELETE), name], capture_output=True, text=True, timeout=60)
+            print(f"  PRUNED: {name}" if r.returncode == 0 else f"  prune FAILED: {name}: {r.stderr.strip()[:150]}")
+        elif apply:
             gate.propose("orphan_prune", {"name": name}, preview, files=[name])
         else:
             print(f"  would propose prune: {name}")
         n += 1
     if prunable:
-        print(f"[orphan-prune] {len(prunable)} orphan(s); proposed {n} (cap {ac.get('max_prunes_per_run', 5)})")
+        mode = "pruned" if ac.get("autonomous") else "proposed"
+        print(f"[orphan-prune] {len(prunable)} orphan(s); {mode} {n} (cap {ac.get('max_prunes_per_run', 5)})")
     return n
 
 
-def _codex_verdict(umbrella_doc, source_files) -> str:
-    """Ask the Codex advisor whether the compressed umbrella loses information vs its
-    sources or introduces a secret. Returns APPROVE only on an explicit clean verdict;
-    DEFER on anything else (fail-closed → routes to the human queue)."""
-    if not ADVISOR.exists():
-        return "DEFER-no-advisor"
+def _strict_verdict(stdout: str) -> str:
+    """Strict token rules — injected source text could try to spoof a verdict.
+    Require: exactly ONE verdict token anywhere, it is APPROVE, and it is on the LAST
+    non-empty line. Anything else is not an approval (fail-closed)."""
+    import re as _re
+    verdicts = _re.findall(r"VERDICT:\s*(APPROVE|REJECT)", stdout or "", _re.I)
+    lines = [ln.strip() for ln in (stdout or "").splitlines() if ln.strip()]
+    last = lines[-1].upper() if lines else ""
+    if len(verdicts) == 1 and verdicts[0].upper() == "APPROVE" and last == "VERDICT: APPROVE":
+        return "APPROVE"
+    return "REJECT" if verdicts else "DEFER-no-verdict"
+
+
+def _self_verdict(umbrella_doc, source_files) -> str:
+    """Ask ENGRAM'S OWN generate backend (role 'verify' — the same dependency harvest
+    and distill already use) whether the compressed umbrella loses information vs its
+    sources or introduces a secret. APPROVE only on the exact strict token; anything
+    unparseable or raised is DEFER-* (fail-closed → skipped/queued as before).
+    Independence is limited — the reviewer shares the writing model's blind spots —
+    but the hard safety never came from reviewer variety: 30-day quarantine and the
+    credential reconciliation do that."""
+    task = ("Does this umbrella drop any durable fact from the sources, or add a secret/"
+            "hallucination? Reply a final line exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT'.")
     # Redact EVERYTHING before it reaches the advisor subprocess/backend/logs — the
     # whole umbrella doc (its frontmatter description may hold a secret) AND every
     # source. A scanner-missed credential in a legacy memory must not leak.
@@ -489,25 +536,11 @@ def _codex_verdict(umbrella_doc, source_files) -> str:
                        for f in source_files)
     blob = f"PROPOSED UMBRELLA:\n{safe_umbrella[:4000]}\n\nSOURCES IT REPLACES:\n{srcs[:6000]}"
     try:
-        r = subprocess.run(
-            [sys.executable, str(ADVISOR), "--mode", "review", "--stdin",
-             "--task", ("Does this umbrella drop any durable fact from the sources, or add a secret/"
-                        "hallucination? Reply a final line exactly 'VERDICT: APPROVE' or 'VERDICT: REJECT'.")],
-            input=blob, capture_output=True, text=True, timeout=180)
+        import engram_llm
+        out = engram_llm.generate(f"{task}\n\n{blob}", role="verify")
     except Exception as e:
         return f"DEFER-{type(e).__name__}"
-    if r.returncode != 0:
-        return "DEFER-advisor-rc"
-    import re as _re
-    # Injected source text could try to surface a spoofed verdict token. Require:
-    # exactly ONE verdict anywhere, it is APPROVE, and it is on the LAST non-empty
-    # line. Anything else -> DEFER to the human queue (fail-closed).
-    verdicts = _re.findall(r"VERDICT:\s*(APPROVE|REJECT)", r.stdout or "", _re.I)
-    lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
-    last = lines[-1].upper() if lines else ""
-    if len(verdicts) == 1 and verdicts[0].upper() == "APPROVE" and last == "VERDICT: APPROVE":
-        return "APPROVE"
-    return "REJECT" if verdicts else "DEFER-no-verdict"
+    return _strict_verdict(out)
 
 
 if __name__ == "__main__":

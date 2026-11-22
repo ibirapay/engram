@@ -244,19 +244,22 @@ auto_graduate:                     # stage ②/④
 # Deterministic auto-consolidation (compress-then-quarantine). Merges near-duplicate
 # memories (Qdrant ANN cosine >= merge_threshold, SAME type) into a compressed umbrella;
 # sources go to .quarantine/ (30-day probation, restorable) NOT trashed. Each merge is
-# reviewed by Codex: clean -> auto-apply + a one-tap UNDO on Telegram; deferred -> the
-# approval queue. OFF by default. Needs the vector store + (ideally) the Telegram gate.
+# reviewed by the store's OWN backend (self-review): clean -> auto-apply + a one-tap
+# UNDO on Telegram; deferred -> the approval queue. OFF by default. Needs the vector
+# store + (ideally) the Telegram gate. No external reviewer CLIs — engram judges its
+# own output (owner rule 2026-11-21: engram depends on nothing but itself).
 auto_curate:
   enabled: false
   merge_threshold: 0.92            # cosine >= this to auto-merge (high = only true near-dups)
   max_merges_per_run: 2
-  review_gate: auto                # auto | codex | human. 'auto' uses Codex if installed, ELSE falls
-                                   # back to a HUMAN Telegram approval for every merge. Most users have
-                                   # only Claude (no Codex) -> 'auto' = human-gated, safely. 'human' forces
-                                   # it; 'codex' forces Codex. There is no unreviewed auto-apply mode.
+  review_gate: self                # self | human. 'self' = engram's own generate backend
+                                   # reviews (role verify — the same model path harvest/distill use).
+                                   # 'human' = every merge goes to the Telegram approval queue.
+                                   # Legacy 'auto'/'codex' values map to self. There is no
+                                   # unreviewed auto-apply mode.
 
 # Async human-approval gate (Telegram). For the irreversible/behavioral ops: skill
-# installs (always), Codex-deferred merges, purges. Long-poll (no webhook). Put the
+# installs (always), self-review-deferred merges, purges. Long-poll (no webhook). Put the
 # bot token + your chat id in ~/.config/engram/daemon.env (mode 600), never here:
 #   TELEGRAM_BOT_TOKEN=...   TELEGRAM_CHAT_ID=...
 # 72h TTL then DROP (never default-apply). Works headless without a token (local

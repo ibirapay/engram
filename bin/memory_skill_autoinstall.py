@@ -264,7 +264,7 @@ def stage_and_propose_skill(skill_name: str, skill_md: str, source_memory: str, 
                    f"Passed provenance+static+syntax+adversarial({verdict}).")
         gate.propose("skill_install",
                      {"name": skill_name, "source_memory": source_memory, "artifact_sha": artifact_sha},
-                     preview, files=[source_memory], codex_verdict=verdict)
+                     preview, files=[source_memory], verdict=verdict)
         return True
     except Exception as e:
         sys.stderr.write(f"[skill] gate propose failed ({e}) — staged, awaiting manual install\n")
