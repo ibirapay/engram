@@ -148,6 +148,26 @@ embed:
 #
 # native uses the Rust/Neo4j schema. Node identity includes the memory slug, so
 # switching to it needs a rebuild; it is still the unproven path.
+# ── Languages: what these stores are written in ─────────────────────────────
+# Declare the languages of the memory stores. The FIRST entry is the store's mother
+# tongue; anything after it is a lateral language. Nothing is ever DETECTED — no part
+# of recall looks at a prompt's language, because a per-query guess is a new way to be
+# wrong on every prompt.
+#
+# The rule engram enforces when you declare: a store whose mother tongue is not `en`
+# must list `en` too. That is not a style preference. The embedding model bridges
+# English only, so a store with no English text in it has no vector leg at all — the
+# words that carry across languages are names, identifiers and technical terms, and
+# those are exactly what English-as-lateral puts in the memories.
+#
+# Only the languages the keyword ranking has function words for may be named, today
+# `pt-BR` and `en`. Anything else is refused at load, because the alternative is
+# quietly ranking that language's prompts with another language's idea of grammar.
+#
+# LEAVE THIS KEY OUT and nothing changes: an undeclared store is ranked exactly as it
+# always was. `languages:` per tenant overrides this for the stores that tenant owns —
+# a store's language is a property of the store, and a tenant is what owns stores.
+# languages: [pt-BR, en]
 # ── Tenants: agent identities ───────────────────────────────────────────────
 # A tenant is one agent's world — the memory stores it owns, and (optionally) the
 # Obsidian vault it reads. Its purpose is isolation: a "work" agent must never
