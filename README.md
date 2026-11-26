@@ -309,17 +309,9 @@ failure is reported as a recall failure rather than silently returning a weaker
 result.
 
 The native synchronizer records typed triples with confidence, preserves replaced
-claims as history, and excludes quarantined claims from recall. To evaluate that
-alternative against the legacy Graphiti index, run:
-
-```bash
-source ~/.claude/graph/.env
-~/.claude/rust/engram-graph-recall-eval --cases ~/.claude/rust/graph_recall_eval.json
-```
-
-The evaluator explicitly uses the native backend regardless of the production
-setting and exits non-zero until native recall contains every Graphiti hit in the
-representative query set.
+claims as history, and excludes quarantined claims from recall. The graph lives in `~/.claude/index/graph.db` (SQLite). An install that still has the
+old Neo4j graph copies it once with `engram-graph-to-sqlite`, which is read-only on
+Neo4j and checks that every count matches before it reports success.
 
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full data flow and **[CONFIG.md](CONFIG.md)** for `engram.yaml`.
 

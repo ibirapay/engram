@@ -30,32 +30,11 @@ struct Args {
     #[arg(long, allow_hyphen_values = true)]
     slug: Option<String>,
     /// Which agent identity's graph to write. Required on an install that
-    /// defines tenants: every node this writes carries the tenant, and the
-    /// Graphiti group it reads legacy facts from is derived from it.
+    /// defines tenants: every row this writes carries the tenant.
     #[arg(long, env = "ENGRAM_TENANT")]
     tenant: Option<String>,
     #[arg(long, default_value_t = 25)]
     limit: usize,
-    #[arg(long)]
-    import_legacy_embeddings: bool,
-    /// Seed the native graph from the legacy Graphiti one without calling a
-    /// model: every memory still byte-identical to the markdown Graphiti ingested
-    /// gets its node, its legacy facts (with their stored embeddings) and a commit
-    /// marker. Everything else is left for the normal, extracting sync.
-    ///
-    /// Refused unless the slug is the store pinned in engram.env: the legacy graph
-    /// is one unscoped group built from that store. Files that already have a
-    /// native node are never touched.
-    #[arg(long)]
-    bootstrap_from_legacy: bool,
-    /// Neo4j connection overrides. Omitted values come from engram.yaml and the
-    /// installer-managed graph/.env, so a normal install needs none of these.
-    #[arg(long)]
-    uri: Option<String>,
-    #[arg(long)]
-    database: Option<String>,
-    #[arg(long, env = "NEO4J_PASSWORD")]
-    password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,46 +107,15 @@ async fn run(args: Args) -> Result<usize, SyncError> {
     if !config.local_enabled {
         return Err("local_enabled is false".into());
     }
-    // Credentials from config + graph/.env, with the CLI able to override.
-    let mut creds = config.graph.credentials();
-    if let Some(uri) = args.uri {
-        creds.uri = uri;
-    }
-    if let Some(database) = args.database {
-        creds.database = database;
-    }
-    if let Some(password) = args.password.filter(|value| !value.trim().is_empty()) {
-        creds.password = engram_config::Secret::new(password);
-    }
     let backend = std::env::var("ENGRAM_GRAPH_BACKEND")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| config.graph.backend.clone());
-    if backend != "sqlite" && creds.password.is_empty() {
-        return Err(
-            "no Neo4j password: set NEO4J_PASSWORD, graph.neo4j_password, or graph/.env".into(),
-        );
+    if engram_config::Graph::is_legacy(&backend) {
+        return Err(engram_config::Graph::legacy_message(&backend).into());
     }
-    let client =
-        GraphClient::connect(&backend, &creds, &config_path).map_err(|error| error.to_string())?;
-
-    // The legacy import is pure Cypher — no model is called — so it must run
-    // BEFORE the provider gates below. Gating it was a real obstruction: the
-    // migration this release documents was unreachable on exactly the read-only
-    // native install that needs it most.
-    // Tenanted, the legacy group was relabelled per tenant (engram-tenant-migrate)
-    // and every legacy read below is confined to it, so the group IS the boundary.
-    if (args.import_legacy_embeddings || args.bootstrap_from_legacy) && !config.tenancy_enabled() {
-        require_pinned_store(&slug, engram_paths::pinned_slug().as_deref())?;
-    }
-    if args.import_legacy_embeddings {
-        client
-            .import_legacy_fact_embeddings(&scope)
-            .await
-            .map_err(|error| error.to_string())?;
-        return Ok(0);
-    }
+    let client = GraphClient::connect(&config_path).map_err(|error| error.to_string())?;
 
     // Everything past here calls models. A native sync needs BOTH an
     // OpenAI-compatible embedding endpoint and a generation endpoint for fact
@@ -201,19 +149,6 @@ async fn run(args: Args) -> Result<usize, SyncError> {
         .with_api_key(config.embed.api_key.present())
         .with_timeout(config.embed_timeout_seconds());
     let space = config.embedding_space_id();
-
-    if args.bootstrap_from_legacy {
-        return bootstrap_from_legacy(
-            &client,
-            &config,
-            &embeddings,
-            &config_path,
-            &scope,
-            &space,
-            &memories,
-        )
-        .await;
-    }
 
     // Retire graph data for memories that left the store. Only on a full pass:
     // a --limit run has not looked at everything, so it cannot conclude a file is
@@ -304,275 +239,6 @@ fn memory_sha(space: &str, memory: &engram_store::Memory) -> String {
             .as_bytes()
         )
     )
-}
-
-/// The legacy graph is ONE unscoped group, built from the store pinned in
-/// engram.env. Copying it into any other store would hand that store another
-/// project's facts, so both legacy commands fail closed unless the target is the
-/// pin, including when there is no pin at all.
-fn require_pinned_store(slug: &str, pinned: Option<&str>) -> Result<(), String> {
-    match pinned {
-        Some(pin) if pin == slug => Ok(()),
-        Some(pin) => Err(format!(
-            "refusing: the legacy graph belongs to the pinned store {pin}, not {slug}"
-        )),
-        None => Err(
-            "refusing: no CLAUDE_MEMORY_SLUG pin in engram.env, so the legacy graph's \
-             store is unknown"
-                .into(),
-        ),
-    }
-}
-
-/// Which legacy episode, if any, may seed this file: the one whose ingested
-/// markdown is byte-identical to the file now. An older ingested version of the
-/// same file never qualifies, so its superseded facts are never imported.
-fn verified_episode<'a>(
-    bytes: &[u8],
-    episodes: impl Iterator<Item = &'a (String, String, String)>,
-) -> Option<&'a str> {
-    let digest = Sha256::digest(bytes);
-    episodes
-        .filter(|(_, _, source)| Sha256::digest(source.as_bytes()) == digest)
-        .map(|(_, uuid, _)| uuid.as_str())
-        .next()
-}
-
-/// `--bootstrap-from-legacy`. No model is called: the legacy graph already holds
-/// the extraction output (facts + embeddings in this same space, checked by the
-/// operator before running), so re-extracting a whole store would cost hours of
-/// GPU to reproduce it. A memory qualifies only if it has no native facts or
-/// marker yet and its file is byte-identical to one legacy episode; only that
-/// episode's facts are used.
-///
-/// Raw legacy facts never touch the native graph: they are read out, redacted
-/// (the extracting sync redacts before anything leaves the box, and this path
-/// skips the model) and, when redaction changed them, re-embedded from the
-/// redacted text, since a vector of a secret still leaks it through similarity.
-/// Each memory's facts and commit marker are then written in one transaction.
-#[allow(clippy::too_many_arguments)]
-async fn bootstrap_from_legacy(
-    client: &GraphClient,
-    config: &Config,
-    embeddings: &OpenAiCompatibleClient,
-    config_path: &std::path::Path,
-    scope: &engram_tenant::GraphScope,
-    space: &str,
-    memories: &[engram_store::Memory],
-) -> Result<usize, SyncError> {
-    let dir = engram_paths::store_dir(config_path, scope.slug());
-    let files: Vec<String> = memories.iter().map(|memory| memory.file.clone()).collect();
-    let sources = client
-        .legacy_sources(scope, &files)
-        .await
-        .map_err(|error| error.to_string())?;
-    let existing: std::collections::HashSet<String> = client
-        .native_files(scope)
-        .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .collect();
-    let mut verified = Vec::new();
-    for memory in memories {
-        if existing.contains(&memory.file) {
-            continue;
-        }
-        let bytes = std::fs::read(dir.join(&memory.file))
-            .map_err(|error| format!("{}: {error}", memory.file))?;
-        if let Some(episode) = verified_episode(
-            &bytes,
-            sources.iter().filter(|(file, _, _)| *file == memory.file),
-        ) {
-            verified.push((memory, episode.to_string()));
-        }
-    }
-    let episodes: Vec<String> = verified
-        .iter()
-        .map(|(_, episode)| episode.clone())
-        .collect();
-    let mut by_file: std::collections::HashMap<String, Vec<engram_graph::LegacyFact>> =
-        std::collections::HashMap::new();
-    for fact in client
-        .legacy_verified_facts(scope, &episodes)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        by_file.entry(fact.file.clone()).or_default().push(fact);
-    }
-    let mut redacted = 0;
-    for (memory, _) in &verified {
-        let mut facts = Vec::new();
-        for legacy in by_file.remove(&memory.file).unwrap_or_default() {
-            let fact = match redacted_fact(
-                &legacy.text,
-                &legacy.subject,
-                &legacy.object,
-                &legacy.legacy_name,
-            ) {
-                None => engram_graph::BootstrapFact {
-                    text: legacy.text,
-                    subject: legacy.subject,
-                    object: legacy.object,
-                    legacy_name: legacy.legacy_name,
-                    embedding: legacy.embedding,
-                    redacted: false,
-                    valid_until: legacy.valid_until,
-                },
-                Some((text, subject, object, legacy_name)) => {
-                    let vector = embeddings
-                        .embedding(&config.embed.model, &config.document_text(&text))
-                        .await
-                        .map_err(|error| format!("re-embedding a redacted fact failed: {error}"))?;
-                    redacted += 1;
-                    engram_graph::BootstrapFact {
-                        text,
-                        subject,
-                        object,
-                        legacy_name,
-                        embedding: Some(vector),
-                        redacted: true,
-                        valid_until: legacy.valid_until,
-                    }
-                }
-            };
-            facts.push(fact);
-        }
-        let facts = valid_wins(facts);
-        let (safe_name, _) = engram_secrets::redact(&memory.name);
-        let (safe_description, _) = engram_secrets::redact(&memory.description);
-        let (safe_body, _) = engram_secrets::redact(&memory.body);
-        client
-            .upsert_native_memory(
-                scope,
-                &memory.file,
-                &safe_name,
-                &safe_description,
-                &safe_body,
-                memory.source_mtime,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        client
-            .commit_bootstrapped_memory(
-                scope,
-                &memory.file,
-                &facts,
-                &memory_sha(space, memory),
-                space,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-    }
-    eprintln!(
-        "engram-native-graph-sync: bootstrapped {} of {} memories from the legacy graph \
-         ({redacted} fact(s) redacted; {} already native, left alone; the rest need \
-         extraction)",
-        verified.len(),
-        memories.len(),
-        existing.len()
-    );
-    Ok(verified.len())
-}
-
-/// One fact per text, because native facts are keyed by (memory, text): when the
-/// same claim exists both as a live and a superseded legacy edge, the live one
-/// wins, or a still-true fact would be retired by its own older copy.
-fn valid_wins(facts: Vec<engram_graph::BootstrapFact>) -> Vec<engram_graph::BootstrapFact> {
-    let mut out: Vec<engram_graph::BootstrapFact> = Vec::new();
-    for fact in facts {
-        match out.iter_mut().find(|kept| kept.text == fact.text) {
-            Some(kept) if kept.valid_until.is_some() && fact.valid_until.is_none() => *kept = fact,
-            Some(_) => {}
-            None => out.push(fact),
-        }
-    }
-    out
-}
-
-/// The redacted `(text, subject, object)` of a fact, or None when nothing in it
-/// looks secret.
-/// The relation name counts too: it is stored in the searchable fulltext index,
-/// so a secret that lives only there must not pass through verbatim.
-fn redacted_fact(
-    text: &str,
-    subject: &str,
-    object: &str,
-    name: &str,
-) -> Option<(String, String, String, String)> {
-    let (safe_text, a) = engram_secrets::redact(text);
-    let (safe_subject, b) = engram_secrets::redact(subject);
-    let (safe_object, c) = engram_secrets::redact(object);
-    let (safe_name, d) = engram_secrets::redact(name);
-    (a + b + c + d > 0).then_some((safe_text, safe_subject, safe_object, safe_name))
-}
-
-#[cfg(test)]
-mod bootstrap_tests {
-    use super::*;
-
-    #[test]
-    fn a_live_copy_of_a_claim_beats_its_superseded_copy() {
-        let fact = |text: &str, until: Option<&str>| engram_graph::BootstrapFact {
-            text: text.into(),
-            subject: String::new(),
-            object: String::new(),
-            legacy_name: String::new(),
-            embedding: None,
-            redacted: false,
-            valid_until: until.map(str::to_string),
-        };
-        let out = valid_wins(vec![
-            fact("a", Some("2026-01-01T00:00:00Z")),
-            fact("a", None),
-            fact("b", Some("2026-01-01T00:00:00Z")),
-        ]);
-        assert_eq!(out.len(), 2);
-        assert!(
-            out.iter()
-                .find(|f| f.text == "a")
-                .unwrap()
-                .valid_until
-                .is_none()
-        );
-        assert!(
-            out.iter()
-                .find(|f| f.text == "b")
-                .unwrap()
-                .valid_until
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn a_secret_in_any_part_of_a_fact_is_redacted() {
-        let secret = "api_key=sk-proj-abcdefghijklmnopqrstuvwxyz1234";
-        assert!(redacted_fact("plain fact", "a", "b", "USES").is_none());
-        let (text, _, _, _) = redacted_fact(&format!("uses {secret}"), "a", "b", "USES").unwrap();
-        assert!(!text.contains("sk-proj-"), "{text}");
-        let (_, _, object, _) = redacted_fact("plain", "svc", secret, "USES").unwrap();
-        assert!(!object.contains("sk-proj-"), "{object}");
-        // a secret only in the relation name still triggers redaction
-        let (_, _, _, name) = redacted_fact("plain", "a", "b", secret).unwrap();
-        assert!(!name.contains("sk-proj-"), "{name}");
-    }
-
-    #[test]
-    fn legacy_commands_only_target_the_pinned_store() {
-        assert!(require_pinned_store("-home-u", Some("-home-u")).is_ok());
-        assert!(require_pinned_store("-home-other", Some("-home-u")).is_err());
-        assert!(require_pinned_store("-home-u", None).is_err());
-    }
-
-    #[test]
-    fn only_the_byte_identical_episode_seeds_a_file() {
-        let episodes = [
-            ("a.md".to_string(), "old".to_string(), "v1".to_string()),
-            ("a.md".to_string(), "new".to_string(), "v2".to_string()),
-        ];
-        assert_eq!(verified_episode(b"v2", episodes.iter()), Some("new"));
-        assert_eq!(verified_episode(b"v1", episodes.iter()), Some("old"));
-        assert_eq!(verified_episode(b"v3 edited", episodes.iter()), None);
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

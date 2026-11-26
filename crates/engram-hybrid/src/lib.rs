@@ -1,10 +1,7 @@
 //! Recall orchestration: the keyword, vector and graph legs, and their fusion.
 //!
-//! Note on compatibility mode: with `graph.backend: graphiti_compat` the outer
-//! keyword and vector legs are deliberately DISABLED and Graphiti's own ordering is
-//! returned untouched. That is a product decision — the point of the compatibility
-//! window is to not change Graphiti's ranking — not hybrid fusion. The leg status
-//! map says so explicitly so nothing downstream has to guess.
+//! The graph leg reads the SQLite native graph (`graph.backend: sqlite`); the keyword
+//! leg reads the persistent keyword index; the vector leg reads Qdrant.
 
 use engram_config::Config;
 use engram_graph::GraphClient;
@@ -30,10 +27,9 @@ pub struct ResultItem {
     pub sources: Vec<String>,
     /// The facts that led to THIS memory.
     ///
-    /// Graphiti returns facts grouped per record and the Python contract
-    /// (`memory_recall.fuse`) keeps them that way. Flattening everything into one
-    /// global list, as this crate used to, throws away the attribution: a caller
-    /// could see twelve facts and not know which memory any of them came from.
+    /// Facts are kept per memory. Flattening everything into one global list throws
+    /// away the attribution: a caller could see twelve facts and not know which
+    /// memory any of them came from.
     pub facts: Vec<String>,
 }
 
@@ -44,8 +40,8 @@ pub struct Output {
     /// Every fact from the graph leg, deduped — retained for callers that just
     /// want context. Per-record attribution lives on each [`ResultItem`].
     pub facts: Vec<String>,
-    /// Graphiti's 1-hop related memories. Part of its response contract and
-    /// previously dropped on the floor by the `--json` output shape.
+    /// Related memories (1 hop). Kept in the response contract; the SQLite graph does
+    /// not produce them, so it is empty.
     pub neighbours: Vec<String>,
     pub legs: HashMap<String, String>,
 }
@@ -97,39 +93,10 @@ pub async fn recall(
     recall_with_config(config, config_path, tenant, slug, query, k).await
 }
 
-pub async fn recall_native(
-    config_path: &Path,
-    tenant: &Tenant,
-    slug: &str,
-    query: &str,
-    k: usize,
-) -> Result<Output, String> {
-    let mut config = Config::load(config_path).map_err(|error| error.to_string())?;
-    config.graph.backend = "native".into();
-    // Force the native path even if ENGRAM_GRAPH_BACKEND says otherwise: a stray
-    // export in the environment used to silently defeat this function, including
-    // inside the parity evaluator, which then compared native against native.
-    recall_with_backend(
-        config,
-        config_path,
-        tenant,
-        slug,
-        query,
-        k,
-        Some("native"),
-        Mode::Full,
-    )
-    .await
-}
-
-/// Recall for the prompt hook: the cheap legs only, no Graphiti child.
+/// Recall for the prompt hook: the cheap legs only.
 ///
-/// Mirrors `memory_recall.recall(fast=True)` on the Python side, and exists for the
-/// same reason. Real Graphiti recall measures ~3.5s against a populated graph,
-/// while the per-prompt budget is 2.5s — so a hook that used the full path would
-/// time out on every single prompt and inject nothing. Fast mode runs local BM25
-/// plus the vector leg, and swaps the Graphiti child for ONE Neo4j fact query, so
-/// it stays inside the budget whatever `graph.backend` says.
+/// Fast mode runs the keyword index and the vector leg, plus ONE graph fact query,
+/// so a prompt stays well inside its 2.5s budget.
 pub async fn recall_fast(
     config_path: &Path,
     tenant: &Tenant,
@@ -138,25 +105,15 @@ pub async fn recall_fast(
     k: usize,
 ) -> Result<Output, String> {
     let config = Config::load(config_path).map_err(|error| error.to_string())?;
-    recall_with_backend(
-        config,
-        config_path,
-        tenant,
-        slug,
-        query,
-        k,
-        None,
-        Mode::Fast,
-    )
-    .await
+    recall_with_backend(config, config_path, tenant, slug, query, k, Mode::Fast).await
 }
 
 /// Which legs to run.
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
-    /// Honour `graph.backend`, including spawning Graphiti in compatibility mode.
+    /// Graph facts, keyword and semantic legs.
     Full,
-    /// Local + vector legs plus a single graph fact query. No child process.
+    /// Local + vector legs plus a single graph fact query.
     Fast,
 }
 
@@ -168,20 +125,9 @@ async fn recall_with_config(
     query: &str,
     k: usize,
 ) -> Result<Output, String> {
-    recall_with_backend(
-        config,
-        config_path,
-        tenant,
-        slug,
-        query,
-        k,
-        None,
-        Mode::Full,
-    )
-    .await
+    recall_with_backend(config, config_path, tenant, slug, query, k, Mode::Full).await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn recall_with_backend(
     config: Config,
     config_path: &Path,
@@ -189,7 +135,6 @@ async fn recall_with_backend(
     slug: &str,
     query: &str,
     k: usize,
-    force_backend: Option<&str>,
     mode: Mode,
 ) -> Result<Output, String> {
     // Authorise before reading anything. `graph_scope` refuses a slug this
@@ -211,51 +156,9 @@ async fn recall_with_backend(
         )
     })?;
     let mut legs = HashMap::new();
-    let backend = force_backend
-        .map(str::to_string)
-        .unwrap_or_else(|| graph_backend(&config));
-    // In compatibility mode the local legs are suppressed so Graphiti's ordering
-    // is returned untouched. Fast mode has no Graphiti ordering to preserve, so
-    // they are exactly what it has to work with.
-    //
-    // ...but only when there is a Graphiti to be compatible WITH. Compat is the
-    // default (an upgraded install must not be moved off its populated index), and
-    // compat failure is fatal by design, because silently reordering is the one
-    // thing this mode exists to prevent. On an install that never had the graph —
-    // `install.sh --no-graph`, which writes no `graph:` block — those two correct
-    // decisions combined into a broken one: recall failed closed on
-    // `ModuleNotFoundError: graphiti_core` for every query, out of the box.
-    //
-    // An absent Graphiti is not a failure to preserve ordering; there is no
-    // ordering to preserve. So it degrades to the ordinary hybrid path instead,
-    // and says so in `legs`. An install that HAS Graphiti and then fails still
-    // fails closed — there the ordering is the whole point.
-    let graphiti_installed = graphiti_usable(&engram_paths::graph_dir());
-    let graphiti_compat = backend == "graphiti_compat" && mode == Mode::Full && graphiti_installed;
-    if backend == "graphiti_compat" && mode == Mode::Full && !graphiti_installed {
-        legs.insert(
-            "graph".into(),
-            "graphiti_compat requested but Graphiti is not installed; \
-             using local keyword + vector recall"
-                .into(),
-        );
-    }
-    let keyword = if graphiti_compat {
-        legs.insert(
-            "keyword".into(),
-            "disabled: graphiti_compat preserves Graphiti ordering".into(),
-        );
-        Vec::new()
-    } else {
-        keyword_leg(config_path, &store, slug, query, k * 2, &mut legs)?
-    };
-    let vector = if graphiti_compat {
-        legs.insert(
-            "vector".into(),
-            "disabled: graphiti_compat preserves Graphiti ordering".into(),
-        );
-        Vec::new()
-    } else {
+    let backend = graph_backend(&config);
+    let keyword = keyword_leg(config_path, &store, slug, query, k * 2, &mut legs)?;
+    let vector = {
         // In fast mode the vector leg gets its OWN, tighter deadline.
         //
         // The hook wraps this entire call in `recall.inject.timeout_ms`, so a
@@ -272,21 +175,13 @@ async fn recall_with_backend(
             .then(|| Duration::from_millis(config.recall.inject.timeout_ms.max(250) * 2 / 5));
         vector_leg(&config, tenant, query, slug, k * 2, &mut legs, leg_budget).await
     };
-    let graph_limit = if graphiti_compat { k } else { k * 2 };
-    // Dispatch on the decision actually made, not on the configured name: with
-    // compat requested but unavailable we must not call the compat leg again just
-    // to re-discover that.
-    let effective_backend = if backend == "graphiti_compat" && !graphiti_compat {
-        "native"
-    } else {
-        backend.as_str()
-    };
+    let graph_limit = k * 2;
     let graph = match mode {
         Mode::Full => {
-            graph_leg(
+            native_leg(
                 &config,
                 config_path,
-                effective_backend,
+                &backend,
                 &scope,
                 query,
                 graph_limit,
@@ -296,19 +191,7 @@ async fn recall_with_backend(
         }
         Mode::Fast => fast_graph_leg(&config, config_path, &scope, query, &mut legs).await,
     };
-    if graphiti_compat
-        && legs
-            .get("graph")
-            .is_some_and(|value| value != "graphiti_compat")
-    {
-        return Err(format!(
-            "Graphiti compatibility recall is unavailable: {}",
-            legs.get("graph").map(String::as_str).unwrap_or("unknown")
-        ));
-    }
-    let ranked: Vec<String> = if graphiti_compat {
-        graph.files.clone()
-    } else {
+    let ranked: Vec<String> = {
         // Weights and the RRF constant come from config; they were hardcoded to
         // equal weighting and 60.0 while engram.yaml documented both. The order
         // of the rankings below must match the weight lookup.
@@ -510,227 +393,6 @@ async fn vector_leg(
     }
 }
 
-async fn graph_leg(
-    config: &Config,
-    config_path: &Path,
-    backend: &str,
-    scope: &GraphScope,
-    query: &str,
-    k: usize,
-    legs: &mut HashMap<String, String>,
-) -> GraphLeg {
-    if backend == "graphiti_compat" {
-        return graphiti_compat_leg(config, scope, &engram_paths::graph_dir(), query, k, legs)
-            .await;
-    }
-    native_leg(config, config_path, backend, scope, query, k, legs).await
-}
-
-/// The installed Graphiti recall script.
-fn graphiti_script(graph_dir: &Path) -> PathBuf {
-    graph_dir.join("memory_graph_recall.py")
-}
-
-/// Whether Graphiti is actually usable here, which is what distinguishes "this
-/// install has an index whose ordering must be preserved" from "this install never
-/// had the graph".
-///
-/// The signal is the **venv**, not the script. `install.sh` copies `graph/*.py`
-/// unconditionally and only builds `graph/venv` under `--graph`, so the script's
-/// presence proves nothing — and with no venv the compat leg falls back to bare
-/// `python3`, where `import graphiti_core` is exactly the failure we are trying to
-/// classify.
-fn graphiti_usable(graph_dir: &Path) -> bool {
-    graph_dir.join("venv/bin/python").is_file() && graphiti_script(graph_dir).is_file()
-}
-
-/// How long the Graphiti child gets before it is killed.
-///
-/// This bounds the CHILD so a stalled Neo4j cannot hang the process forever — it
-/// is not the per-prompt budget. The recall hook layers its much shorter
-/// `recall.inject.timeout_ms` on top, which is the right split: an explicit CLI or
-/// MCP call may wait for a ~4s Graphiti query, while a prompt may not.
-fn graphiti_budget(config: &Config) -> Duration {
-    // The floor keeps a misconfigured 0 from meaning "never run".
-    Duration::from_millis(config.recall.timeout_ms.max(250))
-}
-
-/// `graph_dir` is passed in rather than read from the environment here, so the
-/// caller owns resolution and tests need no process-global state.
-async fn graphiti_compat_leg(
-    config: &Config,
-    scope: &GraphScope,
-    graph_dir: &Path,
-    query: &str,
-    k: usize,
-    legs: &mut HashMap<String, String>,
-) -> GraphLeg {
-    let python = graph_dir.join("venv/bin/python");
-    let interpreter = if python.is_file() {
-        python
-    } else {
-        "python3".into()
-    };
-    let script = graphiti_script(graph_dir);
-    // tokio::process + a deadline. This was a blocking Command::output() with NO
-    // timeout, called from an async handler AND from the UserPromptSubmit hook: a
-    // stalled Neo4j blocked a tokio worker and delayed the user's prompt
-    // indefinitely, failing open only once the call eventually returned.
-    let mut command = tokio::process::Command::new(&interpreter);
-    command
-        .arg(&script)
-        .arg(query)
-        .arg("--k")
-        .arg(k.to_string());
-    // `--group` is sent ONLY for a named tenant, and that asymmetry is load-bearing.
-    //
-    // An older installed script does not merely ignore the flag. Its parser
-    // rebuilds the query from every argument that does not start with "--", so
-    // `--group canonical` turns the search for "qdrant embedding space" into a
-    // search for "qdrant embedding space canonical" — the flag's VALUE lands in
-    // the query text. Sending it unconditionally therefore degraded recall
-    // quality on every pre-tenancy install until its scripts were refreshed,
-    // silently, with results still coming back. (Found by running the new binary
-    // against the live install; no unit test would have shown it, because the
-    // fixtures all implement the new parser.)
-    //
-    // The legacy group is what a new script defaults to when the flag is absent,
-    // so omitting it is not a behaviour change — just a quieter command line. A
-    // named tenant does send it, and must: there the echo check below turns an
-    // old script into a hard refusal rather than a silent cross-tenant read.
-    if !scope.tenant().is_empty() && scope.tenant() != engram_tenant::LEGACY_GRAPH_GROUP {
-        command.arg("--group").arg(scope.tenant());
-    }
-    let spawned = command
-        // BOTH flags, deliberately. --json-full returns Graphiti's `neighbours`
-        // (the 1-hop related memories) which the bare-array --json shape drops, but
-        // an older INSTALLED script does not recognise --json-full and would fall
-        // back to printing markdown. With both, an old script sees --json and
-        // prints the array; a new one sees --json-full and prints the full object.
-        // The parser below accepts either shape, so the Rust binary and the Python
-        // script can be upgraded independently.
-        .arg("--json")
-        .arg("--json-full")
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let output = match tokio::time::timeout(graphiti_budget(config), spawned).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            legs.insert(
-                "graph".into(),
-                format!(
-                    "graphiti_compat could not run {}: {error}",
-                    script.display()
-                ),
-            );
-            return GraphLeg::empty();
-        }
-        Err(_) => {
-            // kill_on_drop reaps the child as the future is dropped here.
-            legs.insert(
-                "graph".into(),
-                format!(
-                    "graphiti_compat timed out after {}ms",
-                    graphiti_budget(config).as_millis()
-                ),
-            );
-            return GraphLeg::empty();
-        }
-    };
-    if !output.status.success() {
-        // stderr used to be discarded, so every failure looked the same.
-        let detail = String::from_utf8_lossy(&output.stderr);
-        let detail = detail.trim().lines().last().unwrap_or("no output");
-        legs.insert(
-            "graph".into(),
-            format!("graphiti_compat exited {}: {detail}", output.status),
-        );
-        return GraphLeg::empty();
-    }
-    let Ok(reply) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
-        legs.insert("graph".into(), "graphiti_compat invalid response".into());
-        return GraphLeg::empty();
-    };
-    // Accept both shapes: {"records": [...], "neighbours": [...]} from --json-full,
-    // and a bare array from a script predating that flag.
-    let (records, neighbours) = match &reply {
-        serde_json::Value::Array(records) => (records.clone(), Vec::new()),
-        serde_json::Value::Object(map) => (
-            map.get("records")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
-            map.get("neighbours")
-                .and_then(serde_json::Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
-        ),
-        _ => {
-            legs.insert("graph".into(), "graphiti_compat invalid response".into());
-            return GraphLeg::empty();
-        }
-    };
-    // Make the script PROVE it honoured the scope.
-    //
-    // `--group` is silently ignored by a script that predates it, so its
-    // presence on the command line guarantees nothing. A new script echoes the
-    // group it actually filtered on; if that echo is missing or wrong while a
-    // named tenant is active, the result may contain another identity's records
-    // and the leg fails. In compatibility mode a failed graph leg is fatal
-    // (below), which is the correct severity here: returning one agent's
-    // memories to another is strictly worse than returning none.
-    //
-    // The legacy tenant is exempt, and must be: a pre-tenancy install has no
-    // boundary to cross, and requiring the echo there would break every install
-    // that has not yet updated its graph scripts.
-    if !scope.tenant().is_empty() && scope.tenant() != engram_tenant::LEGACY_GRAPH_GROUP {
-        let echoed = reply.get("group").and_then(serde_json::Value::as_str);
-        if echoed != Some(scope.tenant()) {
-            legs.insert(
-                "graph".into(),
-                format!(
-                    "graphiti_compat did not confirm tenant scoping (asked for {:?}, \
-                     reply said {:?}); the installed {} is too old to partition by \
-                     group — re-run install.sh",
-                    scope.tenant(),
-                    echoed.unwrap_or("nothing"),
-                    script.display(),
-                ),
-            );
-            return GraphLeg::empty();
-        }
-    }
-    let mut leg = GraphLeg::empty();
-    leg.neighbours = neighbours;
-    for row in &records {
-        let Some(file) = row.get("file").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        leg.files.push(file.to_string());
-        let facts = row
-            .get("facts")
-            .and_then(serde_json::Value::as_array)
-            .map(|facts| {
-                facts
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        leg.facts_by_file.insert(file.to_string(), facts);
-    }
-    legs.insert("graph".into(), "graphiti_compat".into());
-    leg
-}
-
 /// Entity-ish words for the graph lookup: 4+ chars, case-insensitively deduped.
 /// The cap is generous on purpose: at 6, prose prompts spent it on filler words
 /// ("that", "when") and the real entity further in was never looked up. Every
@@ -758,15 +420,14 @@ async fn native_leg(
     k: usize,
     legs: &mut HashMap<String, String>,
 ) -> GraphLeg {
-    let creds = config.graph.credentials();
-    if backend != "sqlite" && creds.password.is_empty() {
+    if engram_config::Graph::is_legacy(backend) {
         legs.insert(
             "graph".into(),
-            "native: no Neo4j password (set NEO4J_PASSWORD or graph/.env)".into(),
+            engram_config::Graph::legacy_message(backend),
         );
         return GraphLeg::empty();
     }
-    let client = match GraphClient::connect(backend, &creds, config_path) {
+    let client = match GraphClient::connect(config_path) {
         Ok(client) => client,
         Err(error) => {
             legs.insert("graph".into(), format!("native: {error}"));
@@ -840,9 +501,8 @@ async fn native_leg(
     leg
 }
 
-/// One Neo4j query for facts about the query's tokens — no ranking, no child
-/// process. The legacy Entity/RELATES_TO leg when Graphiti owns the graph, the
-/// native triple leg otherwise; the same choice `memory_recall.graph_facts` makes.
+/// One graph query for facts about the query's tokens, no ranking, no child
+/// process: one fact query against the SQLite graph.
 async fn fast_graph_leg(
     config: &Config,
     config_path: &Path,
@@ -856,40 +516,24 @@ async fn fast_graph_leg(
         legs.insert("graph".into(), "fast: no usable query tokens".into());
         return leg;
     }
-    let creds = config.graph.credentials();
     let backend = graph_backend(config);
-    if backend != "sqlite" && creds.password.is_empty() {
-        legs.insert("graph".into(), "fast: no Neo4j password".into());
+    if engram_config::Graph::is_legacy(&backend) {
+        legs.insert(
+            "graph".into(),
+            engram_config::Graph::legacy_message(&backend),
+        );
         return leg;
     }
-    let client = match GraphClient::connect(&backend, &creds, config_path) {
+    let client = match GraphClient::connect(config_path) {
         Ok(client) => client,
         Err(error) => {
             legs.insert("graph".into(), format!("fast: {error}"));
             return leg;
         }
     };
-    let native = matches!(backend.as_str(), "native" | "sqlite");
-    let facts = if native {
-        client
-            .native_facts_for_tokens(scope, &tokens, config.recall.inject.max_facts.max(1))
-            .await
-    } else if config.tenancy_enabled()
-        || engram_paths::pinned_slug().as_deref() == Some(scope.slug())
-    {
-        client
-            .facts_for_tokens(scope, &tokens, config.recall.inject.max_facts.max(1))
-            .await
-    } else {
-        // Untenanted, the legacy graph is ONE group built from the pinned store; a
-        // session on any other store would be handed another project's facts.
-        // Tenanted, the group IS the isolation boundary (see facts_for_tokens).
-        legs.insert(
-            "graph".into(),
-            "fast: legacy facts serve only the pinned store (use graph.backend: native)".into(),
-        );
-        return leg;
-    };
+    let facts = client
+        .native_facts_for_tokens(scope, &tokens, config.recall.inject.max_facts.max(1))
+        .await;
     match facts {
         Ok(mut facts) => {
             facts.sort();
@@ -931,135 +575,13 @@ mod tests {
         );
     }
 
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
     fn config(yaml: &str) -> Config {
         serde_yaml::from_str(yaml).unwrap()
     }
 
-    /// The pre-tenancy identity: Graphiti's historical single group.
-    ///
-    /// Most tests below assert behaviour that predates tenancy, so they use
-    /// this — which also keeps them exercising the upgrade path rather than only
-    /// the new one.
+    /// The pre-tenancy identity (the single legacy group), which most tests use.
     fn legacy_tenant() -> Tenant {
         Tenant::resolve(&config("backend: ollama\n"), None).unwrap()
-    }
-
-    fn legacy_scope() -> GraphScope {
-        legacy_tenant().graph_scope("-test").unwrap()
-    }
-
-    fn named_tenant(name: &str) -> Tenant {
-        let config = config(&format!(
-            "tenants:\n  {name}:\n    slugs: ['-test']\n    vault: /vaults/{name}\n"
-        ));
-        Tenant::resolve(&config, Some(name)).unwrap()
-    }
-
-    /// `ENGRAM_GRAPH_BACKEND` is process-global and cargo runs tests
-    /// concurrently, so the one test that manipulates it takes a lock.
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Compat mode must not fail closed when Graphiti was never installed.
-    ///
-    /// Two individually correct decisions combined into a broken one: compat is
-    /// the default so an upgraded install is not moved off its populated index,
-    /// and compat failure is fatal so ordering is never silently changed. On an
-    /// `install.sh --no-graph` install — which writes no `graph:` block — that
-    /// made recall fail closed on `ModuleNotFoundError: graphiti_core` for every
-    /// query, out of the box. Found by running install.sh as a non-root user.
-    #[test]
-    fn a_missing_graphiti_degrades_instead_of_failing_closed() {
-        let absent = std::env::temp_dir().join("engram-no-graphiti-at-all");
-        assert!(!graphiti_usable(&absent), "an empty dir is not a Graphiti");
-
-        // The SCRIPT is not the signal: install.sh copies graph/*.py
-        // unconditionally and only builds the venv under --graph, so a
-        // --no-graph install has the script and no way to run it. Keying on the
-        // script made this degradation a no-op, which is how the first attempt
-        // at this fix still failed closed on a real non-root install.
-        let fake = FakeGraphiti::new("script-without-venv", "import sys; sys.exit(1)");
-        assert!(graphiti_script(fake.dir()).is_file());
-        assert!(
-            !graphiti_usable(fake.dir()),
-            "a script with no venv must not count as an installed Graphiti"
-        );
-
-        // With a venv present it counts, and a failure there stays fatal.
-        std::fs::create_dir_all(fake.dir().join("venv/bin")).unwrap();
-        std::fs::write(fake.dir().join("venv/bin/python"), "#!/bin/sh\nexit 1\n").unwrap();
-        assert!(graphiti_usable(fake.dir()));
-    }
-
-    /// A fixture `<graph dir>/memory_graph_recall.py` standing in for Graphiti.
-    /// With no venv present, `graphiti_compat_leg` falls back to `python3`.
-    struct FakeGraphiti(std::path::PathBuf);
-
-    impl FakeGraphiti {
-        fn new(name: &str, script: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "engram-hybrid-{name}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("memory_graph_recall.py"), script).unwrap();
-            Self(dir)
-        }
-
-        fn dir(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for FakeGraphiti {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).ok();
-        }
-    }
-
-    #[test]
-    fn the_graphiti_budget_comes_from_config_and_has_a_floor() {
-        let configured = config("recall: {timeout_ms: 1200}\n");
-        assert_eq!(graphiti_budget(&configured), Duration::from_millis(1200));
-        // the documented default
-        let default = config("backend: ollama\n");
-        assert_eq!(graphiti_budget(&default), Duration::from_millis(15_000));
-        // 0 must not mean "never run"
-        let zero = config("recall: {timeout_ms: 0}\n");
-        assert_eq!(graphiti_budget(&zero), Duration::from_millis(250));
-    }
-
-    /// The child bound and the per-prompt bound are different numbers. Sharing the
-    /// hook's 2.5s made every CLI/MCP call fail against a real ~4s Graphiti query.
-    #[test]
-    fn the_prompt_budget_is_separate_from_and_shorter_than_the_child_budget() {
-        let c = config("backend: ollama\n");
-        assert!(
-            Duration::from_millis(c.recall.inject.timeout_ms) < graphiti_budget(&c),
-            "the per-prompt budget must be the tighter of the two"
-        );
-        assert_eq!(c.recall.inject.timeout_ms, 2500);
-    }
-
-    #[test]
-    fn the_env_override_only_applies_when_it_is_set_to_something() {
-        let _guard = env_lock();
-        let base = config("graph: {backend: graphiti_compat}\n");
-        unsafe { std::env::remove_var("ENGRAM_GRAPH_BACKEND") };
-        assert_eq!(graph_backend(&base), "graphiti_compat");
-        // an empty export is not a choice; it used to win over the config
-        unsafe { std::env::set_var("ENGRAM_GRAPH_BACKEND", "  ") };
-        assert_eq!(graph_backend(&base), "graphiti_compat");
-        unsafe { std::env::set_var("ENGRAM_GRAPH_BACKEND", "native") };
-        assert_eq!(graph_backend(&base), "native");
-        unsafe { std::env::remove_var("ENGRAM_GRAPH_BACKEND") };
     }
 
     #[test]
@@ -1077,11 +599,10 @@ mod tests {
         assert_eq!(leg.all_facts(), vec!["a1", "shared", "token-fact"]);
     }
 
-    /// Fast mode is what the prompt hook uses. It must produce results WITHOUT
-    /// spawning Graphiti — the full path takes ~3.5s against a real graph, well
-    /// past the 2.5s per-prompt budget, so a hook on the full path injects nothing.
+    /// Fast mode is what the prompt hook uses: keyword and vector legs plus one graph
+    /// fact query, inside the 2.5s per-prompt budget.
     #[tokio::test]
-    async fn fast_recall_uses_the_local_legs_and_no_child_process() {
+    async fn fast_recall_uses_the_local_legs_and_the_sqlite_graph() {
         let dir = std::env::temp_dir().join(format!(
             "engram-hybrid-fast-{}-{:?}",
             std::process::id(),
@@ -1094,12 +615,10 @@ mod tests {
             "---\nname: qdrant-notes\ndescription: the vector store\nmetadata:\n  type: reference\n---\nQdrant holds the embedding collection for recall.\n",
         )
         .unwrap();
-        // graphiti_compat is selected, and the script it would run hangs forever.
-        // Fast mode must not touch it.
         let config_path = dir.join("engram.yaml");
         std::fs::write(
             &config_path,
-            "graph: {backend: graphiti_compat}\nvector_store: {enabled: false}\n",
+            "graph: {backend: sqlite}\nvector_store: {enabled: false}\n",
         )
         .unwrap();
 
@@ -1122,14 +641,57 @@ mod tests {
         assert_eq!(
             output.results.first().map(|hit| hit.file.as_str()),
             Some("reference_qdrant.md"),
-            "the local BM25 leg must still run in compatibility mode's fast path"
+            "the local BM25 leg must run in the fast path"
         );
-        // The local legs are explicitly ON here, unlike the full compat path.
         assert_eq!(output.legs["keyword"], "ok");
         assert!(
             output.legs["graph"].starts_with("fast"),
             "expected the single-query fact leg, got {:?}",
             output.legs["graph"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A config still on `native` or `graphiti_compat` must not break recall: the graph
+    /// leg says how to migrate and the keyword leg still answers.
+    #[tokio::test]
+    async fn a_legacy_graph_backend_degrades_with_the_migration_message() {
+        let dir = std::env::temp_dir().join(format!(
+            "engram-hybrid-legacy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = dir.join("projects/-test/memory");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            store.join("reference_qdrant.md"),
+            "---\nname: qdrant-notes\ndescription: the vector store\n---\nQdrant holds the embedding collection.\n",
+        )
+        .unwrap();
+        let config_path = dir.join("engram.yaml");
+        std::fs::write(
+            &config_path,
+            "graph: {backend: native}\nvector_store: {enabled: false}\n",
+        )
+        .unwrap();
+        let output = recall_fast(
+            &config_path,
+            &legacy_tenant(),
+            "-test",
+            "qdrant embedding collection",
+            4,
+        )
+        .await
+        .expect("a legacy graph backend must not fail recall");
+        assert!(
+            output.legs["graph"].contains("engram-graph-to-sqlite"),
+            "the leg must say how to migrate, got {:?}",
+            output.legs["graph"]
+        );
+        assert_eq!(output.legs["keyword"], "ok");
+        assert_eq!(
+            output.results.first().map(|hit| hit.file.as_str()),
+            Some("reference_qdrant.md")
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1173,7 +735,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "graph: {{backend: graphiti_compat}}\n\
+                "graph: {{backend: sqlite}}\n\
                  vector_store: {{enabled: true, url: 'http://127.0.0.1:{port}'}}\n\
                  embed: {{provider: llama_cpp, url: 'http://127.0.0.1:{port}/v1', model: m, dim: 1024}}\n\
                  recall: {{inject: {{timeout_ms: 1000}}}}\n"
@@ -1529,310 +1091,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// A stalled Graphiti must not hold a prompt open. The child here sleeps far
-    /// longer than the budget; the leg has to come back promptly, empty, and say
-    /// why.
-    #[tokio::test]
-    async fn a_hung_graphiti_child_is_killed_at_the_deadline() {
-        // A sleeping script stands in for a stalled Neo4j.
-        let graphiti = FakeGraphiti::new("hang", "import time\ntime.sleep(30)\n");
-        let config = config("recall: {timeout_ms: 300}\n");
-        let mut legs = HashMap::new();
-        let started = std::time::Instant::now();
-        let leg = graphiti_compat_leg(
-            &config,
-            &legacy_scope(),
-            graphiti.dir(),
-            "anything",
-            4,
-            &mut legs,
-        )
-        .await;
-        let elapsed = started.elapsed();
-
-        assert!(leg.files.is_empty(), "a timed-out leg must yield nothing");
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "the deadline was not enforced: took {elapsed:?}"
-        );
-        assert!(
-            legs["graph"].contains("timed out"),
-            "the failure must be explicit, got {:?}",
-            legs["graph"]
-        );
-    }
-
-    /// A child that fails must report its stderr, not a single opaque string.
-    #[tokio::test]
-    async fn a_failing_graphiti_child_reports_why() {
-        let graphiti = FakeGraphiti::new(
-            "fail",
-            "import sys\nsys.stderr.write('neo4j unreachable\\n')\nsys.exit(1)\n",
-        );
-        let config = config("recall: {timeout_ms: 5000}\n");
-        let mut legs = HashMap::new();
-        let leg = graphiti_compat_leg(
-            &config,
-            &legacy_scope(),
-            graphiti.dir(),
-            "anything",
-            4,
-            &mut legs,
-        )
-        .await;
-
-        assert!(leg.files.is_empty());
-        assert!(
-            legs["graph"].contains("neo4j unreachable"),
-            "stderr was discarded: {:?}",
-            legs["graph"]
-        );
-    }
-
-    /// Per-record facts must survive the compatibility path, which is the one
-    /// whose response shape we are meant to preserve.
-    #[tokio::test]
-    async fn graphiti_records_keep_their_own_facts() {
-        let graphiti = FakeGraphiti::new(
-            "ok",
-            "import json\nprint(json.dumps([\
-             {'file': 'a.md', 'facts': ['a owns x']},\
-             {'file': 'b.md', 'facts': ['b uses y', 'b runs_on z']}]))\n",
-        );
-        let config = config("recall: {timeout_ms: 5000}\n");
-        let mut legs = HashMap::new();
-        let leg = graphiti_compat_leg(
-            &config,
-            &legacy_scope(),
-            graphiti.dir(),
-            "anything",
-            4,
-            &mut legs,
-        )
-        .await;
-
-        assert_eq!(legs["graph"], "graphiti_compat");
-        // Graphiti's ordering is preserved exactly
-        assert_eq!(leg.files, vec!["a.md", "b.md"]);
-        assert_eq!(leg.facts_by_file["a.md"], vec!["a owns x"]);
-        assert_eq!(leg.facts_by_file["b.md"], vec!["b uses y", "b runs_on z"]);
-    }
-
-    /// An old Graphiti script must not be able to silently defeat tenant
-    /// scoping.
-    ///
-    /// `memory_graph_recall.py` parses `sys.argv` by hand and ignores unknown
-    /// flags, so passing `--group work` to a script that predates the flag is a
-    /// no-op: it would return every tenant's records while this side believed it
-    /// had asked for one. Presence on the command line proves nothing, so the
-    /// reply has to echo the group it filtered on.
-    #[tokio::test]
-    async fn a_graphiti_script_that_cannot_scope_by_tenant_is_refused() {
-        let config = config("recall: {timeout_ms: 5000}\n");
-        let work = named_tenant("work");
-        let scope = work.graph_scope("-test").unwrap();
-
-        // An old script: records, no echo. This is the dangerous case.
-        let old = FakeGraphiti::new(
-            "no-group-echo",
-            "import json\nprint(json.dumps({'records': [{'file': 'secret.md', 'facts': ['x']}]}))\n",
-        );
-        let mut legs = HashMap::new();
-        let leg = graphiti_compat_leg(&config, &scope, old.dir(), "anything", 4, &mut legs).await;
-        assert!(
-            leg.files.is_empty(),
-            "unverified records must not be returned: {:?}",
-            leg.files
-        );
-        assert!(
-            legs["graph"].contains("did not confirm tenant scoping"),
-            "the refusal must say why: {:?}",
-            legs["graph"]
-        );
-
-        // A script echoing the WRONG group is refused the same way — this is the
-        // shape a copy-paste of another tenant's invocation would produce.
-        let wrong = FakeGraphiti::new(
-            "wrong-group-echo",
-            "import json\nprint(json.dumps({'records': [{'file': 'a.md', 'facts': []}],\
-             'group': 'homelab'}))\n",
-        );
-        let mut legs = HashMap::new();
-        let leg = graphiti_compat_leg(&config, &scope, wrong.dir(), "anything", 4, &mut legs).await;
-        assert!(leg.files.is_empty());
-        assert!(
-            legs["graph"].contains("did not confirm"),
-            "{:?}",
-            legs["graph"]
-        );
-
-        // The correct echo passes.
-        let good = FakeGraphiti::new(
-            "right-group-echo",
-            "import json\nprint(json.dumps({'records': [{'file': 'a.md', 'facts': ['f']}],\
-             'group': 'work'}))\n",
-        );
-        let mut legs = HashMap::new();
-        let leg = graphiti_compat_leg(&config, &scope, good.dir(), "anything", 4, &mut legs).await;
-        assert_eq!(legs["graph"], "graphiti_compat");
-        assert_eq!(leg.files, vec!["a.md"]);
-    }
-
-    /// A pre-tenancy install must receive no `--group` at all.
-    ///
-    /// This is not tidiness. An older installed script rebuilds its query from
-    /// every argument that does not begin with "--", so the flag's VALUE joins
-    /// the query text: asking for "qdrant embedding space" became asking for
-    /// "qdrant embedding space canonical". Recall still returned results, for a
-    /// polluted query, on every install that had not refreshed its scripts.
-    ///
-    /// Found by running the binary against the live install, not by a unit test —
-    /// every fixture here implements the NEW parser, so none of them could see
-    /// it. Hence this test asserts the argv the child is given rather than the
-    /// records it returns: the bug lives in what a *different* parser would make
-    /// of that argv.
-    #[tokio::test]
-    async fn the_legacy_path_sends_no_group_flag_that_an_old_parser_would_eat() {
-        // The fixture echoes its own argv instead of records, so the assertion is
-        // about the command line itself.
-        let argv = FakeGraphiti::new(
-            "argv-echo",
-            "import json, sys\nprint(json.dumps({'records': [], 'neighbours': [],\
-             'group': 'canonical', 'argv': sys.argv[1:]}))\n",
-        );
-        let config = config("recall: {timeout_ms: 5000}\n");
-
-        let mut legs = HashMap::new();
-        graphiti_compat_leg(
-            &config,
-            &legacy_scope(),
-            argv.dir(),
-            "dns failover",
-            4,
-            &mut legs,
-        )
-        .await;
-        assert_eq!(legs["graph"], "graphiti_compat");
-
-        // Re-run the child directly to read the argv it saw.
-        let seen = |scope: &GraphScope| {
-            let mut command = std::process::Command::new("python3");
-            command
-                .arg(graphiti_script(argv.dir()))
-                .arg("dns failover")
-                .arg("--k")
-                .arg("4");
-            if !scope.tenant().is_empty() && scope.tenant() != engram_tenant::LEGACY_GRAPH_GROUP {
-                command.arg("--group").arg(scope.tenant());
-            }
-            let out = command.arg("--json").arg("--json-full").output().unwrap();
-            let reply: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-            reply["argv"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        };
-
-        let legacy_argv = seen(&legacy_scope());
-        assert!(
-            !legacy_argv.iter().any(|arg| arg == "--group"),
-            "the legacy path must send no --group: {legacy_argv:?}"
-        );
-        assert!(
-            !legacy_argv.iter().any(|arg| arg == "canonical"),
-            "the group VALUE is what an old parser folds into the query: {legacy_argv:?}"
-        );
-
-        // A named tenant does send it — there the echo check makes an old script
-        // fail closed instead of quietly returning another identity's records.
-        let named = named_tenant("work").graph_scope("-test").unwrap();
-        let named_argv = seen(&named);
-        assert!(
-            named_argv
-                .windows(2)
-                .any(|pair| pair == ["--group", "work"]),
-            "a named tenant must scope the child: {named_argv:?}"
-        );
-    }
-
-    /// ...but a pre-tenancy install must NOT be made to prove anything, or every
-    /// install that has not refreshed its graph scripts breaks on upgrade.
-    #[tokio::test]
-    async fn a_legacy_install_does_not_have_to_prove_scoping() {
-        let config = config("recall: {timeout_ms: 5000}\n");
-        let old = FakeGraphiti::new(
-            "legacy-no-echo",
-            "import json\nprint(json.dumps([{'file': 'a.md', 'facts': ['f']}]))\n",
-        );
-        let mut legs = HashMap::new();
-        let leg = graphiti_compat_leg(
-            &config,
-            &legacy_scope(),
-            old.dir(),
-            "anything",
-            4,
-            &mut legs,
-        )
-        .await;
-        assert_eq!(legs["graph"], "graphiti_compat");
-        assert_eq!(
-            leg.files,
-            vec!["a.md"],
-            "the bare-array shape from an older script must still work"
-        );
-    }
-
-    /// Graphiti's 1-hop neighbours are part of its reply and were dropped by the
-    /// bare-array `--json` shape. Both shapes must parse.
-    #[tokio::test]
-    async fn graphiti_neighbours_survive_and_the_legacy_shape_still_parses() {
-        let config = config("recall: {timeout_ms: 5000}\n");
-
-        let full = FakeGraphiti::new(
-            "neighbours",
-            "import json\nprint(json.dumps({'records': [{'file': 'a.md', 'facts': ['f1']}],\
-             'neighbours': ['related-one', 'related-two']}))\n",
-        );
-        let mut legs = HashMap::new();
-        let leg = graphiti_compat_leg(
-            &config,
-            &legacy_scope(),
-            full.dir(),
-            "anything",
-            4,
-            &mut legs,
-        )
-        .await;
-        assert_eq!(legs["graph"], "graphiti_compat");
-        assert_eq!(leg.files, vec!["a.md"]);
-        assert_eq!(leg.neighbours, vec!["related-one", "related-two"]);
-
-        // a script predating --json-full prints a bare array
-        let legacy = FakeGraphiti::new(
-            "legacy-shape",
-            "import json\nprint(json.dumps([{'file': 'a.md', 'facts': ['f1']}]))\n",
-        );
-        let mut legs = HashMap::new();
-        let leg = graphiti_compat_leg(
-            &config,
-            &legacy_scope(),
-            legacy.dir(),
-            "anything",
-            4,
-            &mut legs,
-        )
-        .await;
-        assert_eq!(
-            legs["graph"], "graphiti_compat",
-            "the old shape must still work"
-        );
-        assert_eq!(leg.files, vec!["a.md"]);
-        assert!(leg.neighbours.is_empty());
     }
 }
 

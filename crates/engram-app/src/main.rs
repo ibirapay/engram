@@ -425,11 +425,8 @@ fn validate_edit(path: &Path, mut edit: EditableConfig) -> Result<(EditableConfi
     ) {
         return Err("unsupported embedding provider".into());
     }
-    if !matches!(
-        edit.graph.backend.as_str(),
-        "native" | "sqlite" | "graphiti_compat"
-    ) {
-        return Err("unsupported graph backend".into());
+    if edit.graph.backend != "sqlite" {
+        return Err("unsupported graph backend (only sqlite)".into());
     }
     if edit.embed.dim == 0 || edit.llama_cpp.timeout_seconds == 0 {
         return Err("embedding dimension and timeout must be positive".into());
@@ -995,7 +992,7 @@ mod tests {
         EditableConfig {
             backend: "llama_cpp".into(),
             graph: GraphEdit {
-                backend: "graphiti_compat".into(),
+                backend: "sqlite".into(),
             },
             llama_cpp: LlamaCppEdit {
                 url: "http://ai/v1".into(),
@@ -1026,7 +1023,7 @@ mod tests {
     fn numeric_editor_fields_accept_strings_from_the_browser() {
         let request: SaveRequest = serde_json::from_str(
             r#"{"revision":"abc","config":{"backend":"llama_cpp",
-                "graph":{"backend":"native"},
+                "graph":{"backend":"sqlite"},
                 "llama_cpp":{"url":"http://ai/v1","model":"q","timeout_seconds":"600"},
                 "embed":{"provider":"llama_cpp","url":"http://e/v1","model":"bge-m3","dim":"1024"}}}"#,
         )
@@ -1036,7 +1033,7 @@ mod tests {
 
         // and real numbers still work
         let request: EditRequest = serde_json::from_str(
-            r#"{"config":{"backend":"llama_cpp","graph":{"backend":"native"},
+            r#"{"config":{"backend":"llama_cpp","graph":{"backend":"sqlite"},
                 "llama_cpp":{"url":"http://ai/v1","model":"q","timeout_seconds":600},
                 "embed":{"provider":"llama_cpp","url":"http://e/v1","model":"bge-m3","dim":1024}}}"#,
         )
@@ -1046,7 +1043,7 @@ mod tests {
         // junk is still rejected, just with a message instead of a silent 422
         assert!(
             serde_json::from_str::<EditRequest>(
-                r#"{"config":{"backend":"llama_cpp","graph":{"backend":"native"},
+                r#"{"config":{"backend":"llama_cpp","graph":{"backend":"sqlite"},
                 "llama_cpp":{"url":"http://ai/v1","model":"q","timeout_seconds":"soon"},
                 "embed":{"provider":"llama_cpp","url":"http://e/v1","model":"bge-m3","dim":1024}}}"#
             )
