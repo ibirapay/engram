@@ -34,6 +34,15 @@ pub const RUST_EMBED_PROVIDERS: [&str; 2] = ["llama_cpp", "openai"];
 /// `embedding_space_id_matches_the_python_implementation`.
 pub const PINNED_EMBEDDING_SPACE_ID: &str = "b941b4f74fc6de19";
 
+/// The languages a `languages:` list may name.
+///
+/// This is the set the keyword ranking has function-word tables for — a language
+/// outside it would be ranked with no idea which of its words are grammar, which is
+/// how a prompt about one thing starts matching another. Adding a language here
+/// means adding its stopword table in `engram-retrieval` first, not editing this
+/// list.
+pub const SUPPORTED_LANGUAGES: &[&str] = &["pt-BR", "en"];
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Config {
     #[serde(default)]
@@ -54,6 +63,21 @@ pub struct Config {
     pub graph: Graph,
     #[serde(default)]
     pub recall: Recall,
+    /// The languages the stores under this config are written in.
+    ///
+    /// Declared, never detected: no part of recall looks at a prompt's language,
+    /// because a per-query guess would be a new way to be wrong on every prompt.
+    /// The first entry is the store's MOTHER TONGUE; the rest are lateral languages.
+    ///
+    /// The rule this enforces, and why: the embedding model bridges English only, so
+    /// a store with no English text in it has no vector leg — the terms that carry
+    /// across are names, identifiers and technical words. A store whose mother tongue
+    /// is not English must therefore list `en` alongside it. See `check_languages`.
+    ///
+    /// Empty — the state every config written before this key existed is in — means
+    /// undeclared: nothing is enforced and recall behaves exactly as it did.
+    #[serde(default)]
+    pub languages: Vec<String>,
     /// Agent identities, each owning one Obsidian vault and a set of memory
     /// stores. See [`Config::tenancy_enabled`] for what an EMPTY map means —
     /// it is load-bearing, not a degenerate case.
@@ -90,6 +114,12 @@ pub struct TenantConfig {
     /// (`[[links]]`, headings, tags) is pure parsing and always on.
     #[serde(default)]
     pub extract_facts: bool,
+    /// This tenant's languages, overriding `Config::languages` for the stores it
+    /// owns. A store's language is a property of the store, and a tenant is what
+    /// owns stores — so two tenants under one config may declare different mother
+    /// tongues. Same rule enforced, with the tenant named in the error.
+    #[serde(default)]
+    pub languages: Vec<String>,
 }
 
 impl Default for TenantConfig {
@@ -99,6 +129,7 @@ impl Default for TenantConfig {
             vault: String::new(),
             agent_subtree: default_agent_subtree(),
             extract_facts: false,
+            languages: Vec::new(),
         }
     }
 }
@@ -548,6 +579,7 @@ impl Config {
             endpoint(&self.graph.neo4j_http_url, "graph.neo4j_http_url")?;
         }
         self.validate_tenants()?;
+        self.validate_languages()?;
         Ok(())
     }
 
@@ -580,6 +612,74 @@ impl Config {
             .copied()
             .filter(|slug| self.tenant_of_slug(slug).is_none())
             .collect()
+    }
+
+    /// The languages declared for the store `slug` lives in: its tenant's list if
+    /// that tenant declares one, otherwise the config-level list. Empty means
+    /// undeclared, and an undeclared store is ranked the way it always was — this
+    /// is a declaration the operator makes, not a default this program invents.
+    pub fn languages_for_slug(&self, slug: &str) -> &[String] {
+        self.tenant_of_slug(slug)
+            .and_then(|name| self.tenants.get(name))
+            .filter(|tenant| !tenant.languages.is_empty())
+            .map(|tenant| tenant.languages.as_slice())
+            .unwrap_or(self.languages.as_slice())
+    }
+
+    /// A declared language list has to be one this recall can actually use, and it
+    /// has to carry the lateral language the vector leg depends on. Both checks are
+    /// only made when a list exists: an install that has not declared anything is
+    /// not being told it is wrong.
+    fn check_languages(&self, path: &str, languages: &[String]) -> Result<(), ConfigError> {
+        if languages.is_empty() {
+            return Ok(());
+        }
+        // EXACT spellings, no trimming and no case-insensitive match. The point is
+        // that what a consumer reads out of `languages_for_slug` is what was checked:
+        // a lenient check that accepts " PT-br " and hands back " PT-br " just moves
+        // the bug to the first `== "pt-BR"` comparison.
+        for tag in languages {
+            if !SUPPORTED_LANGUAGES.contains(&tag.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "{path} lists '{tag}', and this build has no function-word table for it. \
+                     Supported: {} (exactly these spellings).",
+                    SUPPORTED_LANGUAGES.join(", ")
+                )));
+            }
+        }
+        let mother = languages[0].to_lowercase();
+        if mother != "en" && !languages.iter().any(|tag| tag == "en") {
+            return Err(ConfigError::Invalid(format!(
+                "{path}: a store whose mother tongue is '{mother}' must also list \"en\". \
+                 The embedding model bridges English only, so a store with no English text \
+                 in it has no vector leg — the words that carry across are names, \
+                 identifiers and technical terms."
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_languages(&self) -> Result<(), ConfigError> {
+        self.check_languages("languages", &self.languages)?;
+        // "Undeclared" is meant for a config written before this key existed. Once the
+        // operator has declared it for ANY identity, an identity left undeclared is not
+        // inheriting a default — it is the owner's rule ("every identity declares a
+        // mother tongue") broken quietly, and the first consumer would rank that store
+        // as undeclared without anyone being told.
+        let declared_anywhere =
+            !self.languages.is_empty() || self.tenants.values().any(|t| !t.languages.is_empty());
+        for (name, tenant) in &self.tenants {
+            let path = format!("tenants.{name}.languages");
+            self.check_languages(&path, &tenant.languages)?;
+            if declared_anywhere && self.languages.is_empty() && tenant.languages.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "{path} declares nothing while another identity does: every identity \
+                     declares a mother tongue. Set it here, or once in the top-level \
+                     `languages:` for every store this config owns."
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn validate_tenants(&self) -> Result<(), ConfigError> {
@@ -864,6 +964,105 @@ mod tests {
             serde_yaml::from_str("embed: {provider: llama_cpp, model: bge-m3, dim: 1024}\n")
                 .unwrap();
         assert!(config.validate().is_err());
+    }
+
+    /// #55 — every identity declares a mother tongue; if it is not English, English
+    /// has to be listed as lateral. Enforced when declared, silent when not: the
+    /// rule is what an operator commits to, not a default this program invents for
+    /// a store it cannot see.
+    #[test]
+    fn a_declared_mother_tongue_must_carry_english_as_lateral() {
+        let load = |yaml: &str| -> Result<Config, ConfigError> {
+            let config: Config = serde_yaml::from_str(yaml).unwrap();
+            config.validate()?;
+            Ok(config)
+        };
+
+        // The state every engram.yaml written before this key exists is in.
+        let undeclared = load("embed: {url: http://ai/v1, model: m}\n").unwrap();
+        assert!(undeclared.languages.is_empty());
+        assert!(undeclared.languages_for_slug("-anything").is_empty());
+
+        // English as the mother tongue needs no lateral language.
+        assert!(load("languages: [en]\n").is_ok());
+        // pt-BR with English lateral is the shape this house runs on.
+        let declared = load("languages: [pt-BR, en]\n").unwrap();
+        assert_eq!(
+            declared.languages_for_slug("-anything"),
+            ["pt-BR".to_string(), "en".to_string()]
+        );
+
+        // A mother tongue with no English in the store: no vector leg at all.
+        for yaml in ["languages: [pt-BR]\n", "languages: [pt-BR, pt-BR]\n"] {
+            let error = load(yaml).expect_err("a mother tongue without en must not load");
+            assert!(
+                error.to_string().contains("must also list \"en\""),
+                "the error has to say what is missing: {error}"
+            );
+        }
+
+        // A language this build cannot rank. Saying so at load time is the point:
+        // the alternative is quietly ranking German prompts with a Portuguese list.
+        let unsupported = load("languages: [de]\n").expect_err("de has no function words here");
+        let message = unsupported.to_string();
+        assert!(message.contains("'de'"), "{message}");
+        for tag in SUPPORTED_LANGUAGES {
+            assert!(
+                message.contains(tag),
+                "must name what IS supported: {message}"
+            );
+        }
+
+        // Exact spellings, on purpose: a check that accepted "PT-br" would hand that
+        // exact string to the first consumer that compares it against "pt-BR".
+        let misspelled = load("languages: [PT-br, EN]\n").expect_err("tags are exact");
+        assert!(
+            misspelled.to_string().contains("'PT-br'"),
+            "must name the tag as written: {misspelled}"
+        );
+
+        // Per tenant: the override is what that tenant's stores get, and the error
+        // names the tenant rather than a bare path.
+        let tenants = load(
+            "languages: [pt-BR, en]\n\
+             tenants:\n  work:\n    slugs: ['-work']\n    languages: [en]\n  \
+             home:\n    slugs: ['-home']\n",
+        )
+        .unwrap();
+        assert_eq!(tenants.languages_for_slug("-work"), ["en".to_string()]);
+        assert_eq!(
+            tenants.languages_for_slug("-home"),
+            ["pt-BR".to_string(), "en".to_string()],
+            "a tenant that declares nothing inherits the config-level list"
+        );
+        let broken = load("tenants:\n  work:\n    slugs: ['-work']\n    languages: [pt-BR]\n")
+            .expect_err("the tenant's own list is held to the same rule");
+        assert!(
+            broken.to_string().contains("tenants.work.languages"),
+            "the error has to name which tenant: {broken}"
+        );
+
+        // Declaring it for one identity may not leave another undeclared: that is the
+        // rule broken quietly, and the first consumer would rank `home` as undeclared
+        // without anyone being told.
+        let partial = load(
+            "tenants:\n  work:\n    slugs: ['-work']\n    languages: [en]\n  \
+             home:\n    slugs: ['-home']\n",
+        )
+        .expect_err("one identity may not declare while another declares nothing");
+        assert!(
+            partial.to_string().contains("tenants.home.languages"),
+            "and it has to name the identity that is missing: {partial}"
+        );
+        // The same config made valid: a top-level declaration covers everyone who
+        // says nothing of their own.
+        assert!(
+            load(
+                "languages: [pt-BR, en]\n\
+             tenants:\n  work:\n    slugs: ['-work']\n  home:\n    slugs: ['-home']\n"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
