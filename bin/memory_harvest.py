@@ -4,7 +4,8 @@ into *staged* memory candidates, with STRUCTURAL provenance.
 
 This is stage ① of the unattended memory pipeline. It replaces the Anthropic
 `claude -p` extraction in memory_agent.sh with a fully-local pass (offload pref):
-it reads Claude Code session transcripts (~/.claude/projects/<slug>/*.jsonl),
+it reads Claude Code session transcripts (~/.claude/projects/<slug>/*.jsonl) plus
+opencode and Hermes sessions exported to <slug>/.sources/ by engram_sources.py,
 extracts durable candidate facts via the LOCAL Ollama models (memory_ai), and
 writes them as QUARANTINED candidates into memory/.staging/ — never directly
 into recall. The downstream cron (score/quarantine -> auto-graduate) decides
@@ -441,7 +442,14 @@ def main():
         targets = [Path(args[args.index("--transcript") + 1])]
         use_watermark = False
     else:
-        targets = sorted(PROJ_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+        # opencode / Hermes sessions become Claude-shaped transcripts first (see engram_sources.py).
+        try:
+            import engram_sources
+            engram_sources.export(dry_run=dry_run)
+        except Exception as e:  # never let a foreign agent's database block the Claude harvest
+            print(f"[harvest] agent sources skipped: {e}", file=sys.stderr)
+        targets = sorted([*PROJ_DIR.glob("*.jsonl"), *(PROJ_DIR / ".sources").glob("*.jsonl")],
+                         key=lambda p: p.stat().st_mtime)
 
     # Idle-grace: only harvest a FINISHED chat. A transcript still being written
     # (active session) keeps gaining bytes, so harvesting it on a schedule would pay

@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.7.0 — neuro-inspired memory for AI agents: opencode and Hermes join Claude Code
+
+engram is no longer "memory for Claude Code". Three agents share one store, and each one's
+conversations feed the same encode, consolidate, fixate pipeline.
+
+- **opencode:** `install.sh` registers the `engram` MCP server (`opencode mcp add --global`) and
+  installs `integrations/opencode/engram-recall.ts`, a v2 plugin that appends the
+  `<relevant-memory>` block to every prompt, once per distinct prompt (opencode can fire the hook
+  twice). `--opencode` / `--no-opencode`.
+- **Hermes Agent:** registers the Rust `engram-mcp` (it used to register only the Python vector
+  server) and keeps a managed `<!-- engram:begin -->` block in `SOUL.md` that tells the model when
+  to recall and how to save. A hand-written engram section is left untouched.
+- **Harvest from every agent:** `bin/engram_sources.py` exports opencode (`opencode.db`) and Hermes
+  (`state.db`) sessions as Claude-shaped transcripts under `<store>/.sources/`: user and assistant
+  text only, never tools, reasoning, synthetic parts, sub-agents or cron. Harvest runs it first and
+  reads that directory too. It sits outside the project's `*.jsonl` so Claude Code's session list is
+  unaffected, and a rewrite only ever appends, so the byte-offset watermark stays valid.
+- **Docs:** README, ARCHITECTURE and the logo now say "neuro-inspired memory for AI agents", with a
+  per-agent support table and an "Agents" section describing the three adapter seams.
+- **Repo:** removed the finished plan and review notes from the root.
+
 ## 1.6.0 — the Python Graphiti stack is gone
 
 Completes 1.5.0. Nothing in the tree builds, installs, registers or reads Neo4j any more.

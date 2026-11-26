@@ -34,6 +34,20 @@ transcript ─▶ .staging ─▶ .md store ─▶ (curate/fixate/distill) ─�
 - **Promote — `memory_skill_autoinstall.py` / `/memory-to-skill`**: a fixated, procedure-
   rich, user-direct memory can graduate into an installed Claude Code skill (5 safety gates).
 
+## Agents
+
+The core is agent-agnostic; an agent is an adapter on three seams:
+
+1. **Recall tools** — the `engram-mcp` stdio server (`memory_recall`, `memory_recall_hybrid`),
+   registered with each agent's own MCP mechanism.
+2. **Prompt-time recall** — `engram-recall-hook` takes `{prompt, session_id, cwd}` on stdin and prints
+   a `<relevant-memory>` block. Claude Code runs it as a `UserPromptSubmit` hook; opencode through
+   `integrations/opencode/engram-recall.ts`. Hermes has no prompt hook that can inject text, so its
+   `SOUL.md` block (`integrations/hermes`) tells the model to call the recall tool.
+3. **Encode** — harvest reads Claude-shaped JSONL transcripts. `bin/engram_sources.py` converts opencode
+   (`opencode.db`) and Hermes (`state.db`) sessions into that shape under `<store>/.sources/`, keeping only
+   user and assistant text. The harvester's injection stripping and provenance rules then apply unchanged.
+
 Two lenses run over the store: **curation** (structure/dedup) and **fixation**
 (trust/security). The light pass runs both cheaply; neither mutates destructively.
 

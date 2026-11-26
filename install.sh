@@ -8,6 +8,7 @@
 #   --graph | --no-graph        (accepted and ignored: the graph is a SQLite file, nothing to build)
 #   --vector | --no-vector      (build the Qdrant vector venv + register the MCP server)
 #   --hermes | --no-hermes      (also register the MCP servers with hermes; default: auto)
+#   --opencode | --no-opencode  (recall plugin + MCP server for opencode; default: auto)
 #   --no-start-services         (do NOT `docker compose up` Qdrant; just print how)
 #   --yes                       (accept defaults, no prompts)
 #
@@ -24,6 +25,7 @@ SETTINGS="$CLAUDE/settings.json"
 BACKEND=""; TIER="small"; OLLAMA_HOST="http://localhost:11434"
 STORAGE="local"; REPO_REMOTE=""; DAEMON="none"; YES=0; WANT_GRAPH="auto"; WANT_VECTOR="auto"
 WANT_HERMES="auto"   # auto = register only if the hermes CLI is on PATH
+WANT_OPENCODE="auto" # auto = register only if the opencode CLI is on PATH
 WANT_BACKUP="no"     # off unless asked: backups need an operator-provided bucket
 WANT_SILVERBULLET="no"  # off unless asked: stands up a web editor per vault
 WANT_WEB_AUTH="no"      # off unless asked: one web credential for atlas + SilverBullet
@@ -48,6 +50,8 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --no-web-auth) WANT_WEB_AUTH="no"; shift;;
   --hermes) WANT_HERMES="yes"; shift;;
   --no-hermes) WANT_HERMES="no"; shift;;
+  --opencode) WANT_OPENCODE="yes"; shift;;
+  --no-opencode) WANT_OPENCODE="no"; shift;;
   --start-services) START_SERVICES="yes"; shift;;
   --no-start-services) START_SERVICES="no"; shift;;
   --yes|-y) YES=1; shift;;
@@ -90,7 +94,7 @@ compose_up() {
     || warn "docker is not enabled at boot — $label will not auto-start (sudo systemctl enable docker)"
 }
 
-# hermes_register <server-name> <python> <server.py> — also expose an engram MCP
+# hermes_register <server-name> <command> [args...] — also expose an engram MCP
 # server to hermes, an MCP client that drives a LOCAL Ollama model, so the local
 # LLM gets the same recall tools Claude Code has. No-op when hermes isn't installed.
 # Two non-obvious constraints, both load-bearing:
@@ -107,11 +111,57 @@ hermes_register() {
   fi
   [[ -x "$2" ]] || return 0
   if hermes mcp list 2>/dev/null | grep -q "$1"; then say "$1 already registered with hermes"; return 0; fi
-  if hermes mcp add "$1" --env "CLAUDE_MEMORY_SLUG=$SLUG" --command "$2" --args "$3" >/dev/null 2>&1; then
+  if hermes mcp add "$1" --env "CLAUDE_MEMORY_SLUG=$SLUG" --env "ENGRAM_BIN=$CLAUDE" \
+       --env "ENGRAM_CONFIG=$CLAUDE/engram.yaml" --command "$2" --args "${@:3}" >/dev/null 2>&1; then
     say "registered $1 with hermes (local LLM gets recall too)"
   else
     warn "hermes mcp add $1 failed — add it under mcp_servers: in ~/.hermes/config.yaml manually"
   fi
+}
+
+# opencode_register — recall for opencode: the MCP server (so the model can ask) plus the
+# prompt plugin (so recall happens on its own, like the Claude Code hook). No-op when the
+# opencode CLI is missing. Both are idempotent: this script is also the updater.
+opencode_register() {
+  [[ "$WANT_OPENCODE" == no ]] && return 0
+  if ! command -v opencode >/dev/null; then
+    [[ "$WANT_OPENCODE" == yes ]] && warn "opencode not found on PATH — skipping"
+    return 0
+  fi
+  [[ -x "$CLAUDE/rust/engram-mcp" ]] || return 0
+  local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+  if grep -qsE '"engram[a-z-]*"[[:space:]]*:' "$cfg"/opencode.json* 2>/dev/null; then say "an engram MCP server is already registered with opencode"
+  elif opencode mcp add --global --env "ENGRAM_BIN=$CLAUDE" --env "ENGRAM_CONFIG=$CLAUDE/engram.yaml" \
+         engram -- "$CLAUDE/rust/engram-mcp" >/dev/null 2>&1; then
+    say "registered engram MCP with opencode"
+  else
+    warn "opencode mcp add failed — add an 'engram' local server running $CLAUDE/rust/engram-mcp to opencode.json"
+  fi
+  mkdir -p "$cfg/plugins" && install -m 0644 "$REPO/integrations/opencode/engram-recall.ts" "$cfg/plugins/engram-recall.ts" \
+    && say "installed the opencode recall plugin (restart opencode to load it)"
+}
+
+# hermes_soul — teach Hermes how to use the shared memory. Managed block between markers, so
+# a re-run updates it in place; an existing hand-written engram section is left alone.
+hermes_soul() {
+  [[ "$WANT_HERMES" == no ]] && return 0
+  command -v hermes >/dev/null || return 0
+  local soul="${HERMES_HOME:-$HOME/.hermes}/SOUL.md" snippet="$REPO/integrations/hermes/SOUL.engram.md"
+  [[ -f "$snippet" ]] || return 0
+  mkdir -p "$(dirname "$soul")"; touch "$soul"
+  if ! grep -q '<!-- engram:begin -->' "$soul" && grep -q 'Shared memory (engram)' "$soul"; then
+    say "SOUL.md already has a hand-written engram section — left as is"; return 0
+  fi
+  python3 - "$soul" "$snippet" <<'PY'
+import re, sys
+soul, snip = sys.argv[1], sys.argv[2]
+block = "<!-- engram:begin -->\n" + open(snip).read().rstrip() + "\n<!-- engram:end -->\n"
+s = open(soul).read()
+pat = re.compile(r"<!-- engram:begin -->.*?<!-- engram:end -->\n?", re.S)
+s = pat.sub(lambda _: block, s) if pat.search(s) else (s.rstrip("\n") + ("\n\n" if s.strip() else "") + block)
+open(soul, "w").write(s)
+PY
+  say "SOUL.md: engram memory instructions up to date"
 }
 
 # ---- prereqs ----
@@ -637,6 +687,11 @@ if command -v claude >/dev/null && [[ -x "$CLAUDE/rust/engram-mcp" ]]; then
       || warn "could not register engram-rust MCP server"
   else say "engram-rust MCP already registered"; fi
 fi
+
+# Other agents: opencode and Hermes get the same recall (and their sessions are harvested).
+hermes_register engram "$CLAUDE/rust/engram-mcp" --slug "$SLUG"
+hermes_soul
+opencode_register
 
 # ---- vector venv + MCP (optional Qdrant index) ----
 if [[ "$WANT_VECTOR" == yes ]]; then

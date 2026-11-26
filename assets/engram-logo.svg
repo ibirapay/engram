@@ -67,5 +67,5 @@
   <rect x="396" y="214" width="360" height="3" rx="1.5" fill="url(#trace)"/>
 
   <!-- tagline -->
-  <text x="398" y="256" font-family="'Inter','Segoe UI',system-ui,-apple-system,Arial,sans-serif" font-size="24" font-weight="500" letter-spacing="5.5" fill="#8b9ac9">NEURO-INSPIRED MEMORY FOR CLAUDE CODE</text>
+  <text x="398" y="256" font-family="'Inter','Segoe UI',system-ui,-apple-system,Arial,sans-serif" font-size="24" font-weight="500" letter-spacing="5.5" fill="#8b9ac9">NEURO-INSPIRED MEMORY FOR AI AGENTS</text>
 </svg>

@@ -37,7 +37,7 @@ warn() { printf 'WARN %s\n' "$*" >> "$WARNS"; }
 
 # HOME is redirected at the sandbox so a stray call to a REAL hermes on this box
 # can never read or mutate the operator's ~/.hermes/config.yaml.
-export HOME="$T"
+export HOME="$T"; CLAUDE="$T/.claude"
 export FAKE_HERMES_CALLS="$T/calls" FAKE_HERMES_STATE="$T/state" WARNS="$T/warns"
 : > "$FAKE_HERMES_CALLS"; : > "$WARNS"
 PATH="$T/bin:$PATH"
