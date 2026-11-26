@@ -6,6 +6,7 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fails=0; ok() { echo "  ok   $*"; }; bad() { echo "  FAIL $*"; fails=$((fails+1)); }
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+unset XDG_CONFIG_HOME HERMES_HOME
 export HOME="$T/home"; mkdir -p "$HOME" "$T/bin" "$HOME/.claude/rust"
 printf '#!/bin/sh\n' > "$HOME/.claude/rust/engram-mcp"; chmod +x "$HOME/.claude/rust/engram-mcp"
 cat > "$T/bin/opencode" <<'X'
