@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.1 — logo names the agents
+
+- **Logo:** three chips under the tagline (Claude Code, opencode, Hermes Agent) and an `aria-label`
+  that lists them.
+- **Repo:** removed the finished plan and review notes (`IMPROVEMENT_PLAN.md`, `PR34_*.md`,
+  `engram-vector.md`) from the root. Nothing linked to them.
+
 ## 1.7.0 — neuro-inspired memory for AI agents: opencode and Hermes join Claude Code
 
 engram is no longer "memory for Claude Code". Three agents share one store, and each one's
@@ -19,7 +26,6 @@ conversations feed the same encode, consolidate, fixate pipeline.
   unaffected, and a rewrite only ever appends, so the byte-offset watermark stays valid.
 - **Docs:** README, ARCHITECTURE and the logo now say "neuro-inspired memory for AI agents", with a
   per-agent support table and an "Agents" section describing the three adapter seams.
-- **Repo:** removed the finished plan and review notes from the root.
 
 ## 1.6.0 — the Python Graphiti stack is gone
 
