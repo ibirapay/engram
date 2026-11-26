@@ -219,6 +219,37 @@ def test_apply_merge_rejects_a_file_in_an_outstanding_transaction():
     print("ok — refuses a file already held by an outstanding transaction")
 
 
+def test_descriptions_with_a_colon_survive_every_document_builder():
+    """A description holding ": " (real ones do: "Fake OTC (live on prod): a Mesa ...") used to be
+    written as a plain YAML scalar, which is a ScannerError: curate held the umbrella on every pass
+    and harvest/graduation silently lost the name and description."""
+    import yaml
+    desc = 'Fake OTC (live on prod 2026-11-15): a Mesa-OTC order, priced "as is" #1'
+    g = _gate()
+    m = _curate(tempfile.mkdtemp())
+    doc = m._umbrella_doc("project_x", desc, "project", "## Summary\nbody\n")
+    ok, why = g.validate_memory_doc(doc)
+    assert ok, f"umbrella with a colon in the description rejected: {why}"
+    assert yaml.safe_load(doc.split("---")[1])["description"] == desc, "description changed in transit"
+
+    sys.modules.setdefault("memory_ai", types.ModuleType("memory_ai"))
+    d = Path(tempfile.mkdtemp())
+    mh = _load("memory_harvest", ROOT / "bin" / "memory_harvest.py")
+    mh.STAGING = d
+    staged = mh.write_candidate({"name": "x", "type": "project", "description": desc, "body": "b"},
+                                "user-direct", "sess", set())
+    fm = yaml.safe_load(staged.read_text().split("---")[1])
+    assert fm["description"] == desc and fm["name"] == staged.stem, f"harvest candidate unparseable: {fm}"
+
+    sa = _load("memory_stage_apply", ROOT / "bin" / "memory_stage_apply.py")
+    content = sa.canonical_content({"name": "x", "description": desc, "metadata": {"type": "project"}},
+                                   "body", "user-direct", "sess")
+    meta, _ = sa.parse_frontmatter(content)
+    assert meta.get("description") == desc and meta.get("name") == "x", f"graduated memory lost its metadata: {meta}"
+    shutil.rmtree(d)
+    print("ok — a colon in the description round-trips through curate, harvest and graduation")
+
+
 if __name__ == "__main__":
     test_validator_rejects_the_real_malformed_shapes()
     test_unwrap_fence_leaves_inner_code_blocks_alone()
@@ -228,3 +259,4 @@ if __name__ == "__main__":
     test_apply_merge_refuses_stale_sources()
     test_apply_merge_refuses_to_reuse_a_transaction_dir()
     test_apply_merge_rejects_a_file_in_an_outstanding_transaction()
+    test_descriptions_with_a_colon_survive_every_document_builder()

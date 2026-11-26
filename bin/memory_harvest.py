@@ -282,7 +282,7 @@ def write_candidate(cand, provenance, session_id, valid_ids, promote=False):
     body = (cand.get("body") or "").strip()
     doc = f"""---
 name: {path.stem}
-description: {desc}
+description: {json.dumps(desc, ensure_ascii=False)}
 metadata:
   type: {typ}
 harvest:

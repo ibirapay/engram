@@ -223,7 +223,7 @@ def canonical_content(meta, body, provenance, sid):
     promote_line = "\npromote: requested" if ((meta.get("harvest") or {}).get("promote") == "requested") else ""
     return f"""---
 name: {name}
-description: {desc}
+description: {json.dumps(desc, ensure_ascii=False)}
 metadata:
   type: {typ}{promote_line}
 ---
