@@ -9,21 +9,29 @@ concentrated in the four largest.
 
 - **More facts are kept verbatim.** The distiller's restated-facts appendix now also covers what a
   note marks as code (any backticked span up to 80 chars: commands, flags, identifiers, error
-  strings), bare short git refs, paths under any root including `~/` and `$HOME/`, more file types
-  (`.rs`, `.md`, `.json`, `.yml`, `.conf`, ...) and "porta N". Code and refs count as present only
-  when the exact string is in the prose (the word "keep" is not the `--keep` flag). The redaction
+  strings), every line of a fenced code block (where commands live), bare short git refs, paths under
+  any root including `~/` and `$HOME/`, more file types (`.rs`, `.json`, `.yml`, `.conf`, ...) and
+  "porta N". Code, refs and env vars count as present only as the exact whole word (the word "keep"
+  is not the `--keep` flag, `ENGRAM_URL` is not `ENGRAM_URL_FALLBACK`), and only in the body the
+  umbrella keeps (a token the model wrote into its own frontmatter is not kept). The redaction
   placeholder is never taken for a fact.
 - **The appendix is smaller and readable.** A short source line is restated once and carries all
   its missing tokens with their context; it used to be repeated under every token it held. Long
-  lines fall back to one entry per token, and a token inside another missing one is listed once.
+  lines fall back to one entry per token, and a token inside another missing one FROM THE SAME
+  LINE is listed once.
 - **Merging an umbrella again is stable.** Its earlier appendix is read back as plain lines, so a
   re-merge keeps those facts at the same size. Before, each generation stacked one more
   "(from x.md)" tag, nested the whole old entry inside the new one, and turned the appendix headers
   into caveats ("Caveats / rules - ..."). A caveat already inside a restated line is not repeated.
 - **A merge that did not compress does not apply on its own.** When the appendix is more than half
   of the umbrella (`auto_curate.max_appendix_ratio`, default 0.5) autonomous runs skip the cluster
-  and the others queue it with the reason, without paying for a review call. On the measured
-  clusters this separates exactly the two lossy merges (53% and 58%) from the rest (9% to 37%).
+  and the others queue it with the reason, without paying for a review call. Only what THIS rewrite
+  dropped counts: lines carried from an earlier merge's appendix are never shown to the model, and
+  counting them would keep a merged umbrella from ever being merged again.
+- **A merge that would mask a txid, an address or a full hash is held.** The distiller masks every
+  long hex/base64 run before the model sees it, so those values could never reach the umbrella and
+  were lost with the absorbed sources (about 65 of the author's money memories hold one). Like a
+  credential, such a merge is now held instead of written without them. Session ids do not count.
 - **Honest notices.** "auto-merged (near-lossless) ... prose-cov 0.0" becomes "N/M concrete facts
   kept, K only in the appendix (X% of the doc); prose rewritten". The old number was the share of
   source sentences copied word for word, so any rewrite scored about 0.

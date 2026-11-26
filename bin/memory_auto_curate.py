@@ -78,9 +78,11 @@ AC_DEFAULTS = {
     # Non-automatic self-review mode: auto-apply only a near-LOSSLESS merge (a fact
     # outside the reviewer's truncated slice could be dropped otherwise); lossy -> queue.
     "min_auto_coverage": 0.90,
-    # A merge whose restated-facts appendix is more than this share of the umbrella did not
-    # compress: the rewrite dropped that many concrete tokens, and the prose around them with it.
+    # A merge whose rewrite left more than this share of the umbrella to the restated-facts
+    # appendix did not compress: it dropped that many concrete tokens, and the prose around them.
     # It never applies on its own: autonomous runs skip it, the others queue it with the reason.
+    # Only what THIS rewrite dropped counts; lines carried over from an earlier merge's appendix
+    # (which the model never sees) do not, or a merged umbrella could never be merged again.
     "max_appendix_ratio": 0.5,
 }
 
@@ -98,6 +100,18 @@ def ac_cfg(cfg):
 
 
 _FM_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.S)
+
+
+_PUBLIC_SHAPE_RE = re.compile(r"[0-9a-fA-F]{32,}|[A-Za-z0-9+/]{40,}={0,2}")
+
+
+def _public_values(text: str) -> set:
+    """Long hex/base64 runs that engram_secrets masks but that are not credentials: txids,
+    addresses, full hashes. Named secrets and session ids are not counted (dropping those is the
+    distiller's policy)."""
+    creds = engram_secrets.credentials(text)
+    return {m.group(0) for m in engram_secrets.SECRET_RE.finditer(text or "")
+            if _PUBLIC_SHAPE_RE.fullmatch(m.group(0)) and not any(m.group(0) in c for c in creds)}
 
 
 def _umbrella_doc(stem: str, desc: str, typ: str, body: str) -> str:
@@ -390,7 +404,7 @@ def main():
         # Losslessness is provided by REVERSIBILITY (sources -> quarantine), not by
         # appending everything. sentence_coverage is recorded, not gated.
         final, report = mdv.distill_cluster(umbrella.stem, files, cfg=cfg, preserve_sources=False)
-        ratio = report.get("appendix_chars", 0) / max(1, report.get("draft_chars") or 0)
+        ratio = report.get("appendix_fresh_chars", 0) / max(1, report.get("draft_chars") or 0)
         bloated = ratio > float(ac["max_appendix_ratio"])
         body = _body_of(final)
         if not body.strip():
@@ -413,6 +427,15 @@ def main():
         if missing:
             print(f"· {files}: HOLD (umbrella drops {len(missing)} credential(s): "
                   f"{[c[:50] for c in missing[:3]]}) — skipping"); continue
+        # The same for PUBLIC values (2026-11-26): the distiller masks every long hex/base64 run
+        # before the model sees it, so a txid, an address or a full hash in a source can never
+        # reach the umbrella. ~65 of the author's money memories hold one. Hold the merge rather
+        # than write the umbrella without them. Counted, never printed.
+        masked = sum(1 for f in files for v in _public_values((MEM / f).read_text(errors="ignore"))
+                     if v not in doc)
+        if masked:
+            print(f"· {files}: HOLD (umbrella would mask {masked} public value(s) the sources hold: "
+                  f"txid, address or full hash) — skipping"); continue
         absorbed = [f for f in files if f != umbrella.name]
         # transaction id so a second merge on the same umbrella can't clobber the
         # first merge's backup (each merge's originals live under their own dir)
@@ -427,14 +450,14 @@ def main():
         facts = report.get("hard_facts", 0)
         kept = round(report.get("final_fact_coverage", 0.0) * facts)
         summary = (f"{kept}/{facts} concrete facts kept, {report.get('appendix_facts', 0)} only in "
-                   f"the appendix ({ratio:.0%} of the doc); prose rewritten")
+                   f"the appendix ({ratio:.0%} of the doc restated by this rewrite); prose rewritten")
         preview = (f"Merge {len(files)} near-dups → {umbrella.name} ({report.get('draft_chars')} chars; "
                    f"{summary}). Absorbed→quarantine: {', '.join(absorbed)}")
         print(f"\n· {files} -> {umbrella.name}")
         if not apply:
             print(f"  would: {preview}")
             if bloated:
-                print(f"  (would not apply on its own: appendix over {ac['max_appendix_ratio']:.0%})")
+                print(f"  (would not apply on its own: restated share over {ac['max_appendix_ratio']:.0%})")
             continue
         cov = report.get("sentence_coverage", 0.0)
         # HUMAN gate (no model review): every merge goes to the Telegram approval queue.
@@ -464,8 +487,8 @@ def main():
                 done += 1
         else:
             if verdict == "BLOATED":
-                why = (f"appendix is {ratio:.0%} of the umbrella, over {ac['max_appendix_ratio']:.0%}: "
-                       f"the rewrite dropped too many concrete facts")
+                why = (f"this rewrite restated {ratio:.0%} of the umbrella in its appendix, over "
+                       f"{ac['max_appendix_ratio']:.0%}: it dropped too many concrete facts")
             elif verdict != "APPROVE":                  # name the REAL reason — cov may be fine
                 why = f"self-review {verdict}"
             else:

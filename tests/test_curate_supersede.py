@@ -251,12 +251,13 @@ def test_descriptions_with_a_colon_survive_every_document_builder():
 
 
 # ── the compress decision, through main() ──────────────────────────────────
-def _run_compress(report, autonomous=True):
+def _run_compress(report, autonomous=True, body_a="alpha holds one fact"):
     """Drive main() through ONE compress merge, every outside dependency stubbed: the vector store
-    pairs two different notes, distill returns `report`, the reviewer approves."""
+    pairs two different notes, distill returns `report`, the reviewer approves. engram_secrets is
+    the real one (its regexes decide the credential and public-value holds)."""
     d = Path(tempfile.mkdtemp())
     fm = "---\nname: {n}\ndescription: d\nmetadata:\n  type: project\n---\n\n{b}\n"
-    (d / "project_a.md").write_text(fm.format(n="project_a", b="alpha holds one fact"))
+    (d / "project_a.md").write_text(fm.format(n="project_a", b=body_a))
     (d / "project_b.md").write_text(fm.format(n="project_b", b="beta holds another fact"))
     calls = {"apply": 0, "verify": 0, "notify": [], "propose": []}
     gate = types.ModuleType("engram_telegram_gate")
@@ -274,8 +275,7 @@ def _run_compress(report, autonomous=True):
     mai = types.ModuleType("memory_ai")
     mai.load = lambda: {"auto_curate": {"enabled": True, "autonomous": autonomous,
                                         "review_gate": "self", "prune_orphans": False}}
-    sec = types.ModuleType("engram_secrets")
-    sec.credentials = lambda t: []; sec.redact = lambda t: (t, 0); sec.looks_secret = lambda t: False
+    sec = _load("engram_secrets", ROOT / "bin" / "engram_secrets.py")
     stubs = {"vector_store": store, "qdrant_client": types.ModuleType("qdrant_client")}
     saved = {k: sys.modules.get(k) for k in stubs}
     sys.modules.update(stubs)
@@ -303,16 +303,38 @@ def test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept():
     commands, flags and refs were gone. A merge whose appendix had to restate more than half the
     umbrella must not apply on its own, and the notice must report the facts actually kept."""
     base = {"hard_facts": 40, "final_fact_coverage": 1.0, "sentence_coverage": 0.0, "draft_chars": 1000}
-    calls = _run_compress({**base, "appendix_facts": 30, "appendix_chars": 600})
+    calls = _run_compress({**base, "appendix_facts": 30, "appendix_chars": 650, "appendix_fresh_chars": 600})
     assert calls["apply"] == 0 and not calls["propose"], f"bloated merge applied or queued: {calls}"
     assert calls["verify"] == 0, "a merge that cannot apply still paid for a review call"
-    calls = _run_compress({**base, "appendix_facts": 30, "appendix_chars": 600}, autonomous=False)
-    assert calls["apply"] == 0 and len(calls["propose"]) == 1 and "appendix is 60%" in calls["propose"][0], calls
-    calls = _run_compress({**base, "appendix_facts": 3, "appendix_chars": 100})
+    calls = _run_compress({**base, "appendix_facts": 30, "appendix_chars": 650, "appendix_fresh_chars": 600},
+                          autonomous=False)
+    assert calls["apply"] == 0 and len(calls["propose"]) == 1 and "restated 60%" in calls["propose"][0], calls
+    # lines carried from an earlier merge's appendix (never shown to the model) do not count:
+    # otherwise a merged umbrella with a big appendix could never be merged again
+    calls = _run_compress({**base, "appendix_facts": 30, "appendix_chars": 900, "appendix_fresh_chars": 50})
+    assert calls["apply"] == 1, f"carried-over appendix lines blocked the merge: {calls}"
+    calls = _run_compress({**base, "appendix_facts": 3, "appendix_chars": 150, "appendix_fresh_chars": 100})
     assert calls["apply"] == 1 and calls["verify"] == 1, calls
     note = calls["notify"][0]
     assert "near-lossless" not in note and "40/40 concrete facts kept, 3 only in the appendix (10%" in note, note
     print("ok — a bloated merge never applies on its own; the notice reports the facts kept")
+
+
+def test_a_merge_that_would_mask_a_txid_or_address_is_held():
+    """The distiller masks every long hex/base64 run before the model sees it, so a txid, an
+    address or a full hash in a source can never reach the umbrella. Such a merge is held in every
+    mode (no apply, no queue, no review call); a session id in the frontmatter does not count."""
+    report = {"hard_facts": 1, "final_fact_coverage": 1.0, "sentence_coverage": 0.0, "draft_chars": 1000,
+              "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0}
+    txid = "9f2c" * 16
+    for autonomous in (True, False):
+        calls = _run_compress(report, autonomous, body_a=f"refund sent, txid {txid}")
+        assert calls == {"apply": 0, "verify": 0, "notify": [], "propose": []}, (autonomous, calls)
+    calls = _run_compress(report, body_a="refund sent to 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed")
+    assert calls["apply"] == 0 and calls["verify"] == 0, f"merge masking an address went ahead: {calls}"
+    calls = _run_compress(report, body_a="originSessionId: 5f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b\nplain fact")
+    assert calls["apply"] == 1, f"a session id held the merge: {calls}"
+    print("ok — a merge that would mask a txid or an address is held; a session id is not a value")
 
 
 if __name__ == "__main__":
@@ -326,3 +348,4 @@ if __name__ == "__main__":
     test_apply_merge_rejects_a_file_in_an_outstanding_transaction()
     test_descriptions_with_a_colon_survive_every_document_builder()
     test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept()
+    test_a_merge_that_would_mask_a_txid_or_address_is_held()
