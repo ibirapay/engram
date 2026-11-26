@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.3.0 — the prompt hook no longer reads the whole store
+
+Every prompt, `engram-recall-hook` listed the memory directory, opened and tokenized every
+`.md` file (about 1,100) and ranked them in memory before making a single network call. On
+the reference install that was most of the hook's ~860 ms.
+
+The keyword leg now ranks from a persistent SQLite index (`<engram home>/index/keyword-<slug>.db`,
+derived data, safe to delete). A prompt reads only the postings of its own query terms, and
+a sync is a directory listing plus a re-read of the files whose mtime or size changed. Median
+hook latency on the reference install: 862 ms -> 421 ms.
+
+- **Same ranking, bit for bit.** The index reuses the same tokenizer, field weights and the
+  same `term_score` function as the in-memory BM25 (it is deliberately not SQLite FTS5, whose
+  tokenizer and scoring would have changed the hard-won precision). A test holds the parity;
+  `recall_precision_eval.sh` passes and 8/8 prompts inject identical text before and after.
+- **Never trusted blindly.** A tokenizer or stopword change alters a fingerprint and the next
+  sync rebuilds the index. If the index cannot be opened or written, the leg falls back to
+  scanning the store and says so in `legs.keyword`.
+- Only the memories that survive rank fusion are read from disk. `load_file` refuses any name
+  that is not a bare `*.md` file name, so a hostile vector payload or graph node cannot point it
+  outside the store.
+
 ## 1.2.3 — the daemon runs once a day by default
 
 `engram.timer` fired every 30 minutes (`OnCalendar=*:0/30`, plus `OnBootSec=5min`), so every
