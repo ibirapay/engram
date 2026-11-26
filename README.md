@@ -1,13 +1,25 @@
 <p align="center">
-  <img src="assets/engram-logo.svg" alt="engram — neuro-inspired memory for Claude Code" width="840">
+  <img src="assets/engram-logo.svg" alt="engram — neuro-inspired memory for AI agents" width="840">
 </p>
 
-<p align="center"><b>A neuro-inspired memory organism for Claude Code.</b></p>
+<p align="center"><b>Neuro-inspired memory for AI agents.</b><br>One local memory that Claude Code, opencode and Hermes Agent share.</p>
 
 An *engram* is the physical trace a memory leaves in the brain. This is that, for your
 AI: a local-first memory system that *encodes* what you do, *consolidates* it into
 durable knowledge, *fixates* what proves true, and *recalls* it associatively — so
-Claude Code remembers your projects, your infra, and your preferences across sessions.
+your agents remember your projects, your infra, and your preferences across sessions,
+**and across agents**: what you taught one is recalled by the others.
+
+| Agent | Recall (MCP tools) | Automatic recall on every prompt | Learns from its sessions (harvest) | Installer |
+|---|---|---|---|---|
+| **Claude Code** | `engram-rust` | `UserPromptSubmit` hook | transcripts (`~/.claude/projects`) | registers MCP, hooks and `/memory-*` commands |
+| **opencode** | `engram` | `engram-recall` plugin (`integrations/opencode`) | sessions from `opencode.db` | `opencode mcp add` + the plugin |
+| **Hermes Agent** | `engram` | the model recalls on its own, taught by a `SOUL.md` block (`integrations/hermes`) | sessions from `~/.hermes/state.db` | `hermes mcp add` + the `SOUL.md` block |
+
+Every agent reads and writes the same Markdown store through the same Rust recall, and
+each one's conversations feed the same encode, consolidate, fixate pipeline. Missing an
+agent? The core is agent-agnostic: an adapter is an MCP registration plus a way to hand
+the prompt to `engram-recall-hook` and the transcript to the harvester.
 
 It's not a flat notes file. It's a pipeline modeled on how human memory actually works:
 
@@ -175,7 +187,7 @@ cd engram
 
 The installer copies the engine into `~/.claude`, writes `engram.yaml`, registers the
 `/memory-*` commands + the graph recall MCP server, and (optionally) sets up the 24/7
-daemon. Restart Claude Code afterward so it loads the new commands.
+daemon. Restart your agents (Claude Code, opencode) afterward so they load the new commands, plugin and MCP servers.
 
 > **Trying it without touching an existing `~/.claude`?** Install into a sandbox:
 > `ENGRAM_CLAUDE_HOME=~/engram-sandbox/.claude ./install.sh --yes`
@@ -192,7 +204,7 @@ key, the Telegram token), and re-registers the MCP servers without duplicating t
 cd engram
 ./update.sh            # shows the incoming commits and the plan; changes nothing
 ./update.sh --apply    # pull + reinstall + restore overrides + rebuild Atlas + verify
-# then restart Claude Code so it reloads the commands + MCP servers
+# then restart Claude Code / opencode so they reload the commands, plugin and MCP servers
 ```
 
 - **Safe pull:** fast-forward only; refuses a dirty tree, a non-default branch or a
@@ -247,14 +259,14 @@ Run in any Claude session. Each is **dry-run first** — it shows a plan and you
 | **`/memory-clean-review`** | Walk the store file-by-file with you deciding **keep / edit / delete** on each — fully human-driven. |
 | **`/memory-to-skill`** | Promote a high-trust, frequently-recalled *procedural* memory into a first-class Claude Code skill. |
 
-### Recall — how the right memories reach Claude
+### Recall — how the right memories reach your agents
 - **Auto-recall** (the `UserPromptSubmit` hook): every prompt gets the memories that match it injected automatically — no waiting for Claude to think of calling a recall tool. Names + one-line descriptions only, **at most once per memory per session**, ~0.3s, fail-open. The installer uses the Rust hook when available. Off with `recall.inject.enabled: false`.
-- **Rust hybrid recall** (`engram-rust` MCP): `memory_recall_hybrid` fuses Markdown, Qdrant, and SQLite-graph rankings via Reciprocal Rank Fusion. Native triples use a controlled relation taxonomy, temporal state, and confidence quarantine; the legacy Graphiti MCP remains available only while parity evaluation is in progress.
+- **Rust hybrid recall** (`engram-rust` MCP): `memory_recall_hybrid` fuses Markdown, Qdrant, and SQLite-graph rankings via Reciprocal Rank Fusion. Native triples use a controlled relation taxonomy, temporal state, and confidence quarantine.
 - **Hybrid recall** (`memory_recall` / `memory_recall_hybrid`, on the `engram-rust` MCP): the single recall path — fuses graph + vector + keyword (BM25) into one ranking via Reciprocal Rank Fusion, keyed by the memory filename, embedding the query once. Degrades to keyword+vector when no graph is installed. Each ranker degrades independently; optional `type` filter.
 - **Graph**: lives in `~/.claude/index/graph.db`; the Python `engram-graph` MCP server was removed in 1.6.0 (recall is on `engram-rust`).
 - **Vector inspection** (the optional `engram-vector` MCP): `memory_vector_search`, `memory_vector_stats` — raw dense-search debugging ("is there a memory about X") and index stats via Qdrant. Off by default; enable with `./install.sh --vector`.
 
-- **Local-LLM recall** (`hermes`): if the `hermes` CLI is on `PATH`, the installer also registers the same MCP servers with it, so a **local Ollama model** can recall your memories from the terminal — `hermes -z "recall what you know about X"`. Auto-detected; skip it with `./install.sh --no-hermes`. (Plain `ollama run`/`ollama agent` can't do this — ollama has no MCP client.)
+- **Other agents** (`opencode`, `hermes`): if the CLI is on `PATH` the installer registers the `engram` MCP server with it (`--no-opencode` / `--no-hermes` skip it). opencode also gets the `engram-recall` plugin, so recall happens on every prompt; Hermes gets a managed block in its `SOUL.md` that teaches it when to recall and how to save. A **local Ollama model** driven through Hermes can therefore recall your memories from the terminal: `hermes -z "recall what you know about X"`. Their sessions are exported to `<store>/.sources/` (`bin/engram_sources.py`: user and assistant text only, no tools, reasoning, sub-agents or cron) and harvested like Claude Code transcripts.
 
 ### Automatic
 A Stop hook harvests new facts each session; the daemon consolidates / fixates / syncs the graph (and the vector index, if enabled) on a cadence — all dry-run + human-approved.

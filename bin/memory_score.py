@@ -151,6 +151,8 @@ def session_date(origin: str) -> str | None:
         return None
     tr = PROJ_DIR / f"{origin}.jsonl"
     if not tr.exists():
+        tr = PROJ_DIR / ".sources" / f"{origin}.jsonl"   # opencode / Hermes sessions
+    if not tr.exists():
         return None
     try:
         with tr.open() as fh:
