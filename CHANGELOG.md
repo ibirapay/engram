@@ -10,9 +10,9 @@ concentrated in the four largest.
 - **More facts are kept verbatim.** The distiller's restated-facts appendix now also covers what a
   note marks as code (any backticked span up to 80 chars: commands, flags, identifiers, error
   strings), every line of a fenced code block (where commands live; fences are paired by state, and
-  a fenced markdown document is not code), bare short git refs, paths under any root including `~/`
+  only a fenced markdown document is not code: a fenced YAML file is), bare short git refs, paths under any root including `~/`
   and `$HOME/`, more file types (`.rs`, `.md`, `.json`, `.yml`, `.conf`, ...; a memory file's own name
-  is not a fact) and "porta N". Code, refs and env vars count as present only as the exact whole token
+  is not a fact, nor is a bare subsection label naming a file) and "porta N". Code, refs and env vars count as present only as the exact whole token
   (the word "keep" is not the `--keep` flag, nor is `--keep-alive`; `ENGRAM_URL` is not
   `ENGRAM_URL_FALLBACK`), and only in the body the umbrella keeps (a token the model wrote into its
   own frontmatter is not kept). The redaction placeholder is never taken for a fact.
@@ -22,8 +22,10 @@ concentrated in the four largest.
   LINE is listed once.
 - **Merging an umbrella again is stable.** Its earlier appendix is read back as plain lines, and each
   line is itself a verbatim fact (restated whole), so a re-merge keeps those facts at the same size,
-  including a command that came from a fenced block and has no other marker once restated. Only our
-  own "(from x.md)" tags are removed from those lines. Before, each generation stacked one more
+  including a command that came from a fenced block and has no other marker once restated, and the
+  rest of a line that only contains a rule ("stop electrs; never stop elementsd first"). Only our own
+  "(from x.md)" tags are removed from those lines. Caveat extraction no longer swallows a fence
+  marker into the rule. Before, each generation stacked one more
   "(from x.md)" tag, nested the whole old entry inside the new one, and turned the appendix headers
   into caveats ("Caveats / rules - ..."). A caveat already inside a restated line is not repeated.
 - **A merge that did not compress does not apply on its own.** When the appendix is more than half

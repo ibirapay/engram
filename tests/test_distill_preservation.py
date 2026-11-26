@@ -202,8 +202,8 @@ def second_review_findings():
     assert "Retry with `--keep` when it stalls." in final, "--keep counted as present inside --keep-alive"
 
     # .md references are facts; a memory file name (the model's subsection label) is not
-    toks = {d for d, _ in mdv.extract_facts("Approved in docs/LIQUID-SEND.md rev.12.\n### reference_c.md\n").values()}
-    assert "LIQUID-SEND.md" in toks and "reference_c.md" not in toks, toks
+    toks = {d for d, _ in mdv.extract_facts("Approved in docs/LIQUID-SEND.md rev.12.\n### reference_c.md — Liquid setup\n").values()}
+    assert "LIQUID-SEND.md" in toks and "reference_c.md" not in toks, toks   # a type-prefixed label, with a title
     # only our tags leave a carried line: an attribution in the text stays
     old = ("x\n\n## Reference facts (verbatim — auto-preserved from sources)\n### Hard facts\n"
            "- Fee is 1% (from BlindPay) per fiat leg, port 3110. (from reference_a.md)\n")
@@ -222,9 +222,43 @@ def second_review_findings():
     print("ok — fenced commands survive re-merges; identifiers by line and by hyphen; .md refs; tags; fences")
 
 
+def third_review_findings():
+    """Third independent review, 2026-11-26: a carried line that only CONTAINS a rule keeps its
+    other part; an env var glued to a hyphen keeps its source line; a bare subsection label naming
+    a file is not a fact; a fenced YAML file is code (only a fenced markdown document is not)."""
+    tmp = ROOT / "tests" / "_tmp_review3"; tmp.mkdir(exist_ok=True); mdv.MEM = tmp
+    (tmp / "reference_a.md").write_text(
+        "---\nname: a\n---\nOrder:\n```bash\nsudo systemctl stop electrs; never stop elementsd first\n```\n")
+    (tmp / "reference_b.md").write_text("---\nname: b\n---\nPlain note.\n")
+    mdv.ollama_stream = lambda p, c: ("Umbrella.", "stop", 0.0)
+    for _ in range(3):
+        final, rep = mdv.distill_cluster("reference", ["reference_a.md", "reference_b.md"])
+        (tmp / "reference_a.md").write_text("---\nname: a\n---\n" + final)
+        assert "sudo systemctl stop electrs" in final, "the command before the rule was dropped"
+    # a whole-line rule still comes back as one caveat
+    assert final.count("never stop elementsd first") == 1, final
+
+    (tmp / "reference_a.md").write_text("---\nname: a\n---\nRouting is ENGRAM_URL-based: set it on every host.\n")
+    final, rep = mdv.distill_cluster("reference", ["reference_a.md", "reference_b.md"])
+    assert "Routing is ENGRAM_URL-based: set it on every host." in final, "the env var lost its statement"
+    assert "from ?)" not in final, final
+
+    toks = lambda t: {d for d, _ in mdv.extract_facts(t).values()}
+    assert "sideshift_client.md" not in toks("### sideshift_client.md\nprose\n"), "a subsection label became a fact"
+    assert "sideshift_client.md" in toks("### sideshift_client.md\nsee sideshift_client.md for the API\n")
+    assert mdv.fenced_lines("```yaml\n---\nimage: docker.io/library/postgres:16\nreplicas: 3\n```\n") == \
+        ["---", "image: docker.io/library/postgres:16", "replicas: 3"]
+    assert "---" not in toks("```yaml\n---\nimage: postgres:16\n```\n"), "a bare --- became a fact"
+    assert "name: web" in toks("```yaml\n---\nname: web\nimage: x\n---\n```\n"), "a tagged YAML file read as a document"
+    assert "image: postgres:16" in toks("```\n---\nimage: postgres:16\n```\n"), "an untagged config head is code"
+    shutil.rmtree(tmp)
+    print("ok — partial-rule lines, hyphen-glued env vars, subsection labels and fenced YAML")
+
+
 if __name__ == "__main__":
     main()
     concrete_tokens()
     remerge_is_stable()
     identifiers_fences_and_frontmatter()
     second_review_findings()
+    third_review_findings()

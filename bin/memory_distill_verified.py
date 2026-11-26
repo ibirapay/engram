@@ -139,6 +139,21 @@ def fact_present(disp: str, kind: str, hay: str, hay_norm: str) -> bool:
     dn = re.sub(r"[^a-z0-9]", "", d)        # separator-insensitive (paths/files)
     return len(dn) >= 4 and dn in hay_norm
 
+def _wraps_markdown(info: str, block: list) -> bool:
+    """A fenced block holding a markdown document, not code: tagged markdown/md, or untagged with a
+    leading --- head that has a top-level name:/description: (a YAML file tagged yaml, or one whose
+    head is plain config, is code)."""
+    if info in ("markdown", "md"):
+        return True
+    if info or not block or block[0].strip() != "---":
+        return False
+    for b in block[1:]:
+        if b.strip() == "---":
+            return False
+        if re.match(r"(?:name|description):", b):
+            return True
+    return False
+
 def fenced_lines(text: str) -> list:
     """Lines inside fenced code blocks. A closer uses the opener's character, at least as long, with
     no info string; an unclosed fence contributes nothing; a block that wraps a markdown document
@@ -150,12 +165,23 @@ def fenced_lines(text: str) -> list:
             if m:
                 fence, info, block = m.group(1), m.group(2).strip().lower(), []
         elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
-            if info not in ("markdown", "md") and not (block and block[0].strip() == "---"):
+            if not _wraps_markdown(info, block):
                 out += [b for b in block if not FENCE_RE.match(b)]
             fence = None
         else:
             block.append(ln)
     return out
+
+def _only_labels(tok: str, text: str) -> bool:
+    """Every line holding `tok` is just a label naming it ("### x.md", "**x.md**"): how the model
+    titles a source note's subsection, not a reference to keep."""
+    lines = [ln.strip() for ln in text.splitlines() if tok in ln]
+    return bool(lines) and all(re.fullmatch(rf"[#*_\s]*{re.escape(tok)}[*_:\s]*", ln) for ln in lines)
+
+def _whole_caveat(ln: str) -> bool:
+    """The caveat split keeps this line whole, so it can stay a caveat. A line that only CONTAINS a
+    rule ("stop electrs; never stop elementsd first") would lose its other part to the split."""
+    return caveats(ln) == [" ".join(ln.split()).lstrip("-*# ").strip()]
 
 def _has(disp: str, kind: str, hay: str) -> bool:
     """`disp` occurs in the lowercased `hay`. A verbatim kind only as a whole token: a letter, digit,
@@ -178,7 +204,7 @@ def extract_facts(text: str):
             # a masked secret is not a fact: never list the placeholder as something to keep
             if len(norm) < 3 or norm in FACT_STOP or "«redacted" in norm:
                 continue
-            if kind == "file" and MEMORY_FILE_RE.match(tok):
+            if kind == "file" and (MEMORY_FILE_RE.match(tok) or _only_labels(tok, text)):
                 continue
             # find the line for a secrecy check so we never appendix a secret.
             # Any fact whose source line looks like a secret is dropped (not just
@@ -192,7 +218,8 @@ def extract_facts(text: str):
     # above sees a command with no path, env var or file in it.
     for ln in fenced_lines(text):
         tok = ln.strip(); norm = tok.lower()
-        if 3 <= len(tok) <= 200 and "«redacted" not in norm and not looks_secret(tok):
+        if (3 <= len(tok) <= 200 and re.search(r"[A-Za-z0-9]", tok)   # not a bare --- or ```
+                and "«redacted" not in norm and not looks_secret(tok)):
             seen.setdefault(norm, (tok, "code"))
     return seen
 
@@ -204,6 +231,9 @@ def caveats(text: str):
     1500-char paragraph). Split into sentences and keep the ones with a caveat
     trigger, trimmed to the surrounding clause."""
     out = []
+    # a fence line is a paragraph break, never part of a sentence (it used to end up in the rule:
+    # "never stop elementsd first ```", which no restated line contains, so it was written twice)
+    text = "\n".join("" if FENCE_RE.match(ln) else ln for ln in (text or "").splitlines())
     # normalize whitespace per paragraph, then split on sentence boundaries
     for para in re.split(r"\n\s*\n", text):
         flat = " ".join(para.split())
@@ -310,17 +340,20 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
         keep = prose + "\n\n" + "\n\n".join(prior)
         # Each carried line is itself a verbatim fact: the rule that found its tokens the first
         # time (a fence, backticks) is gone once it was restated, and the model never sees it.
-        # Its own tokens fold into it below (same source line). Caveat lines stay caveats.
+        # Its own tokens fold into it below (same source line). A line that is one whole caveat
+        # stays a caveat.
         for ln in prior:
-            if not CAVEAT_TRIGGER.search(ln):
+            if not CAVEAT_TRIGGER.search(ln) or not _whole_caveat(ln):
                 facts.setdefault(ln.lower(), (ln, "carried"))
                 fact_src.setdefault(ln.lower(), (f, ln))
         for norm, (disp, kind) in extract_facts(keep).items():
             facts.setdefault(norm, (disp, kind))
             if norm not in fact_src:
-                for ln in keep.splitlines():
-                    if _has(disp, kind, ln.lower()):
-                        fact_src[norm] = (f, ln.strip()); break
+                lines = keep.splitlines()
+                src = (next((ln for ln in lines if _has(disp, kind, ln.lower())), None)
+                       or next((ln for ln in lines if disp.lower() in ln.lower()), None))
+                if src is not None:
+                    fact_src[norm] = (f, src.strip())
         all_caveats += [(c, f) for c in caveats(keep)]
     if verbose:
         print(f"[{key}] {len(files)} notes · {len(facts)} hard facts · {len(all_caveats)} caveat lines", flush=True)
