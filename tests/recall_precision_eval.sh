@@ -79,5 +79,19 @@ forbid D-robosats "$D" "dsec-training-scope-doc"           # matched only "plano
 E=$(run E-unrelated "qual filme vou assistir hoje a noite com a familia no cinema")
 forbid E-unrelated "$E" "Graph facts"          # nothing on this prompt should reach the fact leg
 
+# F: the operator's prompt of 2026-11-24, which showed the function-word list was still
+# incomplete. It is about the LANGUAGES of the memory store, and it injected a memory about his
+# mother and one about tailscale/ufw. The tailscale one is the telling case: it shared nothing
+# topical with the prompt — it matched only `as`, `ou`, `entao`, `seja`, `todas`. Grammar.
+#
+# NOT asserted here: `user-adriana-is-mae` is still injected, and that is a different bug. It
+# shares exactly one term with the prompt — `mae` — and earns the ×3 NAME weight because its own
+# name ends in `is_mae`, which is what the prompt's "língua mãe" folds to. A single rare content
+# word carrying a name weight is #51's question (when is a match not enough), not a missing
+# stopword: `mae` is content (4 of 1133 memories) and "adriana é minha mãe" is a real topic.
+F=$(run F-languages "O espanhol não se aplica as minhas memórias, elas são todas em português ou inglês, então todos que usam o engram devem ter uma língua mãe escolhida e caso ela não seja inglês, deve conter inglês como língua lateral")
+expect F-languages "$F" "feedback_engram_declare_mother_tongue"
+forbid F-languages "$F" "reference_tailscale_bypasses_ufw"   # matched ONLY as/ou/entao/seja/todas
+
 [ "$fail" = 0 ] && echo "recall-precision eval: all cases passed"
 exit "$fail"
