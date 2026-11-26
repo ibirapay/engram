@@ -150,12 +150,14 @@ async fn run(args: Args) -> Result<usize, SyncError> {
         .with_timeout(config.embed_timeout_seconds());
     let space = config.embedding_space_id();
 
-    // Retire graph data for memories that left the store. Only on a full pass:
-    // a --limit run has not looked at everything, so it cannot conclude a file is
-    // gone.
-    let full_pass = args.limit >= memories.len();
-    if full_pass {
-        let present: Vec<String> = memories.iter().map(|memory| memory.file.clone()).collect();
+    // Retire graph data for memories that left the store, on EVERY pass. `--limit` only caps how
+    // many memories are re-extracted below; the directory listing is always complete, so a limited
+    // run knows exactly which files are gone. (It used to prune on a full pass only, and the daemon
+    // always runs limited, so merged and quarantined memories piled up in the graph for good.)
+    let store = engram_paths::store_dir(&config_path, &slug);
+    if let Some(present) =
+        files_to_keep(engram_store::list_files(&store).map_err(|error| error.to_string())?)
+    {
         client
             .prune_missing_memories(&scope, &present)
             .await
@@ -228,6 +230,13 @@ async fn run(args: Args) -> Result<usize, SyncError> {
 
 /// The freshness key. The embedding space is part of it: a model swap at the same
 /// dimension must invalidate stored fact vectors.
+/// The file names that stay in the graph, or `None` when the store lists no memory at all. An empty
+/// listing means an unmounted or wiped directory, not a store with no memories: pruning against it
+/// would delete the whole graph.
+fn files_to_keep(files: Vec<engram_store::FileStamp>) -> Option<Vec<String>> {
+    (!files.is_empty()).then(|| files.into_iter().map(|stamp| stamp.file).collect())
+}
+
 fn memory_sha(space: &str, memory: &engram_store::Memory) -> String {
     format!(
         "{:x}",
@@ -428,6 +437,25 @@ fn facts(description: &str, body: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stamp(file: &str) -> engram_store::FileStamp {
+        engram_store::FileStamp {
+            file: file.to_string(),
+            mtime_ns: 1,
+            size: 1,
+        }
+    }
+
+    /// Pruning runs on every pass, so an empty listing (unmounted or wiped store) must not
+    /// reach it: it would read as "every memory is gone" and delete the whole graph.
+    #[test]
+    fn an_empty_store_listing_never_prunes_and_a_real_one_keeps_every_file() {
+        assert_eq!(files_to_keep(Vec::new()), None);
+        assert_eq!(
+            files_to_keep(vec![stamp("a.md"), stamp("b.md")]),
+            Some(vec!["a.md".to_string(), "b.md".to_string()])
+        );
+    }
 
     /// A failed extraction must FAIL. It used to collapse into a facts-only
     /// result with no triples, which the sync then stamped as current — one blip

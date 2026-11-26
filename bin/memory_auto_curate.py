@@ -96,6 +96,14 @@ def ac_cfg(cfg):
 _FM_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.S)
 
 
+def _umbrella_doc(stem: str, desc: str, typ: str, body: str) -> str:
+    """The umbrella document. The description goes in as a JSON string, which is a valid YAML
+    double-quoted scalar: a plain `description: Fake OTC (live): a Mesa ...` is a YAML
+    ScannerError (": " inside a plain scalar), and such an umbrella was held on every pass."""
+    return (f"---\nname: {stem}\ndescription: {json.dumps(desc, ensure_ascii=False)}\n"
+            f"metadata:\n  type: {typ}\n---\n\n{body}")
+
+
 def _fm(p: Path):
     """(name, description, type) from an ANCHORED frontmatter block.
 
@@ -381,7 +389,7 @@ def main():
         body = _body_of(final)
         if not body.strip():
             print(f"· {files}: HOLD (empty umbrella) — skipping"); continue
-        doc = f"---\nname: {umbrella.stem}\ndescription: {desc}\nmetadata:\n  type: {typ}\n---\n\n{body}"
+        doc = _umbrella_doc(umbrella.stem, desc, typ, body)
         okdoc, whydoc = gate.validate_memory_doc(doc)
         if not okdoc:
             print(f"· {files}: HOLD (malformed umbrella: {whydoc}) — skipping"); continue

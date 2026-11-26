@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.7.2 — umbrellas with a colon in the description, and orphan graph rows
+
+- **Fixed: curate held clusters forever.** The umbrella (and the harvest candidate, and the memory
+  written on graduation) put the description into the frontmatter as a plain YAML scalar. A real
+  description such as `Fake OTC (live on prod): a Mesa ...` holds `": "`, which is a YAML
+  `ScannerError`: curate logged `HOLD (malformed umbrella)` on every pass for those clusters, and
+  harvest/graduation silently read an empty name and description. The description is now written as
+  a JSON string (valid YAML double-quoted), and one test covers all three builders.
+- **Fixed: memories that left the store stayed in the graph.** The native graph sync pruned graph
+  rows for deleted memories only on a pass with no `--limit`, and the daemon always runs with
+  `--limit 25`, so merged and quarantined memories piled up (134 on the author's store). `--limit`
+  caps re-extraction only; the directory listing is always complete, so the sync now prunes on every
+  pass, and refuses to prune against an empty listing (an unmounted store must not wipe the graph).
+
 ## 1.7.1 — logo names the agents
 
 - **Logo:** three chips under the tagline (Claude Code, opencode, Hermes Agent) and an `aria-label`
