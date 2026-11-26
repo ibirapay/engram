@@ -212,7 +212,11 @@ embed:
 #   wiki_host_suffix: home.arpa
 
 graph:
-  backend: graphiti_compat       # graphiti_compat | native
+  backend: graphiti_compat       # graphiti_compat | native | sqlite
+  # sqlite = the native graph in a local file (<engram home>/index/graph.db, or
+  # ENGRAM_GRAPH_DB): no Neo4j, no JVM. Fill it once from an existing native Neo4j graph with
+  #   engram-graph-to-sqlite --verify        (read-only on Neo4j; safe to re-run)
+  # then set `backend: sqlite`. neo4j_* below are ignored in that mode.
   neo4j_uri: "bolt://127.0.0.1:7687"
   neo4j_database: "neo4j"
   neo4j_user: "neo4j"

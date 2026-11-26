@@ -557,9 +557,12 @@ impl Config {
                 "embed.url (or llama_cpp.url) is required for llama_cpp/openai embeddings".into(),
             ));
         }
-        if !matches!(self.graph.backend.as_str(), "native" | "graphiti_compat") {
+        if !matches!(
+            self.graph.backend.as_str(),
+            "native" | "sqlite" | "graphiti_compat"
+        ) {
             return Err(ConfigError::Invalid(
-                "graph.backend must be native or graphiti_compat".into(),
+                "graph.backend must be native, sqlite or graphiti_compat".into(),
             ));
         }
         // Deliberately NOT rejected here: `graph.backend: native` without the
