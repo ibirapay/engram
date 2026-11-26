@@ -156,9 +156,8 @@ async fn main() {
     // Fail open ON THE DEADLINE. Waiting for the call to return eventually is the
     // same as having no timeout from the user's point of view.
     //
-    // recall_fast, not recall: the full path spawns Graphiti, which measures ~3.5s
-    // against a populated graph and would therefore blow this budget on every
-    // prompt, injecting nothing at all.
+    // recall_fast, not recall: the full path adds the graph's keyword and semantic
+    // legs, which this per-prompt budget does not need.
     let budget = Duration::from_millis(inject.timeout_ms.max(250));
     let Ok(Ok(result)) = tokio::time::timeout(
         budget,

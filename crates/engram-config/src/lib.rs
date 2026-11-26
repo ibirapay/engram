@@ -206,12 +206,12 @@ pub struct VectorRecall {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Graph {
-    /// Defaults to `graphiti_compat`, NOT `native`.
+    /// `sqlite` (the default): the graph is a local file, `<engram home>/index/graph.db`.
     ///
-    /// `install.sh` never adds a `graph:` block to an existing `engram.yaml`, so
-    /// almost every upgraded install reaches this default. Defaulting to `native`
-    /// silently moved those users off their populated Graphiti index and onto the
-    /// unproven native path; the safe default is the one they were already running.
+    /// `native` (Neo4j) and `graphiti_compat` (Graphiti) were removed in 1.5.0. They
+    /// still LOAD, because `validate()` runs on every load and `engram-graph-to-sqlite`
+    /// must be able to read an old config to migrate it; the graph leg and the sync
+    /// refuse to run on them and say how to migrate ([`Graph::is_legacy`]).
     #[serde(default = "default_graph_backend")]
     pub backend: String,
     #[serde(default = "default_neo4j_uri")]
@@ -296,7 +296,7 @@ fn default_dimension() -> u32 {
     768
 }
 fn default_graph_backend() -> String {
-    "graphiti_compat".into()
+    "sqlite".into()
 }
 fn default_neo4j_uri() -> String {
     "bolt://127.0.0.1:7687".into()
@@ -398,6 +398,22 @@ impl Default for Inject {
             max_facts: default_max_facts(),
             timeout_ms: default_timeout_ms(),
         }
+    }
+}
+
+impl Graph {
+    /// A backend value from before 1.5.0 (`native`, `graphiti_compat`). Config still
+    /// loads with it; the readers and writers of the graph do not run on it.
+    pub fn is_legacy(backend: &str) -> bool {
+        backend != "sqlite"
+    }
+
+    /// What to tell the operator when the graph is asked for on a legacy backend.
+    pub fn legacy_message(backend: &str) -> String {
+        format!(
+            "graph.backend: {backend} was removed in 1.5.0. Copy the graph once with \
+             `engram-graph-to-sqlite`, then set graph.backend: sqlite"
+        )
     }
 }
 
@@ -559,10 +575,11 @@ impl Config {
         }
         if !matches!(
             self.graph.backend.as_str(),
-            "native" | "sqlite" | "graphiti_compat"
+            "sqlite" | "native" | "graphiti_compat"
         ) {
             return Err(ConfigError::Invalid(
-                "graph.backend must be native, sqlite or graphiti_compat".into(),
+                "graph.backend must be sqlite (native and graphiti_compat were removed in 1.5.0)"
+                    .into(),
             ));
         }
         // Deliberately NOT rejected here: `graph.backend: native` without the
@@ -1077,12 +1094,21 @@ mod tests {
         );
     }
 
-    /// An upgraded install has no `graph:` block. It must keep reading the Graphiti
-    /// index it already populated, not silently switch to the native path.
+    /// An install with no `graph:` block gets the SQLite graph. A config that still
+    /// says `native` or `graphiti_compat` loads (the migration tool needs it to) but
+    /// is reported as legacy.
     #[test]
-    fn a_missing_graph_block_stays_on_graphiti() {
+    fn a_missing_graph_block_is_sqlite_and_old_values_are_legacy() {
         let config: Config = serde_yaml::from_str("backend: ollama\n").unwrap();
-        assert_eq!(config.graph.backend, "graphiti_compat");
+        assert_eq!(config.graph.backend, "sqlite");
+        for old in ["native", "graphiti_compat"] {
+            let config: Config =
+                serde_yaml::from_str(&format!("backend: ollama\ngraph: {{backend: {old}}}\n"))
+                    .unwrap();
+            assert!(config.validate().is_ok(), "{old} must still load");
+            assert!(Graph::is_legacy(&config.graph.backend));
+        }
+        assert!(!Graph::is_legacy("sqlite"));
         assert!(config.local_enabled, "the master switch defaults on");
         assert!(config.recall.inject.enabled);
         assert_eq!(config.recall.inject.timeout_ms, 2500);

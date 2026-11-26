@@ -85,7 +85,7 @@ async fn main() {
             "tools/list" => ok(
                 id,
                 json!({"tools":[
-                    {"name":"memory_recall","description":"Primary memory recall. Uses the configured graph backend; Graphiti compatibility preserves Graphiti ordering exactly.","inputSchema":{"type":"object","properties":{"q":{"type":"string"},"slug":{"type":"string"},"k":{"type":"integer","minimum":1,"maximum":20}},"required":["q"]}},
+                    {"name":"memory_recall","description":"Primary memory recall: keyword index, vector search and the SQLite graph, fused.","inputSchema":{"type":"object","properties":{"q":{"type":"string"},"slug":{"type":"string"},"k":{"type":"integer","minimum":1,"maximum":20}},"required":["q"]}},
                     {"name":"memory_recall_hybrid","description":"Alias for memory_recall, retained for existing callers.","inputSchema":{"type":"object","properties":{"q":{"type":"string"},"slug":{"type":"string"},"k":{"type":"integer","minimum":1,"maximum":20}},"required":["q"]}}
                 ]}),
             ),

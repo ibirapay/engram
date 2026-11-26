@@ -22,7 +22,7 @@ struct Args {
     #[arg(long, default_value_t = 6)]
     k: usize,
     /// Run the prompt HOOK's recall (local keyword + vector + one fact query), not
-    /// the full Graphiti one. This is the only way to see what the hook will inject
+    /// the full one. This is the only way to see what the hook will inject
     /// for a prompt without sending the prompt.
     #[arg(long)]
     fast: bool,

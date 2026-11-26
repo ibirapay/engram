@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.5.0 — SQLite is the graph: Neo4j and Graphiti are gone from the Rust side
+
+**Breaking.** `graph.backend` is `sqlite` by default, and `native` (Rust writer into Neo4j)
+and `graphiti_compat` (the Python Graphiti graph) no longer run. A config that still says
+one of them LOADS, because `engram-graph-to-sqlite` has to read it to migrate; the graph leg
+of recall and the sync then stop with `graph.backend: <old value> was removed in 1.5.0.
+Copy the graph once with engram-graph-to-sqlite, then set graph.backend: sqlite`,
+and recall keeps answering from the keyword and vector legs meanwhile.
+
+- **Migrating an install that has the old graph:** run `engram-graph-to-sqlite` (read-only on
+  Neo4j; it fails unless memories, facts, embedded facts and triples all match), set
+  `graph.backend: sqlite`, and the Neo4j container can be stopped.
+- **Removed:** the Cypher for the native path (the Rust code is now ~2,000 lines smaller),
+  the Graphiti compatibility leg and its child process, the legacy import/bootstrap, and the
+  binaries `engram-graph-sync`, `engram-graph-recall-eval`, `engram-tenant-migrate` and
+  `engram-graph-facts`, which only served those. `engram-graph` keeps a read-only Neo4j
+  reader used by the one-time copy.
+- The Python Graphiti scripts under `graph/` and their tests are still in the tree; they are
+  inert on a `sqlite` install and go in the next release.
+
 ## 1.4.0 — the native graph can live in SQLite (opt-in: `graph.backend: sqlite`)
 
 `graph.backend: native` still needed Neo4j: the Rust code wrote the same Cypher into it. On the
