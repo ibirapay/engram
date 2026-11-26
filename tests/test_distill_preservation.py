@@ -167,8 +167,64 @@ def identifiers_fences_and_frontmatter():
     print("ok — identifiers by whole word, fenced commands, and the model's frontmatter does not count")
 
 
+def second_review_findings():
+    """Second independent review, 2026-11-26: a fenced command must survive MORE than one merge;
+    the source line of an identifier must not depend on line order; a hyphen continues a flag;
+    .md references are facts but memory file names are not; only OUR "(from x.md)" tags are
+    stripped from a carried line; fences are paired by state, not by regex."""
+    tmp = ROOT / "tests" / "_tmp_review2"; tmp.mkdir(exist_ok=True); mdv.MEM = tmp
+    LONG = "podman run -d --name electrs-liquid --network liquid-net -v electrs-db:/db " + "--opt-x " * 12
+    assert 160 < len(LONG) <= 200 and not mdv.looks_secret(LONG)
+    (tmp / "reference_a.md").write_text(
+        "---\nname: a\n---\nRebuild with:\n```bash\ncargo build --locked --release --features liquid\n"
+        + LONG + "\n```\nOther prose.\n")
+    (tmp / "reference_b.md").write_text("---\nname: b\n---\nPlain note.\n")
+    mdv.ollama_stream = lambda p, c: ("Umbrella.", "stop", 0.0)
+    sizes = []
+    for _ in range(3):   # the umbrella is merged again each time: the fence is gone after the first
+        final, rep = mdv.distill_cluster("reference", ["reference_a.md", "reference_b.md"])
+        (tmp / "reference_a.md").write_text("---\nname: a\n---\n" + final)
+        sizes.append(len(final))
+        assert "cargo build --locked --release --features liquid" in final and LONG.strip() in final, final
+        assert rep["final_fact_coverage"] == 1.0, rep
+    assert sizes[1] == sizes[2], f"the carried commands grow on every re-merge: {sizes}"
+
+    # line order: the gateway statement is found even when the longer identifier comes first
+    (tmp / "reference_a.md").write_text(
+        "---\nname: a\n---\nENGRAM_URL_FALLBACK points at the local daemon.\nSet ENGRAM_URL to the gateway.\n")
+    mdv.ollama_stream = lambda p, c: ("ENGRAM_URL_FALLBACK points at the local daemon.", "stop", 0.0)
+    final, _ = mdv.distill_cluster("reference", ["reference_a.md", "reference_b.md"])
+    assert "Set ENGRAM_URL to the gateway." in final, "the source line was picked by plain substring"
+    # a hyphen continues a flag: --keep-alive in the prose is not --keep
+    (tmp / "reference_a.md").write_text("---\nname: a\n---\nRetry with `--keep` when it stalls.\n")
+    mdv.ollama_stream = lambda p, c: ("use --keep-alive on slow links", "stop", 0.0)
+    final, _ = mdv.distill_cluster("reference", ["reference_a.md", "reference_b.md"])
+    assert "Retry with `--keep` when it stalls." in final, "--keep counted as present inside --keep-alive"
+
+    # .md references are facts; a memory file name (the model's subsection label) is not
+    toks = {d for d, _ in mdv.extract_facts("Approved in docs/LIQUID-SEND.md rev.12.\n### reference_c.md\n").values()}
+    assert "LIQUID-SEND.md" in toks and "reference_c.md" not in toks, toks
+    # only our tags leave a carried line: an attribution in the text stays
+    old = ("x\n\n## Reference facts (verbatim — auto-preserved from sources)\n### Hard facts\n"
+           "- Fee is 1% (from BlindPay) per fiat leg, port 3110. (from reference_a.md)\n")
+    assert mdv.prior_appendix_lines(old) == ["Fee is 1% (from BlindPay) per fiat leg, port 3110."], \
+        mdv.prior_appendix_lines(old)
+    # fences by state: unclosed adds nothing; a fenced markdown document is not code; a longer
+    # outer fence holds an inner one (the inner command is code, the fence markers are not)
+    assert mdv.fenced_lines("```bash\nrm -rf /tmp/x\nprose after an unclosed fence\n") == []
+    assert mdv.fenced_lines("```markdown\n---\nname: x\n---\nbody\n```\n") == []
+    assert mdv.fenced_lines("```md\n# Title\nsome template text\n```\n") == []           # by info string alone
+    assert mdv.fenced_lines("```\n---\nname: x\n---\n```\n") == []                       # by a leading --- alone
+    assert mdv.fenced_lines("````\n```bash\nmake release\n```\nafter inner\n````\n") == ["make release", "after inner"]
+    assert mdv.fenced_lines("```\ncode a\n~~~\ncode b\n```\n") == ["code a", "code b"]      # ~~~ does not close ```
+    assert mdv.fenced_lines("```\nx\n```bash\ny\n```\n") == ["x", "y"]                      # a closer has no info string
+    shutil.rmtree(tmp)
+    print("ok — fenced commands survive re-merges; identifiers by line and by hyphen; .md refs; tags; fences")
+
+
 if __name__ == "__main__":
     main()
     concrete_tokens()
     remerge_is_stable()
     identifiers_fences_and_frontmatter()
+    second_review_findings()

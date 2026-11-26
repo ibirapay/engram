@@ -251,15 +251,20 @@ def test_descriptions_with_a_colon_survive_every_document_builder():
 
 
 # ── the compress decision, through main() ──────────────────────────────────
-def _run_compress(report, autonomous=True, body_a="alpha holds one fact"):
-    """Drive main() through ONE compress merge, every outside dependency stubbed: the vector store
-    pairs two different notes, distill returns `report`, the reviewer approves. engram_secrets is
-    the real one (its regexes decide the credential and public-value holds)."""
+def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=None, cap=None):
+    """Drive main() through compress merges, every outside dependency stubbed: the vector store pairs
+    project_a/project_b (plus `more` pairs: {name: body}), distill returns `report`, the reviewer
+    approves. engram_secrets is the real one (its regexes decide the credential and value holds).
+    Returns the calls and everything main() printed."""
+    import contextlib, io
     d = Path(tempfile.mkdtemp())
     fm = "---\nname: {n}\ndescription: d\nmetadata:\n  type: project\n---\n\n{b}\n"
-    (d / "project_a.md").write_text(fm.format(n="project_a", b=body_a))
-    (d / "project_b.md").write_text(fm.format(n="project_b", b="beta holds another fact"))
-    calls = {"apply": 0, "verify": 0, "notify": [], "propose": []}
+    bodies = {"project_a.md": body_a, "project_b.md": "beta holds another fact", **(more or {})}
+    for f, b in bodies.items():
+        (d / f).write_text(fm.format(n=f[:-3], b=b))
+    names = sorted(bodies)
+    pairs = [(0.99, names[i], names[i + 1]) for i in range(0, len(names) - 1, 2)]
+    calls = {"apply": 0, "verify": 0, "distill": 0, "notify": [], "propose": []}
     gate = types.ModuleType("engram_telegram_gate")
     gate.validate_memory_doc = lambda doc: (True, "")
     gate.unwrap_code_fence = lambda text: text
@@ -268,18 +273,23 @@ def _run_compress(report, autonomous=True, body_a="alpha holds one fact"):
     gate.propose = lambda op, p, text, files=None, verdict=None: calls["propose"].append(text)
     store = types.ModuleType("vector_store")
     store.EngramVectorStore = lambda cfg: types.SimpleNamespace(
-        ensure_collection=lambda: None,
-        find_duplicates=lambda threshold, max_pairs: [(0.99, "project_a.md", "project_b.md")])
+        ensure_collection=lambda: None, find_duplicates=lambda threshold, max_pairs: pairs)
     mdv = types.ModuleType("memory_distill_verified")
-    mdv.distill_cluster = lambda key, files, cfg=None, preserve_sources=None: ("umbrella body\n", report)
-    mai = types.ModuleType("memory_ai")
-    mai.load = lambda: {"auto_curate": {"enabled": True, "autonomous": autonomous,
-                                        "review_gate": "self", "prune_orphans": False}}
+
+    def distill(key, files, cfg=None, preserve_sources=None):
+        calls["distill"] += 1
+        return "umbrella body\n", report
+    mdv.distill_cluster = distill
+    ac = {"enabled": True, "autonomous": autonomous, "review_gate": "self", "prune_orphans": False}
+    if cap:
+        ac["max_merges_per_run"] = cap
+    mai = types.ModuleType("memory_ai"); mai.load = lambda: {"auto_curate": ac}
     sec = _load("engram_secrets", ROOT / "bin" / "engram_secrets.py")
     stubs = {"vector_store": store, "qdrant_client": types.ModuleType("qdrant_client")}
     saved = {k: sys.modules.get(k) for k in stubs}
     sys.modules.update(stubs)
     argv, sys.argv = sys.argv, ["memory_auto_curate.py", "--apply"]
+    out = io.StringIO()
     try:
         m = _load("memory_auto_curate", ROOT / "bin" / "memory_auto_curate.py", memory_ai=mai,
                   engram_secrets=sec, memory_distill_verified=mdv, engram_telegram_gate=gate)
@@ -289,31 +299,41 @@ def _run_compress(report, autonomous=True, body_a="alpha holds one fact"):
             calls["verify"] += 1
             return "APPROVE"
         m._self_verdict = verify
-        m.main()
+        with contextlib.redirect_stdout(out):
+            m.main()
     finally:
         sys.argv = argv
         for k, v in saved.items():
             sys.modules.pop(k) if v is None else sys.modules.__setitem__(k, v)
         shutil.rmtree(d)
+    calls["out"] = out.getvalue()
     return calls
+
+
+BASE = {"hard_facts": 40, "final_fact_coverage": 1.0, "sentence_coverage": 0.0, "draft_chars": 1000,
+        "appendix_carried_chars": 0}
 
 
 def test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept():
     """Measured 2026-11-26: two merges applied as "near-lossless" with a prose score of 0.0 while
-    commands, flags and refs were gone. A merge whose appendix had to restate more than half the
-    umbrella must not apply on its own, and the notice must report the facts actually kept."""
-    base = {"hard_facts": 40, "final_fact_coverage": 1.0, "sentence_coverage": 0.0, "draft_chars": 1000}
-    calls = _run_compress({**base, "appendix_facts": 30, "appendix_chars": 650, "appendix_fresh_chars": 600})
+    commands, flags and refs were gone. A merge whose rewrite left more than half the umbrella to
+    the appendix must not apply on its own, and the notice must report the facts actually kept."""
+    bloated = {**BASE, "appendix_facts": 30, "appendix_chars": 650, "appendix_fresh_chars": 600}
+    calls = _run_compress(bloated)
     assert calls["apply"] == 0 and not calls["propose"], f"bloated merge applied or queued: {calls}"
     assert calls["verify"] == 0, "a merge that cannot apply still paid for a review call"
-    calls = _run_compress({**base, "appendix_facts": 30, "appendix_chars": 650, "appendix_fresh_chars": 600},
-                          autonomous=False)
+    calls = _run_compress(bloated, autonomous=False)
     assert calls["apply"] == 0 and len(calls["propose"]) == 1 and "restated 60%" in calls["propose"][0], calls
-    # lines carried from an earlier merge's appendix (never shown to the model) do not count:
-    # otherwise a merged umbrella with a big appendix could never be merged again
-    calls = _run_compress({**base, "appendix_facts": 30, "appendix_chars": 900, "appendix_fresh_chars": 50})
+    # lines carried from an earlier merge's appendix (never shown to the model) are out of BOTH sides
+    # of the share: in the numerator they would block re-merging a merged umbrella forever...
+    calls = _run_compress({**BASE, "appendix_facts": 30, "appendix_chars": 900,
+                           "appendix_fresh_chars": 50, "appendix_carried_chars": 800})
     assert calls["apply"] == 1, f"carried-over appendix lines blocked the merge: {calls}"
-    calls = _run_compress({**base, "appendix_facts": 3, "appendix_chars": 150, "appendix_fresh_chars": 100})
+    # ...and in the denominator they dilute a real loss: 150 fresh of the 200 not carried is 75%
+    calls = _run_compress({**BASE, "appendix_facts": 30, "appendix_chars": 980,
+                           "appendix_fresh_chars": 150, "appendix_carried_chars": 800})
+    assert calls["apply"] == 0, f"carried lines diluted a bloated rewrite into applying: {calls}"
+    calls = _run_compress({**BASE, "appendix_facts": 3, "appendix_chars": 150, "appendix_fresh_chars": 100})
     assert calls["apply"] == 1 and calls["verify"] == 1, calls
     note = calls["notify"][0]
     assert "near-lossless" not in note and "40/40 concrete facts kept, 3 only in the appendix (10%" in note, note
@@ -323,18 +343,36 @@ def test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept():
 def test_a_merge_that_would_mask_a_txid_or_address_is_held():
     """The distiller masks every long hex/base64 run before the model sees it, so a txid, an
     address or a full hash in a source can never reach the umbrella. Such a merge is held in every
-    mode (no apply, no queue, no review call); a session id in the frontmatter does not count."""
-    report = {"hard_facts": 1, "final_fact_coverage": 1.0, "sentence_coverage": 0.0, "draft_chars": 1000,
-              "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0}
+    mode, judged from the sources (no distill, no review, no slot); a session id does not count."""
+    report = {**BASE, "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0}
     txid = "9f2c" * 16
     for autonomous in (True, False):
         calls = _run_compress(report, autonomous, body_a=f"refund sent, txid {txid}")
-        assert calls == {"apply": 0, "verify": 0, "notify": [], "propose": []}, (autonomous, calls)
+        assert (calls["apply"], calls["verify"], calls["distill"], calls["propose"]) == (0, 0, 0, []), calls
+        assert txid not in calls["out"], "the held value was printed"
     calls = _run_compress(report, body_a="refund sent to 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed")
-    assert calls["apply"] == 0 and calls["verify"] == 0, f"merge masking an address went ahead: {calls}"
+    assert calls["apply"] == 0 and calls["distill"] == 0, f"merge masking an address went ahead: {calls}"
     calls = _run_compress(report, body_a="originSessionId: 5f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b\nplain fact")
     assert calls["apply"] == 1, f"a session id held the merge: {calls}"
-    print("ok — a merge that would mask a txid or an address is held; a session id is not a value")
+    # a held cluster takes no slot: with a cap of 1, the clean cluster after it still merges
+    calls = _run_compress(report, body_a=f"txid {txid}", cap=1,
+                          more={"project_c.md": "gamma fact", "project_d.md": "delta fact"})
+    assert calls["distill"] == 1 and calls["apply"] == 1, f"a held cluster used up the cap: {calls}"
+    # and the cap still bounds real attempts: two clean clusters, cap 1, one distill
+    calls = _run_compress(report, cap=1, more={"project_c.md": "gamma fact", "project_d.md": "delta fact"})
+    assert calls["distill"] == 1 and calls["apply"] == 1, f"the cap no longer bounds merge attempts: {calls}"
+    print("ok — a merge that would mask a txid or an address is held before distill; a session id is not a value")
+
+
+def test_a_credential_hold_never_prints_the_credential():
+    """The credential HOLD printed the first 50 chars of each credential, i.e. the whole of a GitHub
+    or AWS token, into the daemon log (and the transcript when the memory-tidy skill runs curate)."""
+    token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" * 2
+    calls = _run_compress({**BASE, "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0},
+                          body_a=f"deploy key GITHUB_TOKEN={token}")
+    assert calls["apply"] == 0 and calls["distill"] == 0, calls
+    assert "HOLD" in calls["out"] and token[:12] not in calls["out"], calls["out"]
+    print("ok — a credential hold reports a count, never the value")
 
 
 if __name__ == "__main__":
@@ -349,3 +387,4 @@ if __name__ == "__main__":
     test_descriptions_with_a_colon_survive_every_document_builder()
     test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept()
     test_a_merge_that_would_mask_a_txid_or_address_is_held()
+    test_a_credential_hold_never_prints_the_credential()

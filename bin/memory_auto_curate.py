@@ -17,7 +17,8 @@ call is delegated to a model. Two different operations come out of that:
                  review/human gate plus REVERSIBILITY, not from the score.
   * RECOVERABLE — absorbed sources go to .quarantine/ (undo) and are de-indexed via
                  delete_memory.sh, which snapshots to .trash/ (90-day undo) first.
-  * BOUNDED    — at most `max_merges_per_run` clusters per run.
+  * BOUNDED    — at most `max_merges_per_run` merge attempts per run (a cluster held from its
+                 sources alone does not count).
 Everything a model can't make safe (pruning distinct memories, deleting suspects)
 stays in the human-gated /memory-curate. This never deletes a memory that isn't
 absorbed into an umbrella first.
@@ -343,15 +344,20 @@ def main():
             typed.append(sorted(files))
         else:
             print(f"[auto-curate] skip mixed-type cluster {files}")
-    typed = typed[:ac["max_merges_per_run"]]
 
     gate_mode = _resolve_gate(ac)     # "self" or "human"
     print(f"# memory_auto_curate — apply={apply} enabled={ac['enabled']} "
           f"threshold={ac['merge_threshold']} cap={ac['max_merges_per_run']} review_gate={gate_mode}")
-    print(f"near-dup clusters this run: {len(typed)}")
+    print(f"near-dup clusters this run: {len(typed)} (cap {ac['max_merges_per_run']} merge attempts)")
     import engram_telegram_gate as gate
-    done = queued = 0
+    done = queued = attempted = 0
     for files in typed:
+        # The cap counts clusters that cost a merge attempt. A cluster held from its sources alone
+        # (credential or public value, below) costs nothing and must not take a slot: those holds
+        # never clear, and in filename order two of them used to stall every compress merge.
+        if attempted >= ac["max_merges_per_run"]:
+            print(f"[auto-curate] cap of {ac['max_merges_per_run']} merge attempt(s) reached")
+            break
         paths = [MEM / f for f in files]
         # Snapshot BEFORE any analysis. Hashing after the containment test (or after a
         # minutes-long distillation) would record whatever a concurrent writer had just
@@ -366,6 +372,7 @@ def main():
         # each other), and lands in the human queue for no reason.
         keeper = _supersede_keeper(files)
         if keeper:
+            attempted += 1
             absorbed = [f for f in files if f != keeper]
             content = (MEM / keeper).read_text(errors="ignore")
             kname, kdesc, _kt = _fm(MEM / keeper)
@@ -400,19 +407,6 @@ def main():
             continue
         umbrella = max(paths, key=lambda p: _score(p, scores))   # keep the highest-trust member's name
         name, desc, typ = _fm(umbrella)
-        # COMPRESS for real (no preserve_sources) — the umbrella is a tight consolidation.
-        # Losslessness is provided by REVERSIBILITY (sources -> quarantine), not by
-        # appending everything. sentence_coverage is recorded, not gated.
-        final, report = mdv.distill_cluster(umbrella.stem, files, cfg=cfg, preserve_sources=False)
-        ratio = report.get("appendix_fresh_chars", 0) / max(1, report.get("draft_chars") or 0)
-        bloated = ratio > float(ac["max_appendix_ratio"])
-        body = _body_of(final)
-        if not body.strip():
-            print(f"· {files}: HOLD (empty umbrella) — skipping"); continue
-        doc = _umbrella_doc(umbrella.stem, desc, typ, body)
-        okdoc, whydoc = gate.validate_memory_doc(doc)
-        if not okdoc:
-            print(f"· {files}: HOLD (malformed umbrella: {whydoc}) — skipping"); continue
         # Credential RECONCILIATION (replaces the blanket secret-HOLD, 2026-11-12):
         # every REMOTE hop (distill prompt, review blob) already redacts AGGRESSIVELY,
         # so a credential in the cluster is not a leak risk — the real risk is the
@@ -421,21 +415,36 @@ def main():
         # verbatim in the final doc. Only CREDENTIAL_RE (high-precision) counts —
         # txids/EVM-addresses/UUIDs are public data the aggressive scanner used to
         # block on, which is why secret-bearing clusters never consolidated.
-        missing = sorted({c for f in files
-                          for c in engram_secrets.credentials((MEM / f).read_text(errors="ignore"))
-                          if c not in doc})
-        if missing:
-            print(f"· {files}: HOLD (umbrella drops {len(missing)} credential(s): "
-                  f"{[c[:50] for c in missing[:3]]}) — skipping"); continue
         # The same for PUBLIC values (2026-11-26): the distiller masks every long hex/base64 run
         # before the model sees it, so a txid, an address or a full hash in a source can never
-        # reach the umbrella. ~65 of the author's money memories hold one. Hold the merge rather
-        # than write the umbrella without them. Counted, never printed.
-        masked = sum(1 for f in files for v in _public_values((MEM / f).read_text(errors="ignore"))
-                     if v not in doc)
+        # reach the umbrella; ~65 of the author's money memories hold one.
+        # The umbrella BODY is always redacted, so only its description (kept verbatim) can carry
+        # either: both are judged from the sources here, before a distill call is spent.
+        # Counted, never printed (the credential HOLD used to print the first 50 chars of each).
+        srcs = [(MEM / f).read_text(errors="ignore") for f in files]
+        creds = {c for t in srcs for c in engram_secrets.credentials(t) if c not in (desc or "")}
+        if creds:
+            print(f"· {files}: HOLD (umbrella would drop {len(creds)} credential(s)) — skipping"); continue
+        masked = {v for t in srcs for v in _public_values(t) if v not in (desc or "")}
         if masked:
-            print(f"· {files}: HOLD (umbrella would mask {masked} public value(s) the sources hold: "
+            print(f"· {files}: HOLD (umbrella would mask {len(masked)} public value(s) the sources hold: "
                   f"txid, address or full hash) — skipping"); continue
+        attempted += 1
+        # COMPRESS for real (no preserve_sources) — the umbrella is a tight consolidation.
+        # Losslessness is provided by REVERSIBILITY (sources -> quarantine), not by
+        # appending everything. sentence_coverage is recorded, not gated.
+        final, report = mdv.distill_cluster(umbrella.stem, files, cfg=cfg, preserve_sources=False)
+        # share of the doc THIS rewrite left to the appendix; carried lines are out of both sides
+        ratio = report.get("appendix_fresh_chars", 0) / max(
+            1, (report.get("draft_chars") or 0) - report.get("appendix_carried_chars", 0))
+        bloated = ratio > float(ac["max_appendix_ratio"])
+        body = _body_of(final)
+        if not body.strip():
+            print(f"· {files}: HOLD (empty umbrella) — skipping"); continue
+        doc = _umbrella_doc(umbrella.stem, desc, typ, body)
+        okdoc, whydoc = gate.validate_memory_doc(doc)
+        if not okdoc:
+            print(f"· {files}: HOLD (malformed umbrella: {whydoc}) — skipping"); continue
         absorbed = [f for f in files if f != umbrella.name]
         # transaction id so a second merge on the same umbrella can't clobber the
         # first merge's backup (each merge's originals live under their own dir)

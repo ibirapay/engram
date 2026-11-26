@@ -54,7 +54,7 @@ FACT_PATTERNS = [
     # short hex ref (git sha, image digest prefix): needs a letter AND a digit, not part of a
     # hyphenated id (UUID). 32+ hex never gets here: engram_secrets masks it first.
     (r"(?<![\w-])(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,31}(?![\w-])", "hash"),
-    (r"\b[\w\-]+\.(?:py|ts|tsx|js|jsx|mjs|rs|go|sql|toml|yaml|yml|json|env|sh|service|timer|conf|dart)\b", "file"),
+    (r"\b[\w\-]+\.(?:py|ts|tsx|js|jsx|mjs|rs|go|sql|toml|yaml|yml|json|env|sh|service|timer|conf|md|dart)\b", "file"),
     # decimals ONLY when carrying a unit/threshold meaning (sats, BTC, version,
     # =0.01, x.y.z handled by ip). bare balances/amounts like 282.63 are NOT durable.
     (r"\b\d+\.\d+\s*(?:BTC|L-BTC|sats?|USDt?|USDC)\b", "amount"),
@@ -66,9 +66,12 @@ FACT_PATTERNS = [
 ]
 # Kinds whose token IS the fact: a flag, a ref or an identifier is only conveyed by the exact
 # string, as a whole word ("--keep" is not "keep" in the prose, ENGRAM_URL is not ENGRAM_URL_FALLBACK).
-VERBATIM_KINDS = {"code", "hash", "env"}
+VERBATIM_KINDS = {"code", "hash", "env", "carried"}
 FACT_STOP = {"0.0", "1.0", "2.0", "3.0"}
-FENCE_BLOCK_RE = re.compile(r"^[ \t]*```[^\n]*\n(.*?)^[ \t]*```", re.M | re.S)
+# A memory file's own name is not a fact about the world: the model labels the umbrella's subsections
+# with the source file names, and those files are quarantined after the merge.
+MEMORY_FILE_RE = re.compile(r"^(?:user|feedback|project|reference)[_-][\w.-]*\.md$", re.I)
+FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
 # The model's own frontmatter: curate keeps only the body (it writes the umbrella's own name and
 # description), so a token the model put there is not kept and must not count as present.
 LEAD_FRONTMATTER_RE = re.compile(r"\A\s*(?:```[\w-]*[ \t]*\n)?---[ \t]*\n.*?\n---[ \t]*\n", re.S)
@@ -103,7 +106,7 @@ def strip_prior_appendix(text: str) -> str:
 # An earlier appendix's scaffolding (headers, notes, <details> wrappers) and the source tag each
 # entry carries: "(from x.md)", "(path, from x.md)", and the " — " that used to follow it.
 _APPX_SCAFFOLD_RE = re.compile(r"^(?:#+\s|_Hard facts/caveats|_Full sources kept|</?details)")
-_APPX_TAG_RE = re.compile(r"\s*\((?:\w+, )?from [^()\s]+\)(?:\s*—)?")
+_APPX_TAG_RE = re.compile(r"\s*\((?:\w+, )?from (?:[\w.\-]+\.md|\?)\)(?:\s*—|\s*$)")
 
 def prior_appendix_lines(text: str) -> list:
     """The entries of an earlier merge's appendix as plain lines: no bullet, no source tag, no
@@ -127,7 +130,7 @@ def fact_present(disp: str, kind: str, hay: str, hay_norm: str) -> bool:
     prose already stated — the accretion this dedup fixes."""
     d = disp.lower()
     if kind in VERBATIM_KINDS:
-        return re.search(rf"(?<!\w){re.escape(d)}(?!\w)", hay) is not None
+        return _has(disp, kind, hay)
     if d in hay:
         return True
     if kind == "port":
@@ -135,6 +138,32 @@ def fact_present(disp: str, kind: str, hay: str, hay_norm: str) -> bool:
         return bool(num) and re.search(rf"(?<!\d){num}(?!\d)", hay) is not None
     dn = re.sub(r"[^a-z0-9]", "", d)        # separator-insensitive (paths/files)
     return len(dn) >= 4 and dn in hay_norm
+
+def fenced_lines(text: str) -> list:
+    """Lines inside fenced code blocks. A closer uses the opener's character, at least as long, with
+    no info string; an unclosed fence contributes nothing; a block that wraps a markdown document
+    (info string markdown/md, or a first line of ---) is not code."""
+    out, fence, info, block = [], None, "", []
+    for ln in (text or "").splitlines():
+        m = FENCE_RE.match(ln)
+        if fence is None:
+            if m:
+                fence, info, block = m.group(1), m.group(2).strip().lower(), []
+        elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
+            if info not in ("markdown", "md") and not (block and block[0].strip() == "---"):
+                out += [b for b in block if not FENCE_RE.match(b)]
+            fence = None
+        else:
+            block.append(ln)
+    return out
+
+def _has(disp: str, kind: str, hay: str) -> bool:
+    """`disp` occurs in the lowercased `hay`. A verbatim kind only as a whole token: a letter, digit,
+    _ or - on either side means a longer identifier or flag (ENGRAM_URL_FALLBACK, --keep-alive)."""
+    d = disp.lower()
+    if kind in VERBATIM_KINDS:
+        return re.search(rf"(?<![\w-]){re.escape(d)}(?![\w-])", hay) is not None
+    return d in hay
 
 def extract_facts(text: str):
     seen = {}
@@ -149,6 +178,8 @@ def extract_facts(text: str):
             # a masked secret is not a fact: never list the placeholder as something to keep
             if len(norm) < 3 or norm in FACT_STOP or "«redacted" in norm:
                 continue
+            if kind == "file" and MEMORY_FILE_RE.match(tok):
+                continue
             # find the line for a secrecy check so we never appendix a secret.
             # Any fact whose source line looks like a secret is dropped (not just
             # commit hashes) — a port/path/env sharing a line with a credential
@@ -159,11 +190,10 @@ def extract_facts(text: str):
             seen.setdefault(norm, (tok, kind))
     # A fenced block is code line by line: that is where commands live, and none of the patterns
     # above sees a command with no path, env var or file in it.
-    for block in FENCE_BLOCK_RE.finditer(text):
-        for ln in block.group(1).splitlines():
-            tok = ln.strip(); norm = tok.lower()
-            if 3 <= len(tok) <= 200 and "«redacted" not in norm and not looks_secret(tok):
-                seen.setdefault(norm, (tok, "code"))
+    for ln in fenced_lines(text):
+        tok = ln.strip(); norm = tok.lower()
+        if 3 <= len(tok) <= 200 and "«redacted" not in norm and not looks_secret(tok):
+            seen.setdefault(norm, (tok, "code"))
     return seen
 
 CAVEAT_TRIGGER = re.compile(r"(?i)\b(do not|don'?t|never|must not|not viable|banned|do NOT)\b")
@@ -278,11 +308,18 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
         carried.update((f, ln) for ln in prior)
         carried_cav.update((c, f) for c in caveats("\n\n".join(prior)))
         keep = prose + "\n\n" + "\n\n".join(prior)
+        # Each carried line is itself a verbatim fact: the rule that found its tokens the first
+        # time (a fence, backticks) is gone once it was restated, and the model never sees it.
+        # Its own tokens fold into it below (same source line). Caveat lines stay caveats.
+        for ln in prior:
+            if not CAVEAT_TRIGGER.search(ln):
+                facts.setdefault(ln.lower(), (ln, "carried"))
+                fact_src.setdefault(ln.lower(), (f, ln))
         for norm, (disp, kind) in extract_facts(keep).items():
             facts.setdefault(norm, (disp, kind))
             if norm not in fact_src:
                 for ln in keep.splitlines():
-                    if disp.lower() in ln.lower():
+                    if _has(disp, kind, ln.lower()):
                         fact_src[norm] = (f, ln.strip()); break
         all_caveats += [(c, f) for c in caveats(keep)]
     if verbose:
@@ -322,7 +359,7 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
         hard, restated = [], []                 # (entry, carried?); (file, line) each once
         for n in sorted(missing, key=lambda n: facts[n][1]):
             disp, kind = facts[n]; src = fact_src.get(n, ("?", ""))
-            if src[1] and len(src[1]) <= 160 and not looks_secret(src[1]):
+            if kind == "carried" or (src[1] and len(src[1]) <= 160 and not looks_secret(src[1])):
                 if src not in restated:
                     restated.append(src)
             else:
