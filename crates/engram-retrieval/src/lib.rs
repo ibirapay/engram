@@ -230,26 +230,50 @@ fn tokenize(text: &str) -> Vec<String> {
 /// they fold to "no"/"nos", so the accented FUNCTION words ("não", "são"…)
 /// are listed explicitly instead of relying on the fold. Both unaccented and
 /// accented shapes are listed: people type prompts without accents.
+#[rustfmt::skip]
 const STOPWORDS: &[&str] = &[
-    // pt-BR
+    // pt-BR.
     "a", "o", "e", "de", "da", "do", "dos", "das", "em", "no", "na", "nos", "nas", "ao", "aos",
     "um", "uma", "uns", "umas", "por", "para", "com", "sem", "que", "quem", "qual", "quais",
     "como", "mas", "se", "meu", "minha", "meus", "minhas", "teu", "tua", "seu", "sua", "seus",
     "suas", "nosso", "nossa", "dele", "dela", "deles", "delas", "ele", "ela", "eles", "elas",
     "voce", "você", "ti", "lhe", "lhes", "foi", "ser", "sao", "esta", "este", "essa", "esse",
     "isso", "isto", "estao", "estão", "está", "tava", "muito", "pouco", "tambem", "também",
-    "ainda", "nao", "não", "sim", "quando", "onde", "sobre", "sob", "ate", "até", "pois", "porque",
-    "são", "quanto", "quanta", "quantos", "quantas", "eu", "pra", "pro", "pelo", "pela", "pelos",
-    "pelas", "num", "dum",
-    // One-character function words that arrive ACCENTED: the length filter counts
-    // chars now (it counted bytes), and these fold to "e"/"a"/"ja"/"ha" — so they
-    // are listed in their real shape, per the contract above. "já"/"há" are plain
-    // function words in this store's prompts ("o que já temos pronto").
-    "é", "à", "às", "há", "já", "ja", "ha", // en
+    "ainda", "nao", "não", "sim", "quando", "onde", "sobre", "sob", "ate", "até", "pois",
+    "porque", "são", "quanto", "quanta", "quantos", "quantas", "eu", "pra", "pro", "pelo",
+    "pela", "pelos", "pelas", "num", "dum",
+    // pt-BR, second rank — added 2026-11-24 after measuring a real false injection: the
+    // operator's prompt about store languages injected a memory about his mother and one about
+    // tailscale/ufw, and the tailscale memory matched ONLY these words — as, ou, entao, seja,
+    // todas. Grammar is not a topic. Then the auxiliaries and modals: a verb in a prompt says
+    // what the user wants done, never what the memory is about. "caso" is deliberately absent
+    // — it is also a noun, and it was not needed once its neighbours left.
+    "as", "os", "todo", "toda", "todos", "todas", "tudo", "cada", "algum", "alguma",
+    "ou", "entao", "então", "assim",
+    "seja", "sejam", "estava", "estavam", "ter", "tem", "temos", "tinham", "deve", "devem",
+    "dever", "deveria", "preciso", "precisa", "precisamos", "posso", "pode", "podem",
+    "poderia", "quer", "quero", "queria", "gostaria", "usa", "usam", "usar", "faz", "faco",
+    "faço", "fazer", "conter", "contem", "contém", "aplica", "aplicam", "aplicar",
+    // One-character function words that arrive ACCENTED: the length filter counts chars (it
+    // counted bytes until PR #50), and these fold to "e"/"a"/"ja"/"ha" — so they are listed in
+    // their real shape, per the contract above. "já"/"há" are plain function words in this
+    // store's prompts ("o que já temos pronto"). The rest are the ACCENTED TWINS of forms the
+    // lists above already carry: the stopword test runs on the pre-fold word, so "nós" does not
+    // match the "nos" entry and "só" does not match the "so" entry — unlisted, each one folds
+    // into a term that the unaccented shape would have dropped, and a word no prompt is about
+    // gets a full idf vote.
+    "é", "à", "às", "há", "já", "ja", "ha", "só", "nós", "têm", "dá",
+    // en.
     "the", "an", "of", "to", "in", "on", "for", "with", "without", "that", "this", "these",
     "those", "it", "its", "is", "are", "was", "were", "been", "being", "have", "has", "had",
-    "does", "did", "what", "which", "how", "why", "all", "any", "some", "not", "and", "or", "but",
-    "then", "than", "can", "will", "should", "would", "could",
+    "does", "did", "what", "which", "how", "why", "all", "any", "some", "not", "and", "or",
+    "but", "then", "than", "can", "will", "should", "would", "could",
+    // en, second rank: pronouns, copulas, modals. Measured the same way — an English prompt's
+    // surviving terms included we, much, want, my, about.
+    "we", "you", "your", "yours", "my", "mine", "our", "ours", "their", "they", "them",
+    "him", "his", "her", "hers", "us", "me", "be", "am", "if", "so", "about", "into",
+    "from", "at", "there", "here", "just", "much", "want", "wants", "need", "needs",
+    "already", "cannot", "cant", "dont", "wont",
 ];
 
 pub fn is_stopword(word: &str) -> bool {
@@ -479,5 +503,26 @@ mod tests {
             },
         ];
         assert_eq!(bm25(&memories, "stratum proxy", 2)[0].file, "titled.md");
+    }
+
+    #[test]
+    fn swallows_second_rank_function_words() {
+        // Measured 2026-11-24 on the live store: a prompt about store languages
+        // injected a tailscale/ufw memory that matched ONLY these words. Grammar is
+        // not a topic, and a word that appears in almost every prompt is the least
+        // informative thing a document can share with a query.
+        let grammar = "as os ou entao então assim todas todos tudo cada seja tem temos deve \
+                       devem precisa queria usam fazer muito much about their you your already \
+                       só nós têm dá";
+        for word in grammar.split_whitespace() {
+            assert!(is_stopword(word), "{word} must be a function word");
+        }
+        // Never a topic word — including `mae`, the high-idf word (4 of 1133 memories)
+        // that pulled a memory about the owner's mother into a systems prompt, and
+        // `caso`, deliberately left out because it is also a noun.
+        let content = "mae mãe caso engram energia robosats vaultwarden espanhol lingua fatura";
+        for word in content.split_whitespace() {
+            assert!(!is_stopword(word), "{word} is content");
+        }
     }
 }
