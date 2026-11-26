@@ -78,6 +78,10 @@ AC_DEFAULTS = {
     # Non-automatic self-review mode: auto-apply only a near-LOSSLESS merge (a fact
     # outside the reviewer's truncated slice could be dropped otherwise); lossy -> queue.
     "min_auto_coverage": 0.90,
+    # A merge whose restated-facts appendix is more than this share of the umbrella did not
+    # compress: the rewrite dropped that many concrete tokens, and the prose around them with it.
+    # It never applies on its own: autonomous runs skip it, the others queue it with the reason.
+    "max_appendix_ratio": 0.5,
 }
 
 
@@ -386,6 +390,8 @@ def main():
         # Losslessness is provided by REVERSIBILITY (sources -> quarantine), not by
         # appending everything. sentence_coverage is recorded, not gated.
         final, report = mdv.distill_cluster(umbrella.stem, files, cfg=cfg, preserve_sources=False)
+        ratio = report.get("appendix_chars", 0) / max(1, report.get("draft_chars") or 0)
+        bloated = ratio > float(ac["max_appendix_ratio"])
         body = _body_of(final)
         if not body.strip():
             print(f"· {files}: HOLD (empty umbrella) — skipping"); continue
@@ -415,12 +421,21 @@ def main():
                                + json.dumps(sha0, sort_keys=True)).encode()).hexdigest()[:10]
         params = {"umbrella": umbrella.name, "umbrella_content": doc, "desc": desc,
                   "absorbed": absorbed, "merge_id": merge_id, "src_sha": sha0}
-        preview = (f"Merge {len(files)} near-dups → {umbrella.name} (compressed "
-                   f"{report.get('draft_chars')} chars, prose-cov {report.get('sentence_coverage')}). "
-                   f"Absorbed→quarantine: {', '.join(absorbed)}")
+        # Say what the merge actually kept. "near-lossless" used to sit next to a prose coverage of
+        # 0.0: that number is the share of source sentences copied word for word, so any rewrite
+        # scores ~0 and it said nothing about what survived.
+        facts = report.get("hard_facts", 0)
+        kept = round(report.get("final_fact_coverage", 0.0) * facts)
+        summary = (f"{kept}/{facts} concrete facts kept, {report.get('appendix_facts', 0)} only in "
+                   f"the appendix ({ratio:.0%} of the doc); prose rewritten")
+        preview = (f"Merge {len(files)} near-dups → {umbrella.name} ({report.get('draft_chars')} chars; "
+                   f"{summary}). Absorbed→quarantine: {', '.join(absorbed)}")
         print(f"\n· {files} -> {umbrella.name}")
         if not apply:
-            print(f"  would: {preview}"); continue
+            print(f"  would: {preview}")
+            if bloated:
+                print(f"  (would not apply on its own: appendix over {ac['max_appendix_ratio']:.0%})")
+            continue
         cov = report.get("sentence_coverage", 0.0)
         # HUMAN gate (no model review): every merge goes to the Telegram approval queue.
         if gate_mode == "human":
@@ -435,19 +450,23 @@ def main():
         # computed on the FULL sources, never on the reviewer's truncated slice.
         # autonomous mode widens this: an APPROVE alone is enough (reversibility,
         # not coverage, is the safety), everything else is SKIPPED below.
-        verdict = _self_verdict(doc, files)
+        # A bloated merge cannot apply whatever the reviewer says, so it does not cost a review call.
+        verdict = "BLOATED" if bloated else _self_verdict(doc, files)
         if verdict == "APPROVE" and (ac.get("autonomous") or cov >= ac["min_auto_coverage"]):
             ok, detail = gate._apply_merge(params)
             # Report the ACTUAL outcome — this used to print AUTO-APPLIED before
             # checking ok, so a refused or partial merge still read as success.
-            print(f"  {'AUTO-APPLIED' if ok else 'FAILED'} (cov={cov}; {detail})")
+            print(f"  {'AUTO-APPLIED' if ok else 'FAILED'} ({summary}; {detail})")
             if ok:
                 gate.notify_undo("merge_undo",
                                  {"umbrella": umbrella.name, "absorbed": absorbed, "merge_id": merge_id},
-                                 f"🧠 auto-merged (near-lossless): {preview}\nTap UNDO to reverse.")
+                                 f"🧠 auto-merged: {preview}\nTap UNDO to reverse.")
                 done += 1
         else:
-            if verdict != "APPROVE":                    # name the REAL reason — cov may be fine
+            if verdict == "BLOATED":
+                why = (f"appendix is {ratio:.0%} of the umbrella, over {ac['max_appendix_ratio']:.0%}: "
+                       f"the rewrite dropped too many concrete facts")
+            elif verdict != "APPROVE":                  # name the REAL reason — cov may be fine
                 why = f"self-review {verdict}"
             else:
                 why = f"lossy compression (cov={cov} < {ac['min_auto_coverage']})"

@@ -250,6 +250,71 @@ def test_descriptions_with_a_colon_survive_every_document_builder():
     print("ok — a colon in the description round-trips through curate, harvest and graduation")
 
 
+# ── the compress decision, through main() ──────────────────────────────────
+def _run_compress(report, autonomous=True):
+    """Drive main() through ONE compress merge, every outside dependency stubbed: the vector store
+    pairs two different notes, distill returns `report`, the reviewer approves."""
+    d = Path(tempfile.mkdtemp())
+    fm = "---\nname: {n}\ndescription: d\nmetadata:\n  type: project\n---\n\n{b}\n"
+    (d / "project_a.md").write_text(fm.format(n="project_a", b="alpha holds one fact"))
+    (d / "project_b.md").write_text(fm.format(n="project_b", b="beta holds another fact"))
+    calls = {"apply": 0, "verify": 0, "notify": [], "propose": []}
+    gate = types.ModuleType("engram_telegram_gate")
+    gate.validate_memory_doc = lambda doc: (True, "")
+    gate.unwrap_code_fence = lambda text: text
+    gate._apply_merge = lambda p: (calls.__setitem__("apply", calls["apply"] + 1), (True, "ok"))[1]
+    gate.notify_undo = lambda op, p, text: calls["notify"].append(text)
+    gate.propose = lambda op, p, text, files=None, verdict=None: calls["propose"].append(text)
+    store = types.ModuleType("vector_store")
+    store.EngramVectorStore = lambda cfg: types.SimpleNamespace(
+        ensure_collection=lambda: None,
+        find_duplicates=lambda threshold, max_pairs: [(0.99, "project_a.md", "project_b.md")])
+    mdv = types.ModuleType("memory_distill_verified")
+    mdv.distill_cluster = lambda key, files, cfg=None, preserve_sources=None: ("umbrella body\n", report)
+    mai = types.ModuleType("memory_ai")
+    mai.load = lambda: {"auto_curate": {"enabled": True, "autonomous": autonomous,
+                                        "review_gate": "self", "prune_orphans": False}}
+    sec = types.ModuleType("engram_secrets")
+    sec.credentials = lambda t: []; sec.redact = lambda t: (t, 0); sec.looks_secret = lambda t: False
+    stubs = {"vector_store": store, "qdrant_client": types.ModuleType("qdrant_client")}
+    saved = {k: sys.modules.get(k) for k in stubs}
+    sys.modules.update(stubs)
+    argv, sys.argv = sys.argv, ["memory_auto_curate.py", "--apply"]
+    try:
+        m = _load("memory_auto_curate", ROOT / "bin" / "memory_auto_curate.py", memory_ai=mai,
+                  engram_secrets=sec, memory_distill_verified=mdv, engram_telegram_gate=gate)
+        m.MEM = d
+
+        def verify(doc, files):
+            calls["verify"] += 1
+            return "APPROVE"
+        m._self_verdict = verify
+        m.main()
+    finally:
+        sys.argv = argv
+        for k, v in saved.items():
+            sys.modules.pop(k) if v is None else sys.modules.__setitem__(k, v)
+        shutil.rmtree(d)
+    return calls
+
+
+def test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept():
+    """Measured 2026-11-26: two merges applied as "near-lossless" with a prose score of 0.0 while
+    commands, flags and refs were gone. A merge whose appendix had to restate more than half the
+    umbrella must not apply on its own, and the notice must report the facts actually kept."""
+    base = {"hard_facts": 40, "final_fact_coverage": 1.0, "sentence_coverage": 0.0, "draft_chars": 1000}
+    calls = _run_compress({**base, "appendix_facts": 30, "appendix_chars": 600})
+    assert calls["apply"] == 0 and not calls["propose"], f"bloated merge applied or queued: {calls}"
+    assert calls["verify"] == 0, "a merge that cannot apply still paid for a review call"
+    calls = _run_compress({**base, "appendix_facts": 30, "appendix_chars": 600}, autonomous=False)
+    assert calls["apply"] == 0 and len(calls["propose"]) == 1 and "appendix is 60%" in calls["propose"][0], calls
+    calls = _run_compress({**base, "appendix_facts": 3, "appendix_chars": 100})
+    assert calls["apply"] == 1 and calls["verify"] == 1, calls
+    note = calls["notify"][0]
+    assert "near-lossless" not in note and "40/40 concrete facts kept, 3 only in the appendix (10%" in note, note
+    print("ok — a bloated merge never applies on its own; the notice reports the facts kept")
+
+
 if __name__ == "__main__":
     test_validator_rejects_the_real_malformed_shapes()
     test_unwrap_fence_leaves_inner_code_blocks_alone()
@@ -260,3 +325,4 @@ if __name__ == "__main__":
     test_apply_merge_refuses_to_reuse_a_transaction_dir()
     test_apply_merge_rejects_a_file_in_an_outstanding_transaction()
     test_descriptions_with_a_colon_survive_every_document_builder()
+    test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept()

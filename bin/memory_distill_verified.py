@@ -44,17 +44,29 @@ MEM = Path.home() / ".claude" / "projects" / (os.environ.get("CLAUDE_MEMORY_SLUG
 
 FACT_PATTERNS = [
     (r"(?<![\w.]):\d{2,5}\b", "port"),
-    (r"\bport\s+\d{2,5}\b", "port"),
+    (r"\bporta?\s+\d{2,5}\b", "port"),                              # "port 3110" / "porta 3110"
     (r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "ip"),
-    (r"/(?:home|data|root|usr|etc|var|opt)/[\w./\-]+", "path"),
+    # absolute or home-relative path with 2+ segments, any root (/mnt, /srv, /daemon, ~/ops, $HOME/...).
+    # Not inside a URL or a word: "https://x/y", "N/A" and "24/7" never start a match.
+    (r"(?<![\w/.~$])(?:~|\$HOME)?/[\w.\-]+(?:/[\w.\-]+)+/?", "path"),
     (r"\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+\b", "env"),
     (r"\bcommit\s+`?[0-9a-f]{7,40}`?", "commit"),                  # only hashes labelled 'commit'
-    (r"\b[\w\-]+\.(?:py|ts|js|tsx|toml|env|sh|service)\b", "file"),
+    # short hex ref (git sha, image digest prefix): needs a letter AND a digit, not part of a
+    # hyphenated id (UUID). 32+ hex never gets here: engram_secrets masks it first.
+    (r"(?<![\w-])(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,31}(?![\w-])", "hash"),
+    (r"\b[\w\-]+\.(?:py|ts|tsx|js|jsx|mjs|rs|go|sql|toml|yaml|yml|json|env|sh|service|timer|conf|md|dart)\b", "file"),
     # decimals ONLY when carrying a unit/threshold meaning (sats, BTC, version,
     # =0.01, x.y.z handled by ip). bare balances/amounts like 282.63 are NOT durable.
     (r"\b\d+\.\d+\s*(?:BTC|L-BTC|sats?|USDt?|USDC)\b", "amount"),
     (r"(?:THRESHOLD|=|version|toolchain|pinned to)\s*`?\d+\.\d+`?", "threshold"),
+    # what a note marks as code: a flag, a command, a class, an image tag, an error string. The
+    # author marked it verbatim, so it is kept verbatim. Spans over 80 chars are sentences and stay
+    # prose. (The pattern takes ANY length so backticks pair up correctly; the cap is applied below.)
+    (r"`([^`\n]+)`", "code"),
 ]
+# Kinds whose token IS the fact: a flag, a ref or an identifier is only conveyed by the exact
+# string ("--keep" is not "keep" somewhere in the prose).
+VERBATIM_KINDS = {"code", "hash"}
 FACT_STOP = {"0.0", "1.0", "2.0", "3.0"}
 # Secrets / per-run cruft that distillation MUST DROP, never faithfully preserve.
 # (Matches the security-mindset + no-secrets memories: client secrets, session
@@ -92,6 +104,8 @@ def fact_present(disp: str, kind: str, hay: str, hay_norm: str) -> bool:
     d = disp.lower()
     if d in hay:
         return True
+    if kind in VERBATIM_KINDS:
+        return False
     if kind == "port":
         num = re.sub(r"\D", "", d)
         return bool(num) and re.search(rf"(?<!\d){num}(?!\d)", hay) is not None
@@ -102,9 +116,14 @@ def extract_facts(text: str):
     seen = {}
     for pat, kind in FACT_PATTERNS:
         for m in re.finditer(pat, text):
-            tok = m.group(0).strip().rstrip(".,;:)")
+            tok = (m.group(1) if m.re.groups else m.group(0)).strip()
+            if kind != "code":
+                tok = tok.rstrip(".,;:)")
+            elif len(tok) > 80:
+                continue
             norm = tok.lower()
-            if len(norm) < 3 or norm in FACT_STOP:
+            # a masked secret is not a fact: never list the placeholder as something to keep
+            if len(norm) < 3 or norm in FACT_STOP or "«redacted" in norm:
                 continue
             # find the line for a secrecy check so we never appendix a secret.
             # Any fact whose source line looks like a secret is dropped (not just
@@ -245,6 +264,9 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
               if fact_present(disp, kind, out_low, out_norm)}
     missing = [n for n in facts if n not in present]
     natural_cov = len(present) / max(1, len(facts))
+    # One appendix line per token: a missing path inside a missing command is listed once, by the
+    # command (it carries the path verbatim, so the path still counts as present in the final doc).
+    missing = [n for n in missing if not any(n != m and n in m for m in missing)]
     present_cav = [c for c, _ in all_caveats if c.lower() in out_low]
     missing_cav = [(c, f) for c, f in all_caveats if c.lower() not in out_low]
 
@@ -257,14 +279,25 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
         appendix += "_Hard facts/caveats from the source notes that the prose above did not restate. Kept here so nothing is lost._\n\n"
         if missing:
             appendix += "### Hard facts\n"
+            # A short source line is restated ONCE and carries all its missing tokens verbatim (it
+            # used to be repeated as context under every token it held). A long or secret-looking
+            # line gives way to one entry per token.
+            restated = []                       # (file, line), each once
             for n in sorted(missing, key=lambda n: facts[n][1]):
                 disp, kind = facts[n]; src = fact_src.get(n, ("?", ""))
-                ctx = f" — {src[1]}" if src[1] and len(src[1]) <= 160 and not looks_secret(src[1]) else ""
-                appendix += f"- `{disp}` ({kind}, from {src[0]}){ctx}\n"
+                if src[1] and len(src[1]) <= 160 and not looks_secret(src[1]):
+                    if src not in restated:
+                        restated.append(src)
+                else:
+                    appendix += f"- `{disp}` ({kind}, from {src[0]})\n"
+            for f, ln in restated:
+                appendix += f"- {re.sub(r'^[-*+]\s+', '', ln)} (from {f})\n"
         if missing_cav:
             appendix += "\n### Caveats / rules\n"
             for c, f in missing_cav:
                 appendix += f"- {c} (from {f})\n"
+
+    appendix_chars = len(appendix)   # the restated-facts section only; the curate bloat gate reads it
 
     # ADD-ONLY preservation (C8). final_fact_coverage only proves REGEX TOKEN
     # CLASSES (ports/IPs/paths/env/…) survived — normal PROSE facts can be dropped
@@ -317,6 +350,7 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
         "source_sentences": len(src_sentences),
         "sources_preserved": bool(preserve_sources),
         "appendix_facts": len(missing), "appendix_caveats": len(missing_cav),
+        "appendix_chars": appendix_chars,
         "possible_hallucinations": invented,
         "secrets_redacted": n_redacted,
         "draft_chars": len(final), "gen_done": done,
