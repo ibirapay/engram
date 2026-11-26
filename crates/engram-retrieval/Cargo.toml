@@ -6,3 +6,5 @@ license.workspace = true
 
 [dependencies]
 engram-store = { path = "../engram-store" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+thiserror = "2"

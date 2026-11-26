@@ -1,6 +1,8 @@
 use engram_store::Memory;
 use std::collections::{HashMap, HashSet};
 
+pub mod index;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hit {
     pub file: String,
@@ -148,10 +150,15 @@ pub fn rank<T: Indexable>(records: &[T], query: &str, limit: usize) -> Vec<Hit> 
                     continue;
                 }
                 let docs = *frequency.get(term.as_str()).unwrap_or(&0) as f64;
-                let idf = ((documents.len() as f64 - docs + 0.5) / (docs + 0.5) + 1.0).ln();
                 let field = *document.weight.get(term.as_str()).unwrap_or(&1.0);
-                score += field * idf * count * 2.2
-                    / (count + 1.2 * (1.0 - 0.75 + 0.75 * document.len as f64 / average));
+                score += term_score(
+                    count,
+                    docs,
+                    documents.len() as f64,
+                    field,
+                    document.len as f64,
+                    average,
+                );
             }
             Hit {
                 file: document.id.clone(),
@@ -168,6 +175,16 @@ pub fn rank<T: Indexable>(records: &[T], query: &str, limit: usize) -> Vec<Hit> 
     });
     hits.truncate(limit);
     hits
+}
+
+/// One term's BM25 contribution to one document: `count` occurrences in a document
+/// of `len` tokens, found in `docs` of the `total` documents (average length
+/// `average`), at the strongest field weight `field`. The single place the formula
+/// lives, shared by the in-memory [`rank`] and the persistent [`index`] so the two
+/// cannot drift apart.
+fn term_score(count: f64, docs: f64, total: f64, field: f64, len: f64, average: f64) -> f64 {
+    let idf = ((total - docs + 0.5) / (docs + 0.5) + 1.0).ln();
+    field * idf * count * 2.2 / (count + 1.2 * (1.0 - 0.75 + 0.75 * len / average))
 }
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -231,7 +248,7 @@ fn tokenize(text: &str) -> Vec<String> {
 /// are listed explicitly instead of relying on the fold. Both unaccented and
 /// accented shapes are listed: people type prompts without accents.
 #[rustfmt::skip]
-const STOPWORDS: &[&str] = &[
+pub(crate) const STOPWORDS: &[&str] = &[
     // pt-BR.
     "a", "o", "e", "de", "da", "do", "dos", "das", "em", "no", "na", "nos", "nas", "ao", "aos",
     "um", "uma", "uns", "umas", "por", "para", "com", "sem", "que", "quem", "qual", "quais",

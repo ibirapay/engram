@@ -9,8 +9,9 @@
 use engram_config::Config;
 use engram_graph::GraphClient;
 use engram_models::OpenAiCompatibleClient;
+use engram_retrieval::index::KeywordIndex;
 use engram_retrieval::{bm25, rrf, rrf_weighted};
-use engram_store::{Memory, load};
+use engram_store::{Memory, load, load_file};
 use engram_tenant::{GraphScope, Tenant};
 use engram_vector::{Corpus, QdrantClient, Scope};
 use serde::Serialize;
@@ -201,7 +202,9 @@ async fn recall_with_backend(
         .graph_scope(slug)
         .map_err(|error| error.to_string())?;
     let store = engram_paths::store_dir(config_path, slug);
-    let memories = load(&store).map_err(|error| {
+    // The store must be readable even when no leg reads it whole: a wrong slug or an
+    // unmounted store is an error, not "no matches". Only the directory is opened.
+    std::fs::read_dir(&store).map_err(|error| {
         format!(
             "could not read the memory store at {}: {error}",
             store.display()
@@ -244,11 +247,7 @@ async fn recall_with_backend(
         );
         Vec::new()
     } else {
-        legs.insert("keyword".into(), "ok".into());
-        bm25(&memories, query, k * 2)
-            .into_iter()
-            .map(|hit| hit.file)
-            .collect::<Vec<_>>()
+        keyword_leg(config_path, &store, slug, query, k * 2, &mut legs)?
     };
     let vector = if graphiti_compat {
         legs.insert(
@@ -306,10 +305,6 @@ async fn recall_with_backend(
             legs.get("graph").map(String::as_str).unwrap_or("unknown")
         ));
     }
-    let by_file: HashMap<String, &Memory> = memories
-        .iter()
-        .map(|memory| (memory.file.clone(), memory))
-        .collect();
     let ranked: Vec<String> = if graphiti_compat {
         graph.files.clone()
     } else {
@@ -339,6 +334,18 @@ async fn recall_with_backend(
         .map(|hit| hit.file)
         .collect()
     };
+    // Only the files that survived fusion are read: `load_file` refuses any name that
+    // is not a bare memory file name, so a hostile vector payload or graph node cannot
+    // point this at a path outside the store.
+    let mut by_file: HashMap<String, Memory> = HashMap::new();
+    for file in &ranked {
+        if by_file.contains_key(file) {
+            continue;
+        }
+        if let Ok(Some(memory)) = load_file(&store, file) {
+            by_file.insert(file.clone(), memory);
+        }
+    }
     // A graph hit for a file that is not on disk in this slug's store is dropped.
     // Say so, rather than silently returning fewer results than the leg found:
     // with the wrong slug this produced zero results and a healthy-looking report.
@@ -385,6 +392,46 @@ async fn recall_with_backend(
         neighbours: graph.neighbours.clone(),
         legs,
     })
+}
+
+/// The keyword leg: BM25 over the persistent SQLite index, falling back to scanning
+/// the store when the index cannot be opened or written (read-only disk, locked by a
+/// long writer). Same ranking either way; only the cost differs.
+fn keyword_leg(
+    config_path: &Path,
+    store: &Path,
+    slug: &str,
+    query: &str,
+    limit: usize,
+    legs: &mut HashMap<String, String>,
+) -> Result<Vec<String>, String> {
+    let indexed = KeywordIndex::open(&engram_paths::keyword_index_path(config_path, slug))
+        .and_then(|mut index| {
+            index.sync(store)?;
+            index.rank(query, limit)
+        });
+    match indexed {
+        Ok(hits) => {
+            legs.insert("keyword".into(), "ok".into());
+            Ok(hits.into_iter().map(|hit| hit.file).collect())
+        }
+        Err(error) => {
+            let memories = load(store).map_err(|error| {
+                format!(
+                    "could not read the memory store at {}: {error}",
+                    store.display()
+                )
+            })?;
+            legs.insert(
+                "keyword".into(),
+                format!("ok (scanned the store: keyword index unavailable: {error})"),
+            );
+            Ok(bm25(&memories, query, limit)
+                .into_iter()
+                .map(|hit| hit.file)
+                .collect())
+        }
+    }
 }
 
 fn graph_backend(config: &Config) -> String {

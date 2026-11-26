@@ -132,6 +132,28 @@ pub fn store_dir(config: &Path, slug: &str) -> PathBuf {
         .join("memory")
 }
 
+/// Where the persistent keyword index for `slug` lives: `<engram home>/index/`, next
+/// to the config. NOT inside the store: the store is mirrored and scanned as Markdown,
+/// and this file is derived and rebuildable.
+pub fn keyword_index_path(config: &Path, slug: &str) -> PathBuf {
+    let safe: String = slug
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    config
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .join("index")
+        .join(format!("keyword-{safe}.db"))
+}
+
 /// Read `CLAUDE_MEMORY_SLUG` out of an `engram.env`-style file.
 ///
 /// The file is shell-sourced by `memory_lib.sh`, so entries may be bare or

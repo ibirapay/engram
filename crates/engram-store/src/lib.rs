@@ -24,6 +24,87 @@ pub enum StoreError {
     Read(#[from] std::io::Error),
 }
 
+/// One memory file as the directory lists it: enough to tell whether a cached index
+/// of it is still current, without opening it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileStamp {
+    pub file: String,
+    /// Modification time in nanoseconds since the epoch (0 when unreadable).
+    pub mtime_ns: i64,
+    pub size: i64,
+}
+
+/// The memory files in `dir` (`*.md`, minus the derived `MEMORY*.md` indexes), sorted
+/// by name. Reads the directory and stats each file; opens none of them.
+pub fn list_files(dir: impl AsRef<Path>) -> Result<Vec<FileStamp>, StoreError> {
+    let mut stamps = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("md") || is_index(&path) {
+            continue;
+        }
+        let Some(file) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            continue;
+        };
+        let meta = entry.metadata()?;
+        stamps.push(FileStamp {
+            file,
+            mtime_ns: meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|age| i64::try_from(age.as_nanos()).ok())
+                .unwrap_or_default(),
+            size: i64::try_from(meta.len()).unwrap_or_default(),
+        });
+    }
+    stamps.sort_by(|left, right| left.file.cmp(&right.file));
+    Ok(stamps)
+}
+
+/// A bare memory file name: no path separators, `.md`, not a derived index. Anything
+/// else is refused, because the names that reach [`load_file`] can come from a vector
+/// payload or a graph node, and `dir.join("../x")` would read outside the store.
+pub fn is_memory_file_name(file: &str) -> bool {
+    !file.is_empty()
+        && file.ends_with(".md")
+        && !file.contains(['/', '\\', '\0'])
+        && file != "."
+        && file != ".."
+        && !is_index(Path::new(file))
+}
+
+/// Read ONE memory from `dir` by file name. `Ok(None)` when the name is not a memory
+/// file name or the file is gone.
+pub fn load_file(dir: impl AsRef<Path>, file: &str) -> Result<Option<Memory>, StoreError> {
+    if !is_memory_file_name(file) {
+        return Ok(None);
+    }
+    let path = dir.as_ref().join(file);
+    let meta = match fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let source_mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|age| age.as_secs() as i64)
+        .unwrap_or_default();
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(build(file, &raw, source_mtime)))
+}
+
 pub fn load(dir: impl AsRef<Path>) -> Result<Vec<Memory>, StoreError> {
     let mut memories = Vec::new();
     for entry in fs::read_dir(dir)? {
@@ -40,26 +121,33 @@ pub fn load(dir: impl AsRef<Path>) -> Result<Vec<Memory>, StoreError> {
             .map(|age| age.as_secs() as i64)
             .unwrap_or_default();
         let raw = fs::read_to_string(&path)?;
-        let (meta, body) = parse(&raw);
-        let file = path.file_name().unwrap().to_string_lossy().to_string();
-        let fallback = file.trim_end_matches(".md").replace('_', " ");
-        memories.push(Memory {
-            file,
-            name: meta
-                .get("name")
-                .cloned()
-                .unwrap_or_else(|| fallback.clone()),
-            description: meta.get("description").cloned().unwrap_or_default(),
-            memory_type: meta
-                .get("type")
-                .cloned()
-                .unwrap_or_else(|| "reference".into()),
-            body,
-            source_mtime,
-        });
+        let file = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        memories.push(build(&file, &raw, source_mtime));
     }
     memories.sort_by(|left, right| left.file.cmp(&right.file));
     Ok(memories)
+}
+
+fn build(file: &str, raw: &str, source_mtime: i64) -> Memory {
+    let (meta, body) = parse(raw);
+    let fallback = file.trim_end_matches(".md").replace('_', " ");
+    Memory {
+        file: file.to_string(),
+        name: meta
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| fallback.clone()),
+        description: meta.get("description").cloned().unwrap_or_default(),
+        memory_type: meta
+            .get("type")
+            .cloned()
+            .unwrap_or_else(|| "reference".into()),
+        body,
+        source_mtime,
+    }
 }
 
 /// The store's own derived indexes — `MEMORY.md`, `MEMORY_FULL.md` — are lists of
@@ -146,6 +234,32 @@ fn scalar(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn load_file_refuses_names_that_leave_the_store() {
+        let dir = std::env::temp_dir().join(format!("engram-store-lf-{}", std::process::id()));
+        let inner = dir.join("memory");
+        assert!(std::fs::create_dir_all(&inner).is_ok());
+        assert!(std::fs::write(dir.join("secret.md"), "---\nname: x\n---\nsegredo\n").is_ok());
+        assert!(std::fs::write(inner.join("ok.md"), "---\nname: ok\n---\ncorpo\n").is_ok());
+        for bad in [
+            "../secret.md",
+            "/etc/passwd",
+            "a/b.md",
+            "..",
+            "MEMORY.md",
+            "",
+            "x.txt",
+        ] {
+            assert!(
+                matches!(load_file(&inner, bad), Ok(None)),
+                "{bad:?} must be refused"
+            );
+        }
+        assert!(matches!(load_file(&inner, "missing.md"), Ok(None)));
+        assert!(matches!(load_file(&inner, "ok.md"), Ok(Some(m)) if m.name == "ok"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// The derived index is not a memory. `MEMORY_FULL.md` — 91 KB of every
