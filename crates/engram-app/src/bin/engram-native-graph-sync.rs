@@ -155,9 +155,9 @@ async fn run(args: Args) -> Result<usize, SyncError> {
     // run knows exactly which files are gone. (It used to prune on a full pass only, and the daemon
     // always runs limited, so merged and quarantined memories piled up in the graph for good.)
     let store = engram_paths::store_dir(&config_path, &slug);
-    if let Some(present) = files_to_keep(
-        engram_store::list_files(&store).map_err(|error| error.to_string())?,
-    ) {
+    if let Some(present) =
+        files_to_keep(engram_store::list_files(&store).map_err(|error| error.to_string())?)
+    {
         client
             .prune_missing_memories(&scope, &present)
             .await
@@ -439,7 +439,11 @@ mod tests {
     use super::*;
 
     fn stamp(file: &str) -> engram_store::FileStamp {
-        engram_store::FileStamp { file: file.to_string(), mtime_ns: 1, size: 1 }
+        engram_store::FileStamp {
+            file: file.to_string(),
+            mtime_ns: 1,
+            size: 1,
+        }
     }
 
     /// Pruning runs on every pass, so an empty listing (unmounted or wiped store) must not
