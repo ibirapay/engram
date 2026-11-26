@@ -1,12 +1,13 @@
 [Unit]
-Description=engram memory daemon timer (fires engram-daemon.py --once; per-task cadences applied inside)
+Description=engram memory daemon timer (fires engram-daemon.py --once daily at 05:00; per-task cadences applied inside)
 
 [Timer]
-OnBootSec=5min
 # Wall-clock anchored, NOT OnUnitActiveSec: the latter schedules the next run
 # relative to the service's last activation, so a single missed/failed activation
 # leaves the timer elapsed with no next trigger ("Trigger: n/a") until reboot.
-OnCalendar=*:0/30
+# Once a day. Persistent=true runs a missed 05:00 at the next boot, so there is no
+# OnBootSec: it would fire the whole pass on every reboot.
+OnCalendar=*-*-* 05:00:00
 Persistent=true
 
 [Install]
