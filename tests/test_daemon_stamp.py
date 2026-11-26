@@ -51,6 +51,29 @@ def test_real_tasks_defer_when_deps_down():
     print("ok — graph/vector/export/reconcile/harvest all defer explicitly")
 
 
+def test_sqlite_backend_does_not_need_neo4j():
+    """graph.backend: sqlite is a local file. A Neo4j that is down (or decommissioned)
+    must not defer the graph sync, and export/reconcile are a permanent skip (None),
+    not a failure, exactly as under `native`."""
+    d = tempfile.mkdtemp()
+    m = _load(Path(d) / "s.json", {})
+    m._neo4j_up = lambda: False
+    os.environ["ENGRAM_GRAPH_BACKEND"] = "sqlite"
+    try:
+        ran = []
+        m._rust = lambda name: "/bin/true"
+        m.rust_native_sync_supported = lambda: True
+        m._per_tenant = lambda label, fn: ran.append(label) or True
+        assert m.TASKS["graph"]() is True and ran == ["graph"], "graph deferred on a sqlite backend"
+        assert m.TASKS["export"]() is None and m.TASKS["reconcile"]() is None
+        os.environ["ENGRAM_GRAPH_BACKEND"] = "native"
+        assert m.TASKS["graph"]() is False, "native still needs Neo4j"
+    finally:
+        os.environ.pop("ENGRAM_GRAPH_BACKEND", None)
+    import shutil; shutil.rmtree(d)
+    print("ok — sqlite backend never waits on Neo4j")
+
+
 def test_graphiti_compat_uses_legacy_jobs():
     """The selected reader and writer must address the same Graphiti index.
 
@@ -111,4 +134,4 @@ def test_native_skip_is_not_a_failure():
 
 
 if __name__ == "__main__":
-    test_native_skip_is_not_a_failure(); test_tick_reports_failed_tasks(); test_deferred_task_is_not_stamped(); test_real_tasks_defer_when_deps_down(); test_graphiti_compat_uses_legacy_jobs()
+    test_native_skip_is_not_a_failure(); test_tick_reports_failed_tasks(); test_deferred_task_is_not_stamped(); test_real_tasks_defer_when_deps_down(); test_sqlite_backend_does_not_need_neo4j(); test_graphiti_compat_uses_legacy_jobs()

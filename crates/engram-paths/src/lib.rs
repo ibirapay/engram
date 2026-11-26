@@ -132,6 +132,21 @@ pub fn store_dir(config: &Path, slug: &str) -> PathBuf {
         .join("memory")
 }
 
+/// The SQLite native graph (`graph.backend: sqlite`): `<engram home>/index/graph.db`
+/// next to the config, or `ENGRAM_GRAPH_DB`. One file for every slug and tenant, which
+/// the tables scope by column.
+pub fn graph_db_path(config: &Path) -> PathBuf {
+    if let Some(path) = non_empty_env("ENGRAM_GRAPH_DB") {
+        return PathBuf::from(path);
+    }
+    config
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .join("index")
+        .join("graph.db")
+}
+
 /// Where the persistent keyword index for `slug` lives: `<engram home>/index/`, next
 /// to the config. NOT inside the store: the store is mirrored and scanned as Markdown,
 /// and this file is derived and rebuildable.

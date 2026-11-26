@@ -285,6 +285,7 @@ async fn recall_with_backend(
         Mode::Full => {
             graph_leg(
                 &config,
+                config_path,
                 effective_backend,
                 &scope,
                 query,
@@ -293,7 +294,7 @@ async fn recall_with_backend(
             )
             .await
         }
-        Mode::Fast => fast_graph_leg(&config, &scope, query, &mut legs).await,
+        Mode::Fast => fast_graph_leg(&config, config_path, &scope, query, &mut legs).await,
     };
     if graphiti_compat
         && legs
@@ -511,6 +512,7 @@ async fn vector_leg(
 
 async fn graph_leg(
     config: &Config,
+    config_path: &Path,
     backend: &str,
     scope: &GraphScope,
     query: &str,
@@ -521,7 +523,7 @@ async fn graph_leg(
         return graphiti_compat_leg(config, scope, &engram_paths::graph_dir(), query, k, legs)
             .await;
     }
-    native_leg(config, scope, query, k, legs).await
+    native_leg(config, config_path, backend, scope, query, k, legs).await
 }
 
 /// The installed Graphiti recall script.
@@ -749,20 +751,22 @@ fn graph_query_tokens(query: &str) -> Vec<String> {
 
 async fn native_leg(
     config: &Config,
+    config_path: &Path,
+    backend: &str,
     scope: &GraphScope,
     query: &str,
     k: usize,
     legs: &mut HashMap<String, String>,
 ) -> GraphLeg {
     let creds = config.graph.credentials();
-    if creds.password.is_empty() {
+    if backend != "sqlite" && creds.password.is_empty() {
         legs.insert(
             "graph".into(),
             "native: no Neo4j password (set NEO4J_PASSWORD or graph/.env)".into(),
         );
         return GraphLeg::empty();
     }
-    let client = match GraphClient::from_credentials(&creds) {
+    let client = match GraphClient::connect(backend, &creds, config_path) {
         Ok(client) => client,
         Err(error) => {
             legs.insert("graph".into(), format!("native: {error}"));
@@ -841,6 +845,7 @@ async fn native_leg(
 /// native triple leg otherwise; the same choice `memory_recall.graph_facts` makes.
 async fn fast_graph_leg(
     config: &Config,
+    config_path: &Path,
     scope: &GraphScope,
     query: &str,
     legs: &mut HashMap<String, String>,
@@ -852,18 +857,19 @@ async fn fast_graph_leg(
         return leg;
     }
     let creds = config.graph.credentials();
-    if creds.password.is_empty() {
+    let backend = graph_backend(config);
+    if backend != "sqlite" && creds.password.is_empty() {
         legs.insert("graph".into(), "fast: no Neo4j password".into());
         return leg;
     }
-    let client = match GraphClient::from_credentials(&creds) {
+    let client = match GraphClient::connect(&backend, &creds, config_path) {
         Ok(client) => client,
         Err(error) => {
             legs.insert("graph".into(), format!("fast: {error}"));
             return leg;
         }
     };
-    let native = graph_backend(config) == "native";
+    let native = matches!(backend.as_str(), "native" | "sqlite");
     let facts = if native {
         client
             .native_facts_for_tokens(scope, &tokens, config.recall.inject.max_facts.max(1))

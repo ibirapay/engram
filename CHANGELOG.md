@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.4.0 — the native graph can live in SQLite (opt-in: `graph.backend: sqlite`)
+
+`graph.backend: native` still needed Neo4j: the Rust code wrote the same Cypher into it. On the
+reference install one statement of that graph (the facts read the prompt hook runs on every
+prompt) cost ~500 ms, and Neo4j held a 1.4 GB JVM on another host.
+
+`graph.backend: sqlite` keeps the native model (`EngramMemory` / `EngramFact` / `EngramTriple`,
+scoped by tenant and slug) in one local file, `<engram home>/index/graph.db` (override with
+`ENGRAM_GRAPH_DB`). Nothing changes by default.
+
+- **Same answers.** `engram-graph-to-sqlite --verify` copies a store out of Neo4j (read-only) and
+  runs the same reads against both: on the reference install the facts, keyword and semantic reads
+  agreed on every probe (semantic score difference ~1e-7). `recall_precision_eval.sh` passes on the
+  SQLite backend and the injected text is identical for 8/8 prompts.
+- **Faster.** Prompt hook median 442 ms -> 185 ms on top of 1.3.0 (862 ms before it).
+- **Less written, nothing lost.** The `EngramEntity` nodes and `MENTIONS` / `SUBJECT` / `OBJECT`
+  edges (38,897 nodes and ~121,000 relationships there) were written on every sync and read by no
+  query, so the SQLite schema does not carry them. Facts and triples are copied through their
+  memory, so retired orphans stay behind.
+- The legacy Graphiti surface and the tenancy migration are not implemented on SQLite and say so.
+- The daemon no longer waits on Neo4j when the backend is `sqlite`: a Neo4j that is down or gone
+  does not defer the graph sync, and `export` / `reconcile` are a permanent skip, not a failure.
+
 ## 1.3.0 — the prompt hook no longer reads the whole store
 
 Every prompt, `engram-recall-hook` listed the memory directory, opened and tokenized every

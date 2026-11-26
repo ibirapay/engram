@@ -108,7 +108,7 @@ The Rust recall service has two graph backends:
 
 ```yaml
 graph:
-  backend: graphiti_compat       # graphiti_compat | native
+  backend: graphiti_compat       # graphiti_compat | native | sqlite
 ```
 
 `graphiti_compat` is the production-safe migration choice, **and the default when

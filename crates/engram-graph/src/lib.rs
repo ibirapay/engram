@@ -7,6 +7,8 @@
 //! therefore retired nothing — ever. No test could see it, because no test touched
 //! a query string.
 
+pub mod sqlite;
+
 use engram_tenant::GraphScope;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -156,6 +158,9 @@ pub struct GraphClient {
     user: String,
     password: String,
     client: Client,
+    /// `graph.backend: sqlite`: the native graph lives in a local file and every
+    /// native method dispatches there. The Neo4j fields are unused in that mode.
+    sqlite: Option<sqlite::SqliteGraph>,
 }
 
 #[derive(Debug, Error)]
@@ -623,6 +628,33 @@ MATCH (n) WHERE any(label IN labels(n) WHERE label STARTS WITH 'Engram') \
   AND n.slug IS NULL AND n.tenant IS NULL \
 WITH n LIMIT 10000 DETACH DELETE n RETURN count(n)";
 
+// ---------------------------------------------------------------------------
+// Export to the SQLite backend (read-only). Only what recall can reach: facts and
+// triples are read THROUGH their memory, so the orphans that retirement left behind
+// (nodes whose HAS_FACT / HAS_TRIPLE edge was deleted) are not carried over.
+// ---------------------------------------------------------------------------
+
+const EXPORT_NATIVE_MEMORIES: &str = "\
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug}) \
+RETURN m.file, m.name, m.description, m.body, m.source_mtime, m.sha, \
+       m.embedding_space, m.native_triple_version ORDER BY m.file";
+
+const EXPORT_NATIVE_FACTS: &str = "\
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug})-[:HAS_FACT]->(f:EngramFact) \
+RETURN m.file, f.text, f.legacy_name, f.subject, f.object, f.embedding, \
+       CASE WHEN f.valid_until IS NULL THEN null ELSE f.valid_until.epochSeconds END \
+ORDER BY m.file, f.text SKIP $skip LIMIT $limit";
+
+const EXPORT_NATIVE_TRIPLES: &str = "\
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug})-[:HAS_TRIPLE]->(t:EngramTriple) \
+RETURN m.file, t.key, t.subject, t.relation, t.object, t.confidence, t.temporal, t.status, \
+       CASE WHEN t.valid_until IS NULL THEN null ELSE t.valid_until.epochSeconds END \
+ORDER BY m.file, t.key";
+
+const COUNT_NATIVE_FACTS: &str = "\
+MATCH (m:EngramMemory {tenant: $tenant, slug: $slug})-[:HAS_FACT]->(f:EngramFact) \
+RETURN count(f), count(f.embedding)";
+
 const NATIVE_MEMORY_FILES: &str = "\
 MATCH (m:EngramMemory {tenant: $tenant, slug: $slug}) RETURN collect(m.file)";
 
@@ -658,7 +690,36 @@ impl GraphClient {
             user: user.into(),
             password: password.into(),
             client: Client::new(),
+            sqlite: None,
         })
+    }
+
+    /// The native graph in a local SQLite file (created if missing).
+    pub fn sqlite(path: &std::path::Path) -> Result<Self, GraphError> {
+        Ok(Self {
+            endpoint: String::new(),
+            user: String::new(),
+            password: String::new(),
+            client: Client::new(),
+            sqlite: Some(sqlite::SqliteGraph::open(path)?),
+        })
+    }
+
+    /// Pick the store for `backend` (`sqlite`, else Neo4j from `creds`).
+    pub fn connect(
+        backend: &str,
+        creds: &engram_config::GraphCredentials,
+        config_path: &std::path::Path,
+    ) -> Result<Self, GraphError> {
+        if backend == "sqlite" {
+            Self::sqlite(&engram_paths::graph_db_path(config_path))
+        } else {
+            Self::from_credentials(creds)
+        }
+    }
+
+    pub fn sqlite_graph(&self) -> Option<&sqlite::SqliteGraph> {
+        self.sqlite.as_ref()
     }
 
     /// Build from the resolved config credentials.
@@ -702,6 +763,9 @@ impl GraphClient {
     ) -> Result<Vec<String>, GraphError> {
         if tokens.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(graph) = &self.sqlite {
+            return graph.facts_for_tokens(scope, tokens, limit);
         }
         self.strings(
             NATIVE_FACTS_FOR_TOKENS,
@@ -775,6 +839,9 @@ impl GraphClient {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
+        if let Some(graph) = &self.sqlite {
+            return graph.keyword_files(scope, &tokens, limit);
+        }
         self.file_hits(
             NATIVE_KEYWORD_FILES,
             serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "tokens": tokens, "limit": limit}),
@@ -788,6 +855,9 @@ impl GraphClient {
         vector: &[f32],
         limit: usize,
     ) -> Result<Vec<RecallHit>, GraphError> {
+        if let Some(graph) = &self.sqlite {
+            return graph.semantic_files(scope, vector, limit);
+        }
         self.file_hits(
             NATIVE_SEMANTIC_FILES,
             serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "vector": vector, "limit": limit}),
@@ -804,6 +874,9 @@ impl GraphClient {
         body: &str,
         source_mtime: i64,
     ) -> Result<(), GraphError> {
+        if let Some(graph) = &self.sqlite {
+            return graph.upsert_memory(scope, file, name, description, body, source_mtime);
+        }
         self.query(
             UPSERT_NATIVE_MEMORY,
             serde_json::json!({
@@ -829,6 +902,9 @@ impl GraphClient {
         if memories.is_empty() {
             return Ok(());
         }
+        if let Some(graph) = &self.sqlite {
+            return graph.set_memory_mtimes(scope, memories);
+        }
         let entries = memories
             .iter()
             .map(|(file, source_mtime)| serde_json::json!({"file": file, "source_mtime": source_mtime}))
@@ -848,6 +924,9 @@ impl GraphClient {
         sha: &str,
         space: &str,
     ) -> Result<bool, GraphError> {
+        if let Some(graph) = &self.sqlite {
+            return graph.memory_is_current(scope, file, sha, space);
+        }
         let response = self
             .query(
                 NATIVE_MEMORY_IS_CURRENT,
@@ -870,6 +949,9 @@ impl GraphClient {
         file: &str,
         facts: &[String],
     ) -> Result<(), GraphError> {
+        if let Some(graph) = &self.sqlite {
+            return graph.replace_facts(scope, file, facts);
+        }
         self.query(
             REPLACE_NATIVE_FACTS,
             serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "file": file, "facts": facts}),
@@ -884,6 +966,9 @@ impl GraphClient {
         file: &str,
         triples: &[NativeTriple],
     ) -> Result<(), GraphError> {
+        if let Some(graph) = &self.sqlite {
+            return graph.replace_triples(scope, file, triples);
+        }
         let payload = triple_payload(triples);
         self.query(
             RETIRE_OBSOLETE_TRIPLES,
@@ -918,6 +1003,9 @@ impl GraphClient {
         if points.is_empty() {
             return Ok(());
         }
+        if let Some(graph) = &self.sqlite {
+            return graph.set_fact_embeddings(scope, file, points);
+        }
         self.query(
             SET_NATIVE_FACT_EMBEDDINGS,
             serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "file": file, "points": points.iter().map(|(text, embedding)| serde_json::json!({"text": text, "embedding": embedding})).collect::<Vec<_>>() }),
@@ -934,6 +1022,9 @@ impl GraphClient {
         sha: &str,
         space: &str,
     ) -> Result<(), GraphError> {
+        if let Some(graph) = &self.sqlite {
+            return graph.mark_memory_current(scope, file, sha, space);
+        }
         self.query(
             MARK_NATIVE_MEMORY_CURRENT,
             serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "file": file, "sha": sha, "space": space}),
@@ -1041,6 +1132,9 @@ impl GraphClient {
     }
 
     pub async fn native_memory_files(&self, scope: &GraphScope) -> Result<Vec<String>, GraphError> {
+        if let Some(graph) = &self.sqlite {
+            return graph.memory_files(scope);
+        }
         let response = self
             .query(
                 NATIVE_MEMORY_FILES,
@@ -1063,12 +1157,152 @@ impl GraphClient {
             .unwrap_or_default())
     }
 
+    /// Every memory of the scope, as the SQLite importer wants it.
+    pub async fn export_native_memories(
+        &self,
+        scope: &GraphScope,
+    ) -> Result<Vec<sqlite::ImportMemory>, GraphError> {
+        let response = self
+            .query(
+                EXPORT_NATIVE_MEMORIES,
+                serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant()}),
+            )
+            .await?;
+        let text = |row: &[serde_json::Value], at: usize| {
+            row.get(at)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        };
+        Ok(response
+            .results
+            .into_iter()
+            .flat_map(|set| set.data)
+            .filter_map(|data| {
+                let row = data.row;
+                Some(sqlite::ImportMemory {
+                    file: text(&row, 0)?,
+                    name: text(&row, 1),
+                    description: text(&row, 2),
+                    body: text(&row, 3),
+                    source_mtime: row.get(4).and_then(|value| value.as_i64()),
+                    sha: text(&row, 5),
+                    embedding_space: text(&row, 6),
+                    triple_version: row.get(7).and_then(|value| value.as_i64()),
+                })
+            })
+            .collect())
+    }
+
+    /// One page of the scope's facts (embeddings are large: ask in pages).
+    pub async fn export_native_facts(
+        &self,
+        scope: &GraphScope,
+        skip: usize,
+        limit: usize,
+    ) -> Result<Vec<sqlite::ImportFact>, GraphError> {
+        let response = self
+            .query(
+                EXPORT_NATIVE_FACTS,
+                serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(),
+                    "skip": skip, "limit": limit}),
+            )
+            .await?;
+        let text = |row: &[serde_json::Value], at: usize| {
+            row.get(at)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        };
+        Ok(response
+            .results
+            .into_iter()
+            .flat_map(|set| set.data)
+            .filter_map(|data| {
+                let row = data.row;
+                Some(sqlite::ImportFact {
+                    memory_file: text(&row, 0)?,
+                    text: text(&row, 1)?,
+                    legacy_name: text(&row, 2),
+                    subject: text(&row, 3),
+                    object: text(&row, 4),
+                    embedding: row.get(5).and_then(|value| value.as_array()).map(|values| {
+                        values
+                            .iter()
+                            .map(|value| value.as_f64().unwrap_or_default() as f32)
+                            .collect()
+                    }),
+                    valid_until: row.get(6).and_then(|value| value.as_i64()),
+                })
+            })
+            .collect())
+    }
+
+    pub async fn export_native_triples(
+        &self,
+        scope: &GraphScope,
+    ) -> Result<Vec<sqlite::ImportTriple>, GraphError> {
+        let response = self
+            .query(
+                EXPORT_NATIVE_TRIPLES,
+                serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant()}),
+            )
+            .await?;
+        let text = |row: &[serde_json::Value], at: usize| {
+            row.get(at)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        };
+        Ok(response
+            .results
+            .into_iter()
+            .flat_map(|set| set.data)
+            .filter_map(|data| {
+                let row = data.row;
+                Some(sqlite::ImportTriple {
+                    memory_file: text(&row, 0)?,
+                    key: text(&row, 1)?,
+                    subject: text(&row, 2)?,
+                    relation: text(&row, 3)?,
+                    object: text(&row, 4)?,
+                    confidence: row
+                        .get(5)
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or_default(),
+                    temporal: text(&row, 6).unwrap_or_default(),
+                    status: text(&row, 7).unwrap_or_else(|| "active".into()),
+                    valid_until: row.get(8).and_then(|value| value.as_i64()),
+                })
+            })
+            .collect())
+    }
+
+    /// `(facts, facts with an embedding)` reachable from the scope's memories.
+    pub async fn count_native_facts(&self, scope: &GraphScope) -> Result<(i64, i64), GraphError> {
+        let response = self
+            .query(
+                COUNT_NATIVE_FACTS,
+                serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant()}),
+            )
+            .await?;
+        let row = response
+            .results
+            .into_iter()
+            .flat_map(|set| set.data)
+            .next()
+            .map(|data| data.row)
+            .unwrap_or_default();
+        let at = |index: usize| row.get(index).and_then(|value| value.as_i64()).unwrap_or(0);
+        Ok((at(0), at(1)))
+    }
+
     /// Remove graph data for memories that are no longer in the store.
     pub async fn prune_missing_memories(
         &self,
         scope: &GraphScope,
         files: &[String],
     ) -> Result<(), GraphError> {
+        if let Some(graph) = &self.sqlite {
+            return graph.prune_missing(scope, files);
+        }
         self.query(
             PRUNE_MISSING_MEMORIES,
             serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant(), "files": files}),
@@ -1102,6 +1336,9 @@ impl GraphClient {
 
     /// Files that already have a native node in this store.
     pub async fn native_files(&self, scope: &GraphScope) -> Result<Vec<String>, GraphError> {
+        if let Some(graph) = &self.sqlite {
+            return graph.native_files(scope);
+        }
         self.strings(
             NATIVE_FILES,
             serde_json::json!({"slug": scope.slug(), "tenant": scope.tenant()}),
@@ -1259,6 +1496,11 @@ impl GraphClient {
         statement: &str,
         parameters: serde_json::Value,
     ) -> Result<Response, GraphError> {
+        if self.sqlite.is_some() {
+            return Err(GraphError::Database(
+                "this operation reads the legacy Neo4j graph and is not available on graph.backend: sqlite".into(),
+            ));
+        }
         let response = self.client.post(&self.endpoint).basic_auth(&self.user, Some(&self.password)).json(&serde_json::json!({"statements": [{"statement": statement, "parameters": parameters}]})).send().await?.error_for_status()?.json::<Response>().await?;
         if let Some(error) = response.errors.first() {
             return Err(GraphError::Database(error.message.clone()));

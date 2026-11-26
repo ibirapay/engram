@@ -601,6 +601,7 @@ dependencies = [
  "engram-paths",
  "engram-tenant",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror",

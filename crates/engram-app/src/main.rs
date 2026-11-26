@@ -425,7 +425,10 @@ fn validate_edit(path: &Path, mut edit: EditableConfig) -> Result<(EditableConfi
     ) {
         return Err("unsupported embedding provider".into());
     }
-    if !matches!(edit.graph.backend.as_str(), "native" | "graphiti_compat") {
+    if !matches!(
+        edit.graph.backend.as_str(),
+        "native" | "sqlite" | "graphiti_compat"
+    ) {
         return Err("unsupported graph backend".into());
     }
     if edit.embed.dim == 0 || edit.llama_cpp.timeout_seconds == 0 {

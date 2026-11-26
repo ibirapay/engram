@@ -274,6 +274,13 @@ def _neo4j_uri() -> str:
             or (cfg().get("graph", {}) or {}).get("neo4j_uri")
             or "bolt://127.0.0.1:7687")
 
+def _graph_store_up() -> bool:
+    """The graph store the tasks need is reachable. With `graph.backend: sqlite` it is a
+    local file (nothing to probe, and a Neo4j that is down or gone must not defer the
+    sync); otherwise it is Neo4j."""
+    return graph_backend() == "sqlite" or _neo4j_up()
+
+
 def _neo4j_up() -> bool:
     p = urlparse(_neo4j_uri())
     try:
@@ -317,13 +324,16 @@ def task_health():
         h = engram_llm.health(cfg())
     except Exception as e:
         h = {"error": str(e)}
-    h["neo4j"] = _neo4j_up()
+    if graph_backend() == "sqlite":
+        h["graph"] = "sqlite"
+    else:
+        h["neo4j"] = _neo4j_up()
     if _vector_enabled():
         h["qdrant"] = _qdrant_up()
     log(f"health: {json.dumps(h)}")
 
 def task_graph():
-    if not _neo4j_up():
+    if not _graph_store_up():
         log("graph: Neo4j down — skipping insert")
         return False
     # --limit: graph_sync extracts every pending memory BEFORE its single terminal
@@ -553,12 +563,12 @@ def _graphiti_maintenance(mode: str, *python_args: str):
         + list(python_args)) == 0)
 
 def task_export():
-    if not _neo4j_up():
+    if not _graph_store_up():
         return False
     return _graphiti_maintenance("export", "--export", "--verify")
 
 def task_reconcile():
-    if not _neo4j_up():
+    if not _graph_store_up():
         return False
     return _graphiti_maintenance("reconcile", "--reconcile")
 

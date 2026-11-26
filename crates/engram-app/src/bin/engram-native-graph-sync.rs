@@ -139,12 +139,18 @@ async fn run(args: Args) -> Result<usize, SyncError> {
     if let Some(password) = args.password.filter(|value| !value.trim().is_empty()) {
         creds.password = engram_config::Secret::new(password);
     }
-    if creds.password.is_empty() {
+    let backend = std::env::var("ENGRAM_GRAPH_BACKEND")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| config.graph.backend.clone());
+    if backend != "sqlite" && creds.password.is_empty() {
         return Err(
             "no Neo4j password: set NEO4J_PASSWORD, graph.neo4j_password, or graph/.env".into(),
         );
     }
-    let client = GraphClient::from_credentials(&creds).map_err(|error| error.to_string())?;
+    let client =
+        GraphClient::connect(&backend, &creds, &config_path).map_err(|error| error.to_string())?;
 
     // The legacy import is pure Cypher — no model is called — so it must run
     // BEFORE the provider gates below. Gating it was a real obstruction: the
