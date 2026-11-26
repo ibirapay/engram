@@ -88,6 +88,33 @@ def concrete_tokens():
     print("ok — commands, flags, refs and any-root paths survive a lossy rewrite verbatim")
 
 
+def remerge_is_stable():
+    """An umbrella merged again (its appendix is now part of a source) keeps every fact at the
+    same size. Entries used to come back with one more "(from x.md)" per generation, or nested
+    inside each other, and the appendix headers turned into caveats."""
+    tmp = ROOT / "tests" / "_tmp_remerge"; tmp.mkdir(exist_ok=True); mdv.MEM = tmp
+    (tmp / "project_a.md").write_text(
+        "---\nname: a\n---\nBlocks live in /data/x/blocks/ there. Never run `rm -rf /data/x` here.\n")
+    (tmp / "project_b.md").write_text("---\nname: b\n---\nOther prose.\n")
+    mdv.ollama_stream = lambda p, c: ("Umbrella prose without tokens.", "stop", 0.0)
+    sizes = []
+    for _ in range(3):
+        final, _rep = mdv.distill_cluster("project", ["project_a.md", "project_b.md"])
+        (tmp / "project_a.md").write_text("---\nname: a\n---\n" + final)   # merged again next time
+        sizes.append(len(final))
+    assert sizes[0] == sizes[1] == sizes[2], f"the umbrella grows on every re-merge: {sizes}"
+    assert "/data/x/blocks/" in final and "rm -rf /data/x" in final, "a fact was lost on re-merge"
+    # one restated line: no stacked tag, and the caveat inside it is not written a second time
+    assert final.count("(from ") == 1, final
+    # an old-format entry (token, tag, " — ", context) reads back as plain text; scaffolding drops
+    old = ("x\n\n## Reference facts (verbatim — auto-preserved from sources)\n_Hard facts/caveats from x._\n\n"
+           "### Hard facts\n- `/data/y` (path, from a.md) — Data in /data/y.\n<details><summary>s.md</summary>\n")
+    assert mdv.prior_appendix_lines(old) == ["`/data/y` Data in /data/y."], mdv.prior_appendix_lines(old)
+    shutil.rmtree(tmp)
+    print("ok — merging an umbrella again keeps its facts at the same size")
+
+
 if __name__ == "__main__":
     main()
     concrete_tokens()
+    remerge_is_stable()

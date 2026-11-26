@@ -96,6 +96,26 @@ PRIOR_APPENDIX_RE = re.compile(r"\n#+\s*Reference facts \(verbatim.*\Z",
 def strip_prior_appendix(text: str) -> str:
     return PRIOR_APPENDIX_RE.sub("\n", text)
 
+# An earlier appendix's scaffolding (headers, notes, <details> wrappers) and the source tag each
+# entry carries: "(from x.md)", "(path, from x.md)", and the " — " that used to follow it.
+_APPX_SCAFFOLD_RE = re.compile(r"^(?:#+\s|_Hard facts/caveats|_Full sources kept|</?details)")
+_APPX_TAG_RE = re.compile(r"\s*\((?:\w+, )?from [^()\s]+\)(?:\s*—)?")
+
+def prior_appendix_lines(text: str) -> list:
+    """The entries of an earlier merge's appendix as plain lines: no bullet, no source tag, no
+    headers. Merging an umbrella again keeps their facts, but used to restate them WITH their old
+    tag (one more "(from x.md)" per generation) or nest the whole old entry inside the new one."""
+    m = PRIOR_APPENDIX_RE.search(text or "")
+    out = []
+    for ln in (m.group(0) if m else "").splitlines():
+        ln = ln.strip()
+        if not ln or _APPX_SCAFFOLD_RE.match(ln):
+            continue
+        ln = _APPX_TAG_RE.sub("", re.sub(r"^[-*+]\s+", "", ln)).strip()
+        if ln:
+            out.append(ln)
+    return out
+
 def fact_present(disp: str, kind: str, hay: str, hay_norm: str) -> bool:
     """True if a fact is already conveyed by the prose, tolerant of formatting.
     The old `formatted-token in prose` substring check produced false 'missing'
@@ -234,19 +254,22 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
     for f in files:
         body, n = redact_secrets((MEM / f).read_text(errors="ignore"))
         n_redacted += n
-        sources[f] = strip_prior_appendix(body)
+        prose = strip_prior_appendix(body)
+        sources[f] = prose
         # Feed the model the prose WITHOUT any prior auto-appendix (no re-parroting,
-        # no accretion); extract the preservation checklist from the FULL body.
+        # no accretion). The preservation checklist covers that appendix too, read as plain
+        # lines, one paragraph each (its tags and headers are not facts or caveats).
         # Body is already secret-redacted, so nothing secret reaches the prompt,
         # the fact/caveat checklist, the appendix source-lines, or the draft.
-        members_text += f"### {f}\n{strip_prior_appendix(body)}\n\n---\n\n"
-        for norm, (disp, kind) in extract_facts(body).items():
+        members_text += f"### {f}\n{prose}\n\n---\n\n"
+        keep = prose + "\n\n" + "\n\n".join(prior_appendix_lines(body))
+        for norm, (disp, kind) in extract_facts(keep).items():
             facts.setdefault(norm, (disp, kind))
             if norm not in fact_src:
-                for ln in body.splitlines():
+                for ln in keep.splitlines():
                     if disp.lower() in ln.lower():
                         fact_src[norm] = (f, ln.strip()); break
-        all_caveats += [(c, f) for c in caveats(body)]
+        all_caveats += [(c, f) for c in caveats(keep)]
     if verbose:
         print(f"[{key}] {len(files)} notes · {len(facts)} hard facts · {len(all_caveats)} caveat lines", flush=True)
 
@@ -277,12 +300,12 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
     if missing or missing_cav:
         appendix = "\n\n## Reference facts (verbatim — auto-preserved from sources)\n"
         appendix += "_Hard facts/caveats from the source notes that the prose above did not restate. Kept here so nothing is lost._\n\n"
+        # A short source line is restated ONCE and carries all its missing tokens verbatim (it
+        # used to be repeated as context under every token it held). A long or secret-looking
+        # line gives way to one entry per token.
+        restated = []                           # (file, line), each once
         if missing:
             appendix += "### Hard facts\n"
-            # A short source line is restated ONCE and carries all its missing tokens verbatim (it
-            # used to be repeated as context under every token it held). A long or secret-looking
-            # line gives way to one entry per token.
-            restated = []                       # (file, line), each once
             for n in sorted(missing, key=lambda n: facts[n][1]):
                 disp, kind = facts[n]; src = fact_src.get(n, ("?", ""))
                 if src[1] and len(src[1]) <= 160 and not looks_secret(src[1]):
@@ -292,6 +315,9 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
                     appendix += f"- `{disp}` ({kind}, from {src[0]})\n"
             for f, ln in restated:
                 appendix += f"- {re.sub(r'^[-*+]\s+', '', ln)} (from {f})\n"
+        # a caveat already inside a restated line is not written twice
+        missing_cav = [(c, f) for c, f in missing_cav
+                       if not any(c.lower() in ln.lower() for _, ln in restated)]
         if missing_cav:
             appendix += "\n### Caveats / rules\n"
             for c, f in missing_cav:

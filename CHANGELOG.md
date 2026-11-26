@@ -16,6 +16,10 @@ concentrated in the four largest.
 - **The appendix is smaller and readable.** A short source line is restated once and carries all
   its missing tokens with their context; it used to be repeated under every token it held. Long
   lines fall back to one entry per token, and a token inside another missing one is listed once.
+- **Merging an umbrella again is stable.** Its earlier appendix is read back as plain lines, so a
+  re-merge keeps those facts at the same size. Before, each generation stacked one more
+  "(from x.md)" tag, nested the whole old entry inside the new one, and turned the appendix headers
+  into caveats ("Caveats / rules - ..."). A caveat already inside a restated line is not repeated.
 - **A merge that did not compress does not apply on its own.** When the appendix is more than half
   of the umbrella (`auto_curate.max_appendix_ratio`, default 0.5) autonomous runs skip the cluster
   and the others queue it with the reason, without paying for a review call. On the measured
