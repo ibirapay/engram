@@ -431,6 +431,26 @@ def _apply_merge_undo(params):
     return True, f"restored {restored} (umbrella original + absorbed)"
 
 
+SETTLE_DAYS = 7
+
+
+def _settle(d: Path) -> None:
+    """Accept an earlier merge for good: its backup moves to .trash/ (what sweep() does when
+    probation ends; recoverable there for 90 days) and its Telegram UNDO record closes, so a late
+    tap answers "merge backup gone" instead of restoring over the newer merge."""
+    import shutil
+    trash = MEM / ".trash"; trash.mkdir(parents=True, exist_ok=True)
+    mid = d.name[len("merge-"):]
+    shutil.move(str(d), str(trash / f"{d.name}-{_now()}"))
+    for u in _dir("undo").glob("*.json"):
+        try:
+            rec = json.loads(u.read_text())
+        except Exception:
+            continue
+        if rec.get("op") == "merge_undo" and (rec.get("params") or {}).get("merge_id") == mid:
+            u.rename(_dir("undone") / u.name)
+
+
 def _apply_merge(params):
     """Apply a compress-merge REVERSIBLY. Backs up the EXACT pre-merge set — the
     umbrella member's ORIGINAL content AND every absorbed source — to .quarantine/
@@ -485,19 +505,29 @@ def _apply_merge(params):
     # an un-undone merge. Checking only the umbrella let a file be absorbed by one merge
     # and act as umbrella in another; undoing those out of order restores an intermediate
     # version over the original and drops the remaining backup.
+    # ...unless that earlier merge is older than settle_days: nobody undid it in that window,
+    # so it is accepted for good (SETTLED, below) instead of locking these memories out of
+    # curation until probation ends (18 live memories were locked on 2026-11-26).
+    settle_s = float(params.get("settle_days", SETTLE_DAYS)) * 86400
+    settling = []
     for d in quar.glob("merge-*"):
         if d == txn:
             continue
         for f in {umbrella, *absorbed}:
             if (d / f"{f}.orig").is_file() or (d / f).is_file():
+                if _now() - d.stat().st_mtime >= settle_s:
+                    settling.append(d); break
                 return False, (f"{f} is referenced by an outstanding merge backup "
-                               f"({d.name}) — undo that first; nothing changed")
+                               f"({d.name}) — undo that first, or it settles after "
+                               f"{settle_s / 86400:g} days; nothing changed")
     # EXCLUSIVE: never reuse a transaction dir. merge_id is content-derived, so an
     # existing one means an unresolved backup from a previous merge — writing into it
     # would overwrite that .orig and destroy the earlier undo.
     if txn.exists():
         return False, (f"transaction dir {txn.name} already exists (unresolved prior merge) "
                        f"— undo or clear it first; nothing changed")
+    for d in settling:                                 # every check passed: settle, then merge
+        _settle(d)
     txn.mkdir(parents=True, exist_ok=False)
     had_orig = (MEM / umbrella).is_file()
     if had_orig:                                       # 1. back up umbrella ORIGINAL
@@ -532,6 +562,8 @@ def _apply_merge(params):
                 deindex_failed.append(f"{f}({d.stderr.strip()[:60]})")
             moved.append(f)
     detail = f"umbrella {umbrella} written; backup in merge-{merge_id} (orig+{moved})"
+    if settling:
+        detail += f"; settled earlier merge(s) {[d.name for d in settling]} (→ .trash, undo closed)"
     if deindex_failed:
         # SUCCESS-WITH-WARNING, deliberately not False: by this point the umbrella is
         # overwritten and the sources are moved. Returning False would make callers skip

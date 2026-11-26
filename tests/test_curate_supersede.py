@@ -219,6 +219,40 @@ def test_apply_merge_rejects_a_file_in_an_outstanding_transaction():
     print("ok — refuses a file already held by an outstanding transaction")
 
 
+def test_an_earlier_merge_settles_after_settle_days():
+    """An earlier merge nobody undid for settle_days no longer locks its files out of curation:
+    its backup goes to .trash and its UNDO record closes; a younger one still blocks."""
+    import hashlib, json, time
+    g = _gate(); d = Path(tempfile.mkdtemp()); g.MEM = d; g.Q = d / ".approvals"; g.HOME = d
+    (d / ".claude").mkdir()
+    save = d / ".claude" / "save_memory.sh"      # fake writer: stdin -> the memory file
+    save.write_text(f'#!/bin/sh\ncat > "{d}/$1"\n'); save.chmod(0o755)
+    doc = "---\nname: b\ndescription: d\n---\n\nbody\n"
+    (d / "b.md").write_text(doc)
+    prior = d / ".quarantine" / "merge-earlier"; prior.mkdir(parents=True)
+    (prior / "b.md.orig").write_text("b before the earlier merge")
+    for uid, mid in (("u1", "earlier"), ("u2", "unrelated")):
+        (g._dir("undo") / f"{uid}.json").write_text(json.dumps(
+            {"id": uid, "op": "merge_undo", "params": {"umbrella": "b.md", "absorbed": [], "merge_id": mid}}))
+    sha = {"b.md": hashlib.sha256((d / "b.md").read_bytes()).hexdigest()}
+    params = {"umbrella": "b.md", "umbrella_content": doc.replace("body", "merged"), "desc": "d",
+              "absorbed": [], "merge_id": "later", "src_sha": sha, "settle_days": 7}
+    six = time.time() - 6 * 86400
+    os.utime(prior, (six, six))
+    ok, why = g._apply_merge(params)
+    assert not ok and "settles after 7 days" in why and prior.is_dir(), why
+    eight = time.time() - 8 * 86400
+    os.utime(prior, (eight, eight))
+    ok, why = g._apply_merge(params)
+    assert ok and "settled earlier merge(s) ['merge-earlier']" in why, why
+    assert not prior.exists() and len(list((d / ".trash").glob("merge-earlier-*"))) == 1
+    assert (g._dir("undone") / "u1.json").is_file() and (g._dir("undo") / "u2.json").is_file(), \
+        "only the settled merge's undo record closes"
+    assert "merged" in (d / "b.md").read_text() and (d / ".quarantine" / "merge-later" / "b.md.orig").is_file()
+    shutil.rmtree(d)
+    print("ok — an earlier merge settles after settle_days; a younger one still blocks")
+
+
 def test_descriptions_with_a_colon_survive_every_document_builder():
     """A description holding ": " (real ones do: "Fake OTC (live on prod): a Mesa ...") used to be
     written as a plain YAML scalar, which is a ScannerError: curate held the umbrella on every pass
@@ -384,6 +418,7 @@ if __name__ == "__main__":
     test_apply_merge_refuses_stale_sources()
     test_apply_merge_refuses_to_reuse_a_transaction_dir()
     test_apply_merge_rejects_a_file_in_an_outstanding_transaction()
+    test_an_earlier_merge_settles_after_settle_days()
     test_descriptions_with_a_colon_survive_every_document_builder()
     test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept()
     test_a_merge_that_would_mask_a_txid_or_address_is_held()

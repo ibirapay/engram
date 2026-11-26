@@ -86,6 +86,9 @@ AC_DEFAULTS = {
     # Only what THIS rewrite dropped counts; lines carried over from an earlier merge's appendix
     # (which the model never sees) do not, or a merged umbrella could never be merged again.
     "max_appendix_ratio": 0.5,
+    # An earlier merge nobody undid within this many days is accepted for good when a new merge
+    # needs one of its files (its backup goes to .trash, 90 days). Below it, it still blocks.
+    "settle_days": 7,
 }
 
 
@@ -377,7 +380,7 @@ def main():
                  + "supersede").encode()).hexdigest()[:10]
             params = {"umbrella": keeper, "umbrella_content": content, "desc": kdesc,
                       "absorbed": absorbed, "merge_id": merge_id,
-                      "src_sha": sha0}
+                      "src_sha": sha0, "settle_days": ac["settle_days"]}
             preview = (f"Supersede: {absorbed} are canonically IDENTICAL copies of "
                        f"{keeper}. Keeper unchanged; absorbed→quarantine.")
             print(f"\n· {files} -> {keeper}  [SUPERSEDE — lossless]")
@@ -445,7 +448,8 @@ def main():
         merge_id = _hl.sha256((umbrella.name + "".join(sorted(absorbed)) + doc
                                + json.dumps(sha0, sort_keys=True)).encode()).hexdigest()[:10]
         params = {"umbrella": umbrella.name, "umbrella_content": doc, "desc": desc,
-                  "absorbed": absorbed, "merge_id": merge_id, "src_sha": sha0}
+                  "absorbed": absorbed, "merge_id": merge_id, "src_sha": sha0,
+                  "settle_days": ac["settle_days"]}
         # Say what the merge actually kept. "near-lossless" used to sit next to a prose coverage of
         # 0.0: that number is the share of source sentences copied word for word, so any rewrite
         # scores ~0 and it said nothing about what survived.
