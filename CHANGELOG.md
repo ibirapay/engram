@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.8.0 — the pipeline drains on its own: nothing waits for a person
+
+A full run on 2026-11-26 showed four places where "autonomous" work stalled until someone stepped
+in. Each is now resolved by the pipeline itself.
+
+- **Graduation drains the whole queue.** It evaluated 8 candidates per run in name order, and holds
+  that never change took 7 of those slots, so with the daily timer one candidate a day was really
+  evaluated against an intake of 150-250 (804 queued; about 200 a day would have expired
+  unevaluated). Now every staged candidate goes through the cheap gates each run (noise, provenance,
+  confidence, dedup, denylist, secret scan), user-direct first and then oldest first:
+  - a failed provenance or confidence gate is terminal: the candidate moves to `.staging/.expired/`
+    (recoverable) instead of coming back every run;
+  - the injection check, the only model call, is bounded by `auto_graduate.llm_budget_seconds`
+    (1800) and stops after 3 failures in a row; what does not fit is deferred to the front of the
+    next run;
+  - a near-copy of something graduated earlier in the same run is dropped;
+  - `max_per_run` defaults to 0 (no cap); the Telegram run summary shows TTL expiries and model time.
+- **Earlier merges settle.** A merge could not touch a file of another merge still inside its
+  30-day undo window, which locked 18 live memories out of curation. A merge nobody undid for
+  `auto_curate.settle_days` (7) now settles when needed: its backup moves to `.trash/` (as the
+  probation sweep does at 30 days) and its UNDO record closes. A younger one still blocks.
+- **Txids, addresses and full hashes reach the umbrella.** The distiller swaps each public value for
+  a stand-in `«vN»` before redaction; the model, the checklist and the appendix only see the
+  stand-in, and the final document gets the original back. Only values from the sources are
+  restored and credentials stay masked. The public-value HOLD (about 65 money memories) is replaced
+  by a reconciliation after distill. `engram_secrets.public_values()` is the shared definition.
+- **A skipped cluster is not distilled again for nothing.** A cluster skipped after a distill call
+  (bloated, REJECT, malformed, a refused apply) is remembered in `.curate_skips.json` and retried
+  only when one of its files changes or `auto_curate.retry_days` (7) pass.
+
 ## 1.7.4 — memory frontmatter is read the way it is written
 
 Measured 2026-11-26: 63 of 1120 live memories and 38 of 804 staged candidates had a `name:` or

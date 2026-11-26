@@ -89,6 +89,10 @@ AC_DEFAULTS = {
     # An earlier merge nobody undid within this many days is accepted for good when a new merge
     # needs one of its files (its backup goes to .trash, 90 days). Below it, it still blocks.
     "settle_days": 7,
+    # A cluster skipped AFTER a distill call (bloated, REJECT, malformed, a failed apply...) is not
+    # distilled again until one of its files changes or this many days pass: retrying an
+    # unchanged cluster every day spent a model call for the same answer.
+    "retry_days": 7,
 }
 
 
@@ -105,6 +109,23 @@ def ac_cfg(cfg):
 
 
 _FM_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.S)
+
+
+SKIPS_FILE = ".curate_skips.json"
+
+
+def _load_skips(retry_days: float) -> dict:
+    """Remembered skips younger than retry_days, keyed by the cluster's files and content hashes."""
+    try:
+        skips = json.loads((MEM / SKIPS_FILE).read_text())
+    except Exception:
+        return {}
+    cutoff = __import__("time").time() - retry_days * 86400
+    return {k: v for k, v in skips.items() if isinstance(v, dict) and v.get("at", 0) >= cutoff}
+
+
+def _skip_key(sha0: dict) -> str:
+    return json.dumps(sorted(sha0.items()))
 
 
 def _umbrella_doc(stem: str, desc: str, typ: str, body: str) -> str:
@@ -335,6 +356,8 @@ def main():
     print(f"near-dup clusters this run: {len(typed)} (cap {ac['max_merges_per_run']} merge attempts)")
     import engram_telegram_gate as gate
     done = queued = attempted = 0
+    retry_days = float(ac.get("retry_days", 7))
+    skips = _load_skips(retry_days)
     for files in typed:
         # The cap counts clusters that cost a merge attempt. A cluster held from its sources alone
         # (credential or public value, below) costs nothing and must not take a slot: those holds
@@ -348,6 +371,20 @@ def main():
         # produced, so _apply_merge would wave through an umbrella computed from the OLD
         # bytes while a newly added fact sat unread in the source.
         sha0 = _src_sha(files)
+        key = _skip_key(sha0)
+        if key in skips:
+            print(f"· {files}: SKIP (unchanged since: {skips[key]['reason']}; retried after "
+                  f"{retry_days:g} days or an edit)")
+            continue
+
+        def remember(why, key=key, files=files):
+            """A skip that cost a distill call: do not pay for the same answer again tomorrow."""
+            if apply:
+                skips[key] = {"files": files, "reason": why[:160], "at": int(__import__("time").time())}
+                try:
+                    (MEM / SKIPS_FILE).write_text(json.dumps(skips, indent=1))
+                except OSError:
+                    pass
         # ── SUPERSEDE first: if the members are identical copies, this is not a
         # compression problem at all. Keep one BYTE-FOR-BYTE and quarantine the rest —
         # no LLM, no coverage score, nothing generated that could be lossy or malformed.
@@ -387,7 +424,7 @@ def main():
                                  f"🧠 superseded (lossless): {preview}\nTap UNDO to reverse.")
                 print(f"  APPLIED ({detail})"); done += 1
             else:
-                print(f"  FAILED ({detail})")
+                print(f"  FAILED ({detail})"); remember(f"supersede failed: {detail}")
             continue
         umbrella = max(paths, key=lambda p: _score(p, scores))   # keep the highest-trust member's name
         name, desc, typ = _fm(umbrella)
@@ -419,17 +456,18 @@ def main():
         bloated = ratio > float(ac["max_appendix_ratio"])
         body = _body_of(final)
         if not body.strip():
-            print(f"· {files}: HOLD (empty umbrella) — skipping"); continue
+            print(f"· {files}: HOLD (empty umbrella) — skipping"); remember("empty umbrella"); continue
         doc = _umbrella_doc(umbrella.stem, desc, typ, body)
         okdoc, whydoc = gate.validate_memory_doc(doc)
         if not okdoc:
-            print(f"· {files}: HOLD (malformed umbrella: {whydoc}) — skipping"); continue
+            print(f"· {files}: HOLD (malformed umbrella: {whydoc}) — skipping")
+            remember(f"malformed umbrella: {whydoc}"); continue
         # Reconciliation: every public value of the sources must be in the umbrella (the
         # distiller restores them by construction; this catches a regression). Counted only.
         lost = {v for t in srcs for v in engram_secrets.public_values(t) if v not in doc}
         if lost:
             print(f"· {files}: HOLD (umbrella lost {len(lost)} public value(s): txid, address or "
-                  f"full hash) — skipping"); continue
+                  f"full hash) — skipping"); remember("umbrella lost public values"); continue
         absorbed = [f for f in files if f != umbrella.name]
         # transaction id so a second merge on the same umbrella can't clobber the
         # first merge's backup (each merge's originals live under their own dir)
@@ -458,7 +496,8 @@ def main():
         # HUMAN gate (no model review): every merge goes to the Telegram approval queue.
         if gate_mode == "human":
             if ac.get("autonomous"):
-                print(f"· {files}: SKIP (autonomous but human gate) — fail-closed"); continue
+                print(f"· {files}: SKIP (autonomous but human gate) — fail-closed")
+                remember("autonomous but human gate"); continue
             gate.propose("merge_apply", params, f"Needs your approval (human gate). {preview}",
                          files=files, verdict="human-gate")
             print("  QUEUED for human approval (human gate)"); queued += 1
@@ -480,6 +519,8 @@ def main():
                                  {"umbrella": umbrella.name, "absorbed": absorbed, "merge_id": merge_id},
                                  f"🧠 auto-merged: {preview}\nTap UNDO to reverse.")
                 done += 1
+            else:
+                remember(f"apply refused: {detail}")
         else:
             if verdict == "BLOATED":
                 why = (f"this rewrite restated {ratio:.0%} of the umbrella in its appendix, over "
@@ -489,7 +530,7 @@ def main():
             else:
                 why = f"lossy compression (cov={cov} < {ac['min_auto_coverage']})"
             if ac.get("autonomous"):
-                print(f"· {files}: SKIP ({why}) — not queued"); continue
+                print(f"· {files}: SKIP ({why}) — not queued"); remember(why); continue
             gate.propose("merge_apply", params, f"Needs approval — {why}. {preview}",
                          files=files, verdict=verdict)
             print(f"  QUEUED for human approval ({why})"); queued += 1

@@ -286,17 +286,18 @@ def test_descriptions_with_a_colon_survive_every_document_builder():
 
 # ── the compress decision, through main() ──────────────────────────────────
 def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=None, cap=None,
-                  umbrella_body="umbrella body\n"):
+                  umbrella_body="umbrella body\n", store=None, dry=False):
     """Drive main() through compress merges, every outside dependency stubbed: the vector store pairs
     project_a/project_b (plus `more` pairs: {name: body}), distill returns `report`, the reviewer
     approves. engram_secrets is the real one (its regexes decide the credential and value holds).
     Returns the calls and everything main() printed."""
     import contextlib, io
-    d = Path(tempfile.mkdtemp())
+    d = store or Path(tempfile.mkdtemp())      # a given store is reused (and kept) across runs
     fm = "---\nname: {n}\ndescription: d\nmetadata:\n  type: project\n---\n\n{b}\n"
     bodies = {"project_a.md": body_a, "project_b.md": "beta holds another fact", **(more or {})}
     for f, b in bodies.items():
-        (d / f).write_text(fm.format(n=f[:-3], b=b))
+        if not (d / f).exists():
+            (d / f).write_text(fm.format(n=f[:-3], b=b))
     names = sorted(bodies)
     pairs = [(0.99, names[i], names[i + 1]) for i in range(0, len(names) - 1, 2)]
     calls = {"apply": 0, "verify": 0, "distill": 0, "notify": [], "propose": []}
@@ -323,7 +324,7 @@ def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=N
     stubs = {"vector_store": store, "qdrant_client": types.ModuleType("qdrant_client")}
     saved = {k: sys.modules.get(k) for k in stubs}
     sys.modules.update(stubs)
-    argv, sys.argv = sys.argv, ["memory_auto_curate.py", "--apply"]
+    argv, sys.argv = sys.argv, ["memory_auto_curate.py"] + ([] if dry else ["--apply"])
     out = io.StringIO()
     try:
         m = _load("memory_auto_curate", ROOT / "bin" / "memory_auto_curate.py", memory_ai=mai,
@@ -340,7 +341,8 @@ def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=N
         sys.argv = argv
         for k, v in saved.items():
             sys.modules.pop(k) if v is None else sys.modules.__setitem__(k, v)
-        shutil.rmtree(d)
+        if store is None:
+            shutil.rmtree(d)
     calls["out"] = out.getvalue()
     return calls
 
@@ -419,6 +421,35 @@ def test_a_credential_hold_never_prints_the_credential():
     print("ok — a credential hold reports a count, never the value")
 
 
+def test_a_skipped_cluster_is_not_distilled_again_until_it_changes():
+    """A cluster skipped after a distill call (here: bloated) is not distilled again on the next
+    run; an edit to one of its files, or retry_days passing, brings it back."""
+    import json, time
+    bloated = {**BASE, "appendix_facts": 30, "appendix_chars": 650, "appendix_fresh_chars": 600}
+    d = Path(tempfile.mkdtemp())
+    first = _run_compress(bloated, store=d)
+    assert first["distill"] == 1 and "SKIP (this rewrite restated 60%" in first["out"], first["out"]
+    again = _run_compress(bloated, store=d)
+    assert again["distill"] == 0 and "SKIP (unchanged since: this rewrite restated" in again["out"], again["out"]
+    (d / "project_b.md").write_text((d / "project_b.md").read_text() + "\nnew fact\n")
+    edited = _run_compress(bloated, store=d)
+    assert edited["distill"] == 1, "an edited cluster was not retried"
+    skips = json.loads((d / ".curate_skips.json").read_text())
+    for v in skips.values():
+        v["at"] = int(time.time()) - 8 * 86400
+    (d / ".curate_skips.json").write_text(json.dumps(skips))
+    aged = _run_compress(bloated, store=d)
+    assert aged["distill"] == 1, "a skip older than retry_days was not retried"
+    shutil.rmtree(d)
+    # a dry run writes nothing, not even a remembered skip (this hold fires before the dry-run exit)
+    d = Path(tempfile.mkdtemp())
+    report = {**BASE, "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0}
+    dry = _run_compress(report, body_a=f"txid {'9f2c' * 16}", store=d, dry=True)
+    assert "lost 1 public value" in dry["out"] and not (d / ".curate_skips.json").exists(), dry["out"]
+    shutil.rmtree(d)
+    print("ok — a skipped cluster is not distilled again until it changes or retry_days pass")
+
+
 if __name__ == "__main__":
     test_validator_rejects_the_real_malformed_shapes()
     test_unwrap_fence_leaves_inner_code_blocks_alone()
@@ -434,3 +465,4 @@ if __name__ == "__main__":
     test_public_values_reach_the_umbrella_or_the_merge_is_held()
     test_held_clusters_take_no_slot()
     test_a_credential_hold_never_prints_the_credential()
+    test_a_skipped_cluster_is_not_distilled_again_until_it_changes()
