@@ -97,5 +97,18 @@ def test_tick_reports_failed_tasks():
     print("ok — tick() reports failed tasks, empty when all ran")
 
 
+def test_native_skip_is_not_a_failure():
+    """Under graph.backend=native there is no export/reconcile: that skip is permanent by
+    design, so it must not make tick() report a failure (the unit would be red forever)."""
+    d = tempfile.mkdtemp()
+    m = _load(Path(d) / "s.json", {"export": 0, "reconcile": 0})
+    m._neo4j_up = lambda: True
+    m.graphiti_compat_enabled = lambda: False
+    m.ORDER = ["export", "reconcile"]
+    assert m.tick() == [], "native skip of export/reconcile was reported as a failure"
+    import shutil; shutil.rmtree(d)
+    print("ok — native skip of export/reconcile is not a failure")
+
+
 if __name__ == "__main__":
-    test_tick_reports_failed_tasks(); test_deferred_task_is_not_stamped(); test_real_tasks_defer_when_deps_down(); test_graphiti_compat_uses_legacy_jobs()
+    test_native_skip_is_not_a_failure(); test_tick_reports_failed_tasks(); test_deferred_task_is_not_stamped(); test_real_tasks_defer_when_deps_down(); test_graphiti_compat_uses_legacy_jobs()

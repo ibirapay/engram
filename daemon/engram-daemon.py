@@ -518,7 +518,7 @@ def task_curate():
         _run([_vector_python(), str(ac), "--apply"])
 
 
-def _graphiti_maintenance(mode: str, *python_args: str) -> bool:
+def _graphiti_maintenance(mode: str, *python_args: str):
     """Run a Graphiti export/reconcile pass, or skip it under a native reader.
 
     `engram-graph-sync` is a thin wrapper that shells out to graph/graph_sync.py,
@@ -534,7 +534,9 @@ def _graphiti_maintenance(mode: str, *python_args: str) -> bool:
     if not graphiti_compat_enabled():
         log(f"{mode}: native backend selected and there is no native {mode} — "
             f"SKIPPING (graph.backend: graphiti_compat enables the Graphiti one)")
-        return False
+        # None, not False: this skip is permanent by design, not a deferral. False would
+        # make every tick report export/reconcile as FAILED and the unit never go green.
+        return None
     # Per tenant: export regenerates .md from ONE store's episodes and reconcile
     # reads ONE group, so an unscoped pass operates on whichever store the
     # environment names and reports success for the rest.
