@@ -140,9 +140,12 @@ fn embedding_bytes(vector: &[f32]) -> Vec<u8> {
 }
 
 fn embedding_from(bytes: &[u8]) -> Vec<f32> {
+    // Whole 4-byte groups only; a torn tail is dropped, which the length check in
+    // `similarity` then turns into "no score" rather than a wrong one.
     bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .chunks(4)
+        .filter_map(|chunk| <[u8; 4]>::try_from(chunk).ok())
+        .map(f32::from_le_bytes)
         .collect()
 }
 
