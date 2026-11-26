@@ -48,17 +48,19 @@ Every LLM/embedding call routes through one module so the same engine runs on an
   to `engram_llm`, so existing callers route through it unchanged.
 
 ## 4. The graph (associative + temporal index)
-- **Neo4j** (loopback, via `graph/docker-compose.yml`) + **Graphiti**.
-- `graph_sync.py` is the auto-link orchestrator: new `.md` → LLM extraction (entities +
-  edges per `extract_spec.md`) → `memory_graph_insert.py` builds episode/entity/edge nodes
-  (each episode stores its verbatim `source_md`, so `memory_graph_export.py` regenerates the
-  `.md` byte-exact). `--reconcile` surfaces superseded facts.
-- `mg_config.py` wires Graphiti's embedder + reranker through `engram_llm` (so the graph
-  works in claude-only mode, no GPU). Authority model v1: **.md-authoritative**, graph is
-  the index (graph-authoritative is a documented future mode).
-- **How Claude consumes it**: `mg_mcp_server.py` exposes `memory_recall`,
-  `memory_search_facts`, `memory_neighbors`, `memory_stats` as MCP tools (`engram-graph`).
-  Claude calls them on demand; the `.md` store stays directly readable for verbatim facts.
+- **SQLite**, one local file: `~/.claude/index/graph.db` (`graph.backend: sqlite`, the only
+  backend). Memories, their extracted facts (each with an embedding) and typed triples
+  (`subject relation object`, with confidence, tense and status), scoped by tenant and slug.
+- `engram-native-graph-sync` (Rust) is the writer: new or edited `.md` → LLM extraction
+  (facts + triples) → embeddings → SQLite, one memory at a time, with a commit marker written
+  last so an interrupted sync is retried. A `supersedes` triple retires the older claim it
+  replaces, ordered by the source file's mtime (file name breaks ties).
+- Authority model: **.md-authoritative**; the graph is an index. It is rebuildable, but a
+  rebuild re-runs the LLM over every memory, which is why it is a file worth keeping.
+- **How Claude consumes it**: the prompt hook (`engram-recall-hook`) and the `engram-rust` MCP
+  server (`memory_recall`) read it for facts about the prompt's entities; the `.md` store stays
+  directly readable for verbatim facts.
+- An older install that still has the Neo4j graph copies it once with `engram-graph-to-sqlite`.
 
 ## 4b. The vector index (Qdrant) — OPTIONAL
 A second, independent index over the same `.md` store, for dense semantic search and
@@ -72,7 +74,7 @@ cosine duplicate finder + graph recall) — nothing breaks.
   uuid5 id (re-insert upserts, never duplicates); payload carries `{file, name,
   description, type, slug, sha}` for filtered search/delete and staleness checks.
 - `vector_sync.py` is the sha-synced orchestrator (`--insert`/`--rebuild`/`--delete`/
-  `--status`), mirroring `graph_sync.py`. `save_memory.sh`/`delete_memory.sh` fire
+  `--status`). `save_memory.sh`/`delete_memory.sh` fire
   best-effort, non-blocking single-file syncs; the daemon does the bulk cadence.
 - The light pass (`memory_light_curate.py`) uses Qdrant ANN for the duplicate finder
   when enabled (O(n·log n)), falling back to the O(n²) cosine loop otherwise.
@@ -97,9 +99,8 @@ them into one ranking with **RRF** (`bin/memory_fusion.py`): each memory scores
   `engram-vector` deliberately no longer expose recall: each ran its own graph/vector legs
   and re-embedded the query, so a recall driven through one of them plus engram-rust called
   the embedding model twice for the same text. They keep only their unique tools
-  (graph: facts/neighbours/stats; vector: raw search/stats). The Python `bin/memory_recall.py`
-  (TUI/CLI) also embeds once now — when its graphiti graph leg runs, the redundant Qdrant
-  leg is skipped, mirroring the Rust compat path.
+  (vector: raw search/stats). The TUI calls the Rust recall, so there is one embedding per
+  query.
 - **Graceful degradation**: each ranker is independently try/excepted — a disabled/down
   vector store or graph simply drops out of the fusion; keyword is effectively always there.
 - **Config**: `recall.hybrid` (`k_rrf`, `default_k`, per-ranker `weights`) +
@@ -151,9 +152,7 @@ memory or wiki page.
 - Qdrant: a collection per tenant, named from the resolved tenant, so reaching
   another identity's vectors requires *naming* its collection rather than
   forgetting a filter.
-- Neo4j: a `tenant` property on engram nodes and `group_id` on Graphiti's. Neo4j
-  Community has one database, so a unit test scans every Cypher statement in
-  `engram-graph` and fails the build if any node pattern is unscoped.
+- The SQLite graph: `tenant` and `slug` columns on every table, in every query.
 - The markdown store is read off disk, where no database filter would help, so a
   slug belonging to another identity is refused rather than filtered.
 - **The identity follows the store.** The slug→tenant mapping is operator-declared
@@ -164,18 +163,17 @@ memory or wiki page.
 ## 5. The daemon (24/7) — `daemon/engram-daemon.py`
 A supervisor that runs tasks on independent cadences (a due-check against
 `daemon_state.json` means one timer yields per-task intervals):
-`health` (backend + Neo4j + Qdrant when enabled) · `graph` (`graph_sync --insert`) ·
+`health` (backend + Qdrant when enabled) · `graph` (`engram-native-graph-sync`) ·
 `vector` (`vector_sync --insert`, when enabled) · `maintenance` (light pass + pipeline,
-gated) · `export --verify` · `reconcile`. Two shapes: **systemd** user timer (`--once`)
+gated) · `backup` · `curate`. Two shapes: **systemd** user timer (`--once`)
 or the **claude-only loop container** (`--loop`, `daemon/docker-compose.yml`).
 Respects `local_enabled` and the dry-run gates.
 
 ## 6. File map
 ```
-bin/      engine + engram_llm.py + memory_recall.py + engram-tui.py → ~/.claude/
-bin/hooks/ memory-recall-inject.py (UserPromptSubmit auto-recall)  → ~/.claude/hooks/
+bin/      engine + engram_llm.py + engram-tui.py → ~/.claude/
+crates/   the Rust engine: recall hook, MCP server, graph sync, index → ~/.claude/rust/
 commands/ the 6 /memory-* slash commands                        → ~/.claude/commands/
-graph/    Graphiti/Neo4j: graph_sync, mg_config, mcp_server, …  → ~/.claude/graph/ (+ venv)
 vector/   OPTIONAL Qdrant: vector_store, vector_sync, mcp_server → ~/.claude/vector/ (+ venv)
 daemon/   engram-daemon.py, systemd units, Dockerfile + compose
 examples/memory/  synthetic seed memories (the AcmeCorp stack)

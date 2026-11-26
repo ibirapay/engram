@@ -18,7 +18,7 @@ It's not a flat notes file. It's a pipeline modeled on how human memory actually
 | **Systems consolidation** (hippocampus → neocortex) | `/memory-curate` — cluster narrow facts into class-level "umbrella" memories |
 | **Long-term potentiation / reconsolidation** | `/memory-fixate` — memories graduate *suspect → provisional → corroborated → fixed* |
 | **The forgetting curve / schema abstraction** | `distill` — compress clusters, drop noise (verbatim hard-facts preserved) |
-| **Associative recall** | a **Neo4j knowledge graph** with native Rust triples + embeddings — semantic + multi-hop + temporal |
+| **Associative recall** | a **SQLite knowledge graph** (one local file) of typed triples + embedded facts — semantic + multi-hop + temporal |
 | **Immune system** | an injection guard that quarantines suspicious/poisoned memories |
 
 Your memories are plain Markdown files (`.md`) — the source of truth, readable and
@@ -39,7 +39,7 @@ daemon) drive it forward, and it earns trust as it goes:
    many distillations it survived + injection-suspicion) and graduates it
    *suspect → provisional → corroborated → fixed*. Trusted memories get distilled
    tighter and reviewed less often; suspect (possibly-poisoned) ones are gated through you.
-5. **Recall** — the `.md` store is continuously synced into a **Neo4j graph** and a
+5. **Recall** — the `.md` store is continuously synced into a **SQLite graph** and a
    **Qdrant vector index**. At query time engram fuses graph (associative/temporal) +
    vector (semantic) + keyword (BM25) via Reciprocal Rank Fusion, so Claude loads only
    the memories relevant to the task instead of the whole store.
@@ -59,22 +59,22 @@ mutation is **dry-run + human-approved**.
 ## What it costs you — measured
 
 Auto-recall runs on **every prompt**, so it has to be cheap in both wall-clock and
-context. Numbers below are from a real 358-memory store (Qdrant + Neo4j + Ollama, all
-on localhost), `python3` on Linux — reproduce them with the commands underneath.
+context. Numbers below are from a real ~1,260-memory store (Qdrant on another host, an
+embedding server on another host, the graph in a local SQLite file), measured end to end
+on the prompt hook (`engram-recall-hook`, a static Rust binary):
 
 | | time |
 |---|---|
-| **Auto-recall hook, end to end** | **~0.27s** |
-| ├ Ollama `nomic-embed-text` embed | 0.04s |
-| ├ Qdrant vector search | 0.04s |
-| ├ BM25 keyword leg (358 memories, pure python) | 0.13s |
-| └ Neo4j 1-hop graph facts | 0.07s |
-| The same hook using the *client libraries* instead of HTTP | 1.85s |
+| **Auto-recall hook, end to end (median)** | **~0.2s** |
+| ├ embedding the prompt (remote server) | 0.03s |
+| ├ Qdrant vector search | 0.005s |
+| ├ keyword leg (persistent SQLite index, same BM25 as before) | a few ms |
+| └ graph facts (local SQLite) | a few ms |
 
-The gap is import time, not I/O: `import qdrant_client` alone costs **0.78s** to
-perform a **0.04s** search, and `mg_config` pulls in graphiti for a 0.07s query. So
-the recall path speaks HTTP to Qdrant/Ollama/Neo4j with nothing but the standard
-library — which is also why it needs **no venv, no daemon, and no server**.
+The hook used to read and tokenize every memory file on every prompt (0.86s median on this
+store) and then ask a graph database over the network (0.5s for one query). It now ranks from
+an index kept next to the config and asks a local file, so there is no venv, no daemon and no
+server in the path.
 
 **Context cost is bounded, not per-prompt.** Auto-recall injects names and one-line
 descriptions only — never memory bodies — and never injects the same memory or graph
@@ -90,13 +90,10 @@ long session ends up having loaded ~15-30 unique memories in total.
 ```bash
 # time the whole hook against your own store
 echo '{"prompt":"how does X work","session_id":"bench"}' > /tmp/prompt.json
-time ~/.claude/hooks/memory-recall-inject.py < /tmp/prompt.json
+time ~/.claude/rust/engram-recall-hook < /tmp/prompt.json
 
-# why was it quiet? (gated / not importable / disabled / already injected)
-ENGRAM_HOOK_DEBUG=1 ~/.claude/hooks/memory-recall-inject.py < /tmp/prompt.json
-
-# the recall core alone — add --json for the raw fused ranking
-time ~/.claude/memory_recall.py "how does X work" --k 4 --fast
+# what would the hook inject for a prompt, and which legs answered?
+~/.claude/rust/engram-recall --fast "how does X work" --k 4
 ```
 
 ## Backends — pick what your hardware allows
@@ -128,14 +125,14 @@ embed:
 The embedding server must provide `POST /v1/embeddings`; generation uses
 `POST /v1/chat/completions`. Confirm the model alias with `GET /v1/models`.
 **Changing an embedding model, dimension, normalization, or query/document prefix
-creates a new embedding space and requires rebuilding the Qdrant and Neo4j indexes.**
+creates a new embedding space and requires rebuilding the Qdrant index and the graph.**
 Do not silently fall back from BGE-M3 to Nomic (or vice versa): equal dimensions do
 not make vectors compatible.
 
 ### Rust recall and model API
 
 The Rust workspace owns the fast recall path: Markdown BM25, OpenAI-compatible
-embeddings, Qdrant search/indexing, Neo4j HTTP graph ranking, the prompt hook, and
+embeddings, Qdrant search/indexing, SQLite graph ranking, the prompt hook, and
 the MCP `memory_recall_hybrid` tool. It also exposes a loopback-only service:
 
 ```bash
@@ -252,9 +249,9 @@ Run in any Claude session. Each is **dry-run first** — it shows a plan and you
 
 ### Recall — how the right memories reach Claude
 - **Auto-recall** (the `UserPromptSubmit` hook): every prompt gets the memories that match it injected automatically — no waiting for Claude to think of calling a recall tool. Names + one-line descriptions only, **at most once per memory per session**, ~0.3s, fail-open. The installer uses the Rust hook when available. Off with `recall.inject.enabled: false`.
-- **Rust hybrid recall** (`engram-rust` MCP): `memory_recall_hybrid` fuses Markdown, Qdrant, and Neo4j rankings via Reciprocal Rank Fusion. Native triples use a controlled relation taxonomy, temporal state, and confidence quarantine; the legacy Graphiti MCP remains available only while parity evaluation is in progress.
+- **Rust hybrid recall** (`engram-rust` MCP): `memory_recall_hybrid` fuses Markdown, Qdrant, and SQLite-graph rankings via Reciprocal Rank Fusion. Native triples use a controlled relation taxonomy, temporal state, and confidence quarantine; the legacy Graphiti MCP remains available only while parity evaluation is in progress.
 - **Hybrid recall** (`memory_recall` / `memory_recall_hybrid`, on the `engram-rust` MCP): the single recall path — fuses graph + vector + keyword (BM25) into one ranking via Reciprocal Rank Fusion, keyed by the memory filename, embedding the query once. Degrades to keyword+vector when no graph is installed. Each ranker degrades independently; optional `type` filter.
-- **Graph admin** (`engram-graph` MCP): `memory_search_facts`, `memory_neighbors`, `memory_stats` — graph-native lookups. (Recall moved to `engram-rust`; it used to live here too and re-embedded the query.)
+- **Graph**: lives in `~/.claude/index/graph.db`; the Python `engram-graph` MCP server was removed in 1.6.0 (recall is on `engram-rust`).
 - **Vector inspection** (the optional `engram-vector` MCP): `memory_vector_search`, `memory_vector_stats` — raw dense-search debugging ("is there a memory about X") and index stats via Qdrant. Off by default; enable with `./install.sh --vector`.
 
 - **Local-LLM recall** (`hermes`): if the `hermes` CLI is on `PATH`, the installer also registers the same MCP servers with it, so a **local Ollama model** can recall your memories from the terminal — `hermes -z "recall what you know about X"`. Auto-detected; skip it with `./install.sh --no-hermes`. (Plain `ollama run`/`ollama agent` can't do this — ollama has no MCP client.)
@@ -272,7 +269,7 @@ queues. Pure stdlib `curses`, no server and no browser; saves and deletes go thr
 ## The 24/7 daemon
 `engram-daemon` runs the pipeline + graph sync + health on independent cadences:
 - **systemd** (GPU/host): a user timer fires `engram-daemon --once`.
-- **container** (claude-only): `docker compose up` in `daemon/` runs Neo4j + the loop.
+- **container** (claude-only): `docker compose up` in `daemon/` runs the loop.
 
 ## Safety & privacy
 - **Local-first.** No account needed; memories live in `~/.claude/projects/<slug>/memory`. GitHub sync is opt-in (`--storage github`).
@@ -287,7 +284,7 @@ queues. Pure stdlib `curses`, no server and no browser; saves and deletes go thr
         │                                            │  ▲                     │
         │                                     insert │  │ export (byte-exact) │
         ▼                                            ▼  │                     │
-   recall (MCP) ◀──────── memory_recall ◀─── Neo4j native triples ────────────┘
+   recall (MCP) ◀──────── memory_recall ◀─── SQLite graph (triples) ───────────┘
         ▲                                     associative / temporal
         └──── memory_vector_recall ◀─── Qdrant vector index (OPTIONAL) ───────┘
                                         dense semantic search + fast dedup
@@ -299,32 +296,24 @@ queues. Pure stdlib `curses`, no server and no browser; saves and deletes go thr
 > `.md` store. With neither (or with their services down), engram still runs on pure
 > markdown. Add the vector index with `./install.sh --vector` (see [vector/README.md](vector/README.md)).
 
-### Graphiti compatibility and native graph evaluation
+### The graph
 
-`graph.backend: graphiti_compat` is the recommended production setting while the
-native index is being evaluated. It delegates retrieval to the pinned Graphiti
-recall script and returns its ordered records directly; keyword and vector fusion
-are deliberately disabled so they cannot alter Graphiti's ranking. A Graphiti
-failure is reported as a recall failure rather than silently returning a weaker
-result.
-
-The native synchronizer records typed triples with confidence, preserves replaced
-claims as history, and excludes quarantined claims from recall. The graph lives in `~/.claude/index/graph.db` (SQLite). An install that still has the
-old Neo4j graph copies it once with `engram-graph-to-sqlite`, which is read-only on
-Neo4j and checks that every count matches before it reports success.
+The graph is a SQLite file, `~/.claude/index/graph.db`. The synchronizer records typed
+triples with confidence, preserves replaced claims as history, and excludes quarantined
+claims from recall. An install that still has the old Neo4j graph copies it once with
+`engram-graph-to-sqlite`, which is read-only on Neo4j and checks that every count matches
+before it reports success; then set `graph.backend: sqlite` (the default).
 
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full data flow and **[CONFIG.md](CONFIG.md)** for `engram.yaml`.
 
 ## Requirements
 - `cargo` is required for the Rust API, hook, MCP, and indexer. `python3`, `jq`, `git`/`gh` remain required for the legacy lifecycle pipeline and optional sync.
-- Graph: Docker (Neo4j) + a Python venv (pinned `graphiti-core==0.29.2`, neo4j, fastembed) — the installer builds it.
 - Vector index (optional): Docker (Qdrant) + a Python venv (qdrant-client, mcp, fastembed) — `./install.sh --vector` builds it.
 - A backend: a reachable Ollama, **or** the `claude` CLI + an Anthropic API key.
 
 ## Status
-Early but functional: the engine, commands, installer, graph wiring, and daemon are
-built and tested. A fresh install is also the first live exercise of the graph
-round-trip against your Neo4j/backend. Issues and PRs welcome.
+Early but functional: the engine, commands, installer, graph, and daemon are
+built and tested. Issues and PRs welcome.
 
 ## License
 Apache-2.0.

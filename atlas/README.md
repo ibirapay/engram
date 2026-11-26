@@ -1,7 +1,7 @@
 # Engram Memory Atlas
 
 Maintained graph-first web UI for the local Engram installation. It inventories
-every project store while labeling Neo4j coverage honestly.
+every project store while labeling graph coverage honestly.
 
 ## Build
 

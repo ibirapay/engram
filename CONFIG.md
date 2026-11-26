@@ -102,61 +102,41 @@ once; they degrade to vector+keyword on no-graph installs. `engram-graph` and
 recall through one plus `engram-rust` hit the embedding model twice). Each ranker
 degrades independently.
 
-## Rust graph backend
-
-The Rust recall service has two graph backends:
+## The graph
 
 ```yaml
 graph:
-  backend: graphiti_compat       # graphiti_compat | native | sqlite
+  backend: sqlite                # the only backend (the default when the block is absent)
 ```
 
-`graphiti_compat` is the production-safe migration choice, **and the default when
-the `graph:` block is absent** — which is the case for almost every install
-upgraded in place, since the installer never adds one. It calls the installed,
-pinned Graphiti recall path and returns its ordered results untouched.
+The graph is a SQLite file, `~/.claude/index/graph.db` (override with `ENGRAM_GRAPH_DB`),
+read by the recall hook and the `engram-rust` MCP server and written by
+`engram-native-graph-sync`. Native node identity includes the memory store slug and every
+row carries the tenant.
 
-Note what that means concretely: in compatibility mode the outer **keyword and
-vector legs are disabled and there is no RRF**. The whole point is that
-compatibility mode cannot change Graphiti's ranking, so it is *compatibility*, not
-hybrid fusion — the `legs` map in a recall response says so explicitly
-(`"disabled: graphiti_compat preserves Graphiti ordering"`). It fails closed if the
-Graphiti path is unavailable, and the child process is bounded by
-`recall.timeout_ms`.
+`native` (typed triples in Neo4j) and `graphiti_compat` (Graphiti) were removed in 1.5.0.
+A config that still says one of them loads, but the graph leg and the sync stop and say how
+to migrate; recall keeps answering from the keyword and vector legs. To move an old graph
+across, run `engram-graph-to-sqlite` (read-only on Neo4j; it fails unless memories, facts,
+embedded facts and triples all match) and set `graph.backend: sqlite`. The `neo4j_*` keys
+are read only by that command.
 
-`native` uses Rust's typed-triple and embedding index together with the usual
-hybrid RRF; use it for shadow evaluation until its recall evaluation reaches
-parity. Native node identity includes the memory store slug, so switching to it
-requires a graph rebuild, and the legacy-edge cache needs
-`engram-native-graph-sync --import-legacy-embeddings` to be re-run.
+The writer needs **both** an OpenAI-compatible embedding endpoint (`embed.url`, or
+`llama_cpp.url` as a fallback) and an OpenAI-compatible generation endpoint for fact
+extraction (`llama_cpp.url`). Note that this is `llama_cpp.url` specifically, *not*
+`backend` — `backend` selects the Python pipeline's generation backend, so `backend: ollama`
+with an OpenAI-compatible `llama_cpp.url` alongside it is a perfectly serviceable setup. With
+either endpoint missing, the daemon's graph job **skips and says so** each run.
 
-The native writer needs **both** an OpenAI-compatible embedding endpoint
-(`embed.url`, or `llama_cpp.url` as a fallback) and an OpenAI-compatible
-generation endpoint for fact extraction (`llama_cpp.url`). Note that this is
-`llama_cpp.url` specifically, *not* `backend` — `backend` selects the Python
-pipeline's generation backend, so `backend: ollama` with an OpenAI-compatible
-`llama_cpp.url` alongside it is a perfectly serviceable native setup.
+Endpoint URLs must not embed credentials — `https://user:pass@host/v1` is rejected. Those URLs
+are published by `/api/v1/status` and the model editor, which would route the password
+around the redaction that `api_key` gets.
 
-With `graph.backend: native` and either endpoint missing, the daemon's graph job
-**skips and says so** each run rather than falling back to the Python Graphiti
-writer: writing the index nothing is reading looks exactly like memories that
-saved and then vanished. The config still loads, so recall against an
-already-populated native index keeps working. Choose `graphiti_compat` to use the
-Python writer.
-
-Endpoint URLs must not embed credentials — `https://user:pass@host/v1` is
-rejected. Those URLs are published by `/api/v1/status` and the model editor, which
-would route the password around the redaction that `api_key` gets.
-
-`ENGRAM_GRAPH_BACKEND` temporarily overrides this setting for a process, and is
-honoured by the **reader and the writer alike** — a daemon that wrote to one index
-while recall read the other produced a split brain that looked like missing
-memories. The daemon uses the matching writer, export, and reconciliation jobs for
-whichever backend is selected, so new memories remain visible to the recall path in
-use.
+`ENGRAM_GRAPH_BACKEND` temporarily overrides the setting for a process and is honoured by the
+reader and the writer alike.
 
 The prompt hook is separate: it always runs in fast mode (local BM25 + vector + one
-graph fact query, never the Graphiti child) under the much shorter
+graph fact query) under the much shorter
 `recall.inject.timeout_ms` budget, because a prompt that waits is worse than a
 prompt without recall.
 
@@ -176,7 +156,7 @@ recall:
 ```
 
 ## Auto-recall (the prompt hook)
-`hooks/memory-recall-inject.py` runs on every prompt and injects the memories that
+`rust/engram-recall-hook` runs on every prompt and injects the memories that
 match it, so recall does not depend on Claude remembering to call a recall tool. The
 installer merges it as a `UserPromptSubmit` hook; `recall.inject.enabled: false`
 silences it without unmerging.
@@ -187,19 +167,17 @@ It is built to be cheap and quiet:
   never injected again, state in `~/.claude/logs/recall-inject/<session_id>.json`,
   swept after 7 days. This is what stops a long session from re-paying for the same
   memories on every prompt;
-- **~0.3s, stdlib only** — it talks to Qdrant/Ollama/Neo4j over HTTP rather than
-  importing their clients (`import qdrant_client` alone measures 0.78s), so it needs
-  no venv and no daemon;
+- **~0.2s, one static binary** — `engram-recall-hook` (Rust) ranks from a persistent SQLite
+  keyword index, asks Qdrant over HTTP and reads the SQLite graph, so it needs no venv and
+  no daemon;
 - **fail-open** — any error prints nothing and exits 0. To find out *why* it was
-  quiet: `echo '{"prompt":"...","session_id":"dbg"}' | ENGRAM_HOOK_DEBUG=1 ~/.claude/hooks/memory-recall-inject.py`.
+  quiet: `echo '{"prompt":"...","session_id":"dbg"}' | ~/.claude/rust/engram-recall-hook`, or `engram-recall --fast "..."`.
 
 A prompt shorter than 25 characters, or starting with `/` or `!`, is skipped.
 
-## Graph (Neo4j)
-Config is mostly env: `NEO4J_URI` (default `bolt://127.0.0.1:7687`), `NEO4J_PASSWORD`
-(from env or `~/.claude/graph/.env`, generated by the installer). `OLLAMA_BASE_URL`,
-`MG_LLM_MODEL` tune the optional bootstrap path. The graph venv lives at
-`~/.claude/graph/venv`.
+## Graph file
+`~/.claude/index/graph.db` holds the graph (see above). `ENGRAM_GRAPH_DB` points the readers
+and the writer at another file. There is no graph service to start and no password.
 
 ## Tenants: agent identities
 
@@ -220,7 +198,7 @@ tenants:
 ```
 
 **An absent block means tenancy is off**, and engram behaves exactly as before: one
-shared collection, Graphiti's historical `canonical` group, the slug resolved the
+shared collection, the single legacy graph tenant, the slug resolved the
 usual way. That is the default and the upgrade path.
 
 ### The identity follows the store
@@ -261,30 +239,17 @@ appears.
 | Layer | Mechanism |
 |---|---|
 | Qdrant | A collection per tenant (`engram_memory__<name>`, `engram_wiki__<name>`). The name comes from the resolved tenant, so reaching another identity's vectors means *naming* its collection rather than forgetting a filter. |
-| Neo4j | A `tenant` property on every engram node and `group_id` on Graphiti's. Neo4j Community has one database, so a database boundary is not available; instead a unit test scans every Cypher statement in `engram-graph` and fails the build if any node pattern is unscoped. |
+| SQLite graph | A `tenant` and a `slug` column on every table, and in every query. |
 | Markdown store | A slug belongs to exactly one tenant. An explicit `--slug` naming another identity's store is refused, not filtered — the store is read straight off disk, where no database filter would help. |
 | Vault | Every path is canonicalized and verified to resolve inside the tenant's vault, so a symlink pointing at another vault is refused. Agent writes are confined again, to `agent_subtree`. |
 | MCP | `slug` is a tool argument and is validated per call. `tenant` is deliberately **not** a tool argument — it is fixed when the client launches the server, so a model cannot choose its own identity. |
 
 ### Migrating existing stores
 
-Moving stores into tenants is not a config-only change. The Qdrant points must be
-reindexed into the per-tenant collection, and the Graphiti episodes re-inserted
-under the new `group_id` — re-inserted rather than relabelled, because Graphiti
-`Entity` nodes are shared across episodes, so an entity mentioned under two
-identities is a single node with a single group that no `SET` can split. Cached
-extractions in `~/.claude/graph/extractions/` mean the re-insert costs no LLM
-calls. A slug claimed by two tenants fails config validation, because that is
-exactly the leak the model exists to prevent.
-
-### Known limitation
-
-The legacy keyword leg rides Graphiti's `edge_name_and_fact` fulltext index, and a
-Neo4j fulltext index cannot be partitioned: it ranks across every group and applies
-its own limit before any group filter can run. The leg over-fetches (20×) and
-filters, which bounds the problem without solving it — a tenant holding under
-~1/20th of the indexed edges can still be crowded out. The semantic and native
-keyword legs do not share the defect, so recall degrades rather than leaking.
+Moving stores into tenants is not a config-only change: the Qdrant points must be
+reindexed into the per-tenant collection (`engram-index`), and the graph re-synced under the
+new tenant (`engram-native-graph-sync`). A slug claimed by two tenants fails config
+validation, because that is exactly the leak the model exists to prevent.
 
 ## The wiki corpus (Obsidian vaults)
 
@@ -352,10 +317,10 @@ not edit; that guarantee does **not** extend to widening the subtree.
 ## Backups (encrypted, off-host)
 
 A daily [restic](https://restic.net) backup of the **authoritative** data — the
-`.md` memory stores and the Obsidian vaults, plus `engram.yaml` and `graph/.env`
-so a restore stands the system back up. The Qdrant and Neo4j indexes are **not**
-backed up: they are rebuildable from the `.md` store (`--rebuild`), so backing
-them up would be redundant weight.
+`.md` memory stores and the Obsidian vaults, plus `engram.yaml`
+so a restore stands the system back up. The Qdrant index and the SQLite graph are **not**
+backed up: they are rebuildable from the `.md` store (`--rebuild`, and a graph sync that
+re-runs the LLM per memory), so backing them up would be redundant weight.
 
 Off by default. The daemon's `backup` task no-ops until you enable it and supply
 credentials; `./install.sh --backup` provisions everything.
@@ -372,7 +337,7 @@ history, retention (`forget --prune`), and integrity checking.
 
 The non-secret knobs live under `backup:` in `engram.yaml` (see
 `engram.yaml.example`). The **secrets never go in `engram.yaml`** — they live in
-`~/.config/engram/daemon.env` (mode 600), beside the Neo4j password and Telegram
+`~/.config/engram/daemon.env` (mode 600), beside the Telegram
 token:
 
 | env var | meaning |

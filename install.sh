@@ -5,10 +5,10 @@
 #   --backend ollama|claude     --tier cpu|small|medium|large   --ollama-host URL
 #   --storage local|github      --repo owner/name (implies github)
 #   --daemon none|systemd|docker
-#   --graph | --no-graph        (build the Neo4j graph venv + register the MCP server)
+#   --graph | --no-graph        (accepted and ignored: the graph is a SQLite file, nothing to build)
 #   --vector | --no-vector      (build the Qdrant vector venv + register the MCP server)
 #   --hermes | --no-hermes      (also register the MCP servers with hermes; default: auto)
-#   --no-start-services         (do NOT `docker compose up` Neo4j/Qdrant; just print how)
+#   --no-start-services         (do NOT `docker compose up` Qdrant; just print how)
 #   --yes                       (accept defaults, no prompts)
 #
 # What it does: copies the engine into ~/.claude, writes engram.yaml, merges the
@@ -27,7 +27,7 @@ WANT_HERMES="auto"   # auto = register only if the hermes CLI is on PATH
 WANT_BACKUP="no"     # off unless asked: backups need an operator-provided bucket
 WANT_SILVERBULLET="no"  # off unless asked: stands up a web editor per vault
 WANT_WEB_AUTH="no"      # off unless asked: one web credential for atlas + SilverBullet
-START_SERVICES="yes" # bring Neo4j/Qdrant UP (they were only ever printed as a hint)
+START_SERVICES="yes" # bring Qdrant UP (it was only ever printed as a hint)
 
 while [[ $# -gt 0 ]]; do case "$1" in
   --backend) BACKEND="$2"; shift 2;;
@@ -127,9 +127,8 @@ fi
 ask STORAGE "Storage (local / github)" "$STORAGE"
 [[ "$STORAGE" == github && -z "$REPO_REMOTE" ]] && ask REPO_REMOTE "GitHub memory repo (owner/name)" ""
 ask DAEMON "24h daemon (none / systemd / docker)" "$DAEMON"
-if [[ "$WANT_GRAPH" == auto ]]; then WANT_GRAPH="yes"; ask WANT_GRAPH "Build the Neo4j graph (yes/no)" "yes"; fi
 if [[ "$WANT_VECTOR" == auto ]]; then WANT_VECTOR="no"; ask WANT_VECTOR "Build the Qdrant vector index (yes/no)" "no"; fi
-say "backend=$BACKEND tier=$TIER storage=$STORAGE daemon=$DAEMON graph=$WANT_GRAPH vector=$WANT_VECTOR hermes=$WANT_HERMES"
+say "backend=$BACKEND tier=$TIER storage=$STORAGE daemon=$DAEMON vector=$WANT_VECTOR hermes=$WANT_HERMES"
 
 # ---- place files ----
 mkdir -p "$CLAUDE/commands" "$CLAUDE/graph" "$CLAUDE/vector" "$CLAUDE/logs"
@@ -142,7 +141,6 @@ for skdir in "$REPO"/skills/*/; do
   sk="$(basename "$skdir")"; mkdir -p "$CLAUDE/skills/$sk"
   install -m 0644 "$skdir/SKILL.md" "$CLAUDE/skills/$sk/"
 done
-for f in "$REPO"/graph/*.py "$REPO"/graph/*.md "$REPO"/graph/docker-compose.yml; do [[ -e "$f" ]] && install -m 0644 "$f" "$CLAUDE/graph/"; done
 for f in "$REPO"/vector/*.py "$REPO"/vector/docker-compose.yml; do [[ -e "$f" ]] && install -m 0644 "$f" "$CLAUDE/vector/"; done
 install -m 0755 "$REPO"/daemon/engram-daemon.py "$CLAUDE"/ 2>/dev/null || true
 mkdir -p "$CLAUDE/hooks"; install -m 0755 "$REPO"/bin/hooks/*.py "$CLAUDE/hooks/" 2>/dev/null || true
@@ -528,11 +526,10 @@ if command -v cargo >/dev/null; then
     for rust_bin in engram-app engram-embed engram-graph-to-sqlite engram-index engram-lifecycle engram-mcp engram-native-graph-sync engram-recall engram-recall-hook engram-wiki-index; do
       [[ -x "$REPO/target/release/$rust_bin" ]] && install -m 0755 "$REPO/target/release/$rust_bin" "$CLAUDE/rust/$rust_bin"
     done
-    # engram-graph-compat was removed: the bounded Graphiti spawn now lives inside
-    # engram-hybrid, so there is one compatibility implementation, not two. Drop a
-    # copy left behind by an earlier install.
-    rm -f "$CLAUDE/rust/engram-graph-compat"
-    install -m 0644 "$REPO/tests/graph_recall_eval.json" "$CLAUDE/rust/graph_recall_eval.json"
+    # Binaries retired with the Graphiti graph (1.5.0): drop copies left by older installs.
+    rm -f "$CLAUDE/rust/engram-graph-compat" "$CLAUDE/rust/engram-graph-sync" \
+          "$CLAUDE/rust/engram-graph-recall-eval" "$CLAUDE/rust/engram-tenant-migrate" \
+          "$CLAUDE/rust/engram-graph-facts" "$CLAUDE/rust/graph_recall_eval.json"
     say "Rust executables installed into $CLAUDE/rust"
     sync_service_binaries
   else
@@ -556,13 +553,13 @@ if [[ -f "$CLAUDE/engram.yaml" ]]; then
     warn "new config keys available since your engram.yaml was written:${NEWKEYS}"
     warn "  -> compare $REPO/engram.yaml.example and add the blocks you want (e.g. auto_curate, telegram)."
   fi
-  # A missing `graph:` block means the graph backend comes from code defaults, and
-  # that default decides which INDEX recall reads. It is graphiti_compat on both
-  # sides (Rust and the daemon) precisely so an upgrade keeps using the Graphiti
-  # index it already populated, but say so rather than leaving it implicit.
-  if ! grep -qE '^graph:' "$CLAUDE/engram.yaml"; then
-    say "no 'graph:' block in engram.yaml — staying on graphiti_compat (your existing index)"
-    say "  -> to try the native graph, add:  graph:\\n  backend: native"
+  # The graph is a SQLite file (graph.backend: sqlite, the default). An install that
+  # still says `native` or `graphiti_compat` keeps loading, but its graph leg and its
+  # sync refuse to run until the old graph is copied once.
+  if grep -qE '^\s*backend:\s*(native|graphiti_compat)\s*$' "$CLAUDE/engram.yaml" 2>/dev/null \
+     && awk '/^graph:/{g=1;next} /^[^ #]/{g=0} g&&/backend:/{print}' "$CLAUDE/engram.yaml" | grep -qE 'native|graphiti_compat'; then
+    warn "engram.yaml still has graph.backend: native/graphiti_compat (removed in 1.5.0)"
+    warn "  -> run: $CLAUDE/rust/engram-graph-to-sqlite   then set graph.backend: sqlite"
   fi
 else
   sed -e "s|^backend: .*|backend: $BACKEND|" \
@@ -617,52 +614,24 @@ if ! python3 -c "import yaml" 2>/dev/null; then
   say "installing pyyaml (engine dep)..."; python3 -m pip install --user -q pyyaml || warn "pip install pyyaml failed"
 fi
 
-# ---- graph venv + MCP ----
-if [[ "$WANT_GRAPH" == yes ]]; then
-  VENV="$CLAUDE/graph/venv"
-  if [[ ! -x "$VENV/bin/python" ]]; then
-    say "building graph venv (graphiti-core, neo4j, fastembed)... this can take a few minutes"
-    if python3 -m venv "$VENV" && "$VENV/bin/pip" install -q --upgrade pip && \
-       "$VENV/bin/pip" install -q "mcp[cli]" "graphiti-core==0.29.2" neo4j fastembed pyyaml; then
-      say "graph venv ready"
-    else
-      warn "graph venv build failed — install graphiti-core/neo4j/fastembed manually into $VENV"
-    fi
+# ---- retire the old engram-graph MCP (Graphiti, Python venv) ----
+# The graph is a SQLite file read by the Rust recall; the Python MCP server is gone.
+if command -v claude >/dev/null && claude mcp list 2>/dev/null | grep -q '^engram-graph'; then
+  if claude mcp get engram-graph 2>/dev/null | grep -q 'mg_mcp_server'; then
+    claude mcp remove --scope user engram-graph >/dev/null 2>&1 \
+      && say "removed the old engram-graph (Graphiti) MCP server" \
+      || warn "could not remove the old engram-graph MCP server (claude mcp remove engram-graph)"
   fi
-  [[ -f "$CLAUDE/graph/.env" ]] || { printf 'NEO4J_PASSWORD=%s\n' "$(openssl rand -hex 24 2>/dev/null || date +%s)" > "$CLAUDE/graph/.env"; chmod 600 "$CLAUDE/graph/.env"; say "generated graph/.env (Neo4j password)"; }
-  # mg_mcp_server.py imports mcp at line 26. Venvs built before that dep was listed
-  # here have graphiti-core but no mcp, so the server dies at import and engram-graph
-  # is SILENTLY absent from every client. Heal them (no-op once satisfied).
-  if [[ -x "$VENV/bin/python" ]] && ! "$VENV/bin/python" -c "import mcp" 2>/dev/null; then
-    "$VENV/bin/pip" install -q "mcp[cli]" \
-      && say "added mcp to graph venv (engram-graph could not start without it)" \
-      || warn "could not install mcp into graph venv — engram-graph will not start"
-  fi
-  if [[ -x "$VENV/bin/python" ]] && ! "$VENV/bin/python" -c "import importlib.metadata as m; assert m.version('graphiti-core') == '0.29.2'" 2>/dev/null; then
-    "$VENV/bin/pip" install -q "graphiti-core==0.29.2" \
-      && say "pinned graphiti-core to 0.29.2 for recall compatibility" \
-      || warn "could not pin graphiti-core — graphiti_compat recall may differ from the tested version"
-  fi
-  if command -v claude >/dev/null && [[ -x "$VENV/bin/python" ]]; then
-    if ! claude mcp list 2>/dev/null | grep -q engram-graph; then
-      claude mcp add --scope user engram-graph \
-        -e "ENGRAM_BIN=$CLAUDE" -e "ENGRAM_CONFIG=$CLAUDE/engram.yaml" -e "ENGRAM_GRAPH=$CLAUDE/graph" \
-        -- "$VENV/bin/python" "$CLAUDE/graph/mg_mcp_server.py" \
-        && say "registered engram-graph MCP server" || warn "claude mcp add failed (register manually later)"
-    else say "engram-graph MCP already registered"; fi
-  else warn "claude CLI or graph venv missing — skipping MCP registration (run 'claude mcp add' later)"; fi
-  hermes_register engram-graph "$VENV/bin/python" "$CLAUDE/graph/mg_mcp_server.py"
-  say "start Neo4j: cd $CLAUDE/graph && NEO4J_PASSWORD=\$(grep -oP 'NEO4J_PASSWORD=\\K.*' .env) docker compose up -d"
 fi
 
-# Register Rust hybrid recall while retaining the graph server's admin tools.
-# The INSTALLATION paths are pinned into the entry (this install's config and graph
-# dir, which the server cannot otherwise know); the memory slug deliberately is NOT,
+# Register Rust hybrid recall.
+# The INSTALLATION paths are pinned into the entry (this install's config, which the
+# server cannot otherwise know); the memory slug deliberately is NOT,
 # because it is per-project and the server resolves it from the session's directory.
 if command -v claude >/dev/null && [[ -x "$CLAUDE/rust/engram-mcp" ]]; then
   if ! claude mcp list 2>/dev/null | grep -q '^engram-rust'; then
     claude mcp add --scope user engram-rust \
-      -e "ENGRAM_BIN=$CLAUDE" -e "ENGRAM_CONFIG=$CLAUDE/engram.yaml" -e "ENGRAM_GRAPH=$CLAUDE/graph" \
+      -e "ENGRAM_BIN=$CLAUDE" -e "ENGRAM_CONFIG=$CLAUDE/engram.yaml" \
       -- "$CLAUDE/rust/engram-mcp" \
       && say "registered Rust hybrid recall MCP server" \
       || warn "could not register engram-rust MCP server"
@@ -689,8 +658,7 @@ if [[ "$WANT_VECTOR" == yes ]]; then
   else warn "claude CLI or vector venv missing — skipping MCP registration (run 'claude mcp add' later)"; fi
   hermes_register engram-vector "$VVENV/bin/python" "$CLAUDE/vector/vector_mcp_server.py"
   # Hybrid recall (graph+vector+keyword) now lives in the engram-rust server, which
-  # embeds the query once. The engram-graph/engram-vector servers no longer run their
-  # own recall legs, so the graph venv no longer needs qdrant-client for it.
+  # embeds the query once; the engram-vector server no longer runs its own recall leg.
   say "start Qdrant: cd $CLAUDE/vector && docker compose up -d"
   # Seed the index from any memories already on disk (best-effort; no-op if Qdrant
   # is down). Output is REPORTED, not swallowed: `2>/dev/null || true` hid both a
@@ -742,12 +710,13 @@ if command -v jq >/dev/null; then
   # Turn off with `recall.inject.enabled: false` in engram.yaml — no need to unmerge.
   # Exactly ONE recall hook must be registered. Whichever implementation is
   # chosen, the other is removed in the same rewrite.
+  # The Rust hook is the only one: the Python recall hook was removed with the Graphiti
+  # graph, so an install that registered it is migrated to the Rust one here.
   if [[ -x "$CLAUDE/rust/engram-recall-hook" ]]; then
     replace_hook UserPromptSubmit "$CLAUDE/rust/engram-recall-hook" \
       "$CLAUDE/hooks/memory-recall-inject.py"
   else
-    replace_hook UserPromptSubmit "$CLAUDE/hooks/memory-recall-inject.py" \
-      "$CLAUDE/rust/engram-recall-hook"
+    warn "engram-recall-hook was not built (cargo missing?): no per-prompt recall hook registered"
   fi
   say "hooks merged into settings.json"
 fi
@@ -798,9 +767,8 @@ for name, entry in (cfg.get("tenants") or {}).items():
 PYT
 )"
     fi
-    { echo "ENGRAM_BIN=$CLAUDE"; echo "ENGRAM_GRAPH=$CLAUDE/graph"; echo "ENGRAM_CONFIG=$CLAUDE/engram.yaml"; echo "ENGRAM_LOG_DIR=$CLAUDE/logs"; echo "CLAUDE_MEMORY_SLUG=$SLUG";
+    { echo "ENGRAM_BIN=$CLAUDE"; echo "ENGRAM_CONFIG=$CLAUDE/engram.yaml"; echo "ENGRAM_LOG_DIR=$CLAUDE/logs"; echo "CLAUDE_MEMORY_SLUG=$SLUG";
       [[ -n "$API_TENANT" ]] && echo "ENGRAM_TENANT=$API_TENANT";
-      [[ -x "$CLAUDE/graph/venv/bin/python" ]] && echo "ENGRAM_GRAPH_PYTHON=$CLAUDE/graph/venv/bin/python";
       [[ -x "$CLAUDE/vector/venv/bin/python" ]] && echo "ENGRAM_VECTOR_PYTHON=$CLAUDE/vector/venv/bin/python"; } > "$DAEMON_ENV"
     if [[ -n "$PRESERVED" ]]; then
       printf '%s\n' "$PRESERVED" >> "$DAEMON_ENV"

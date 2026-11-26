@@ -2,20 +2,20 @@
 """engram_backup.py — encrypted off-host backups of the authoritative data.
 
 engram's source of truth is small and local: the `.md` memory stores
-(~4 MB) and the Obsidian vaults (~tens of KB). Everything else — Qdrant, Neo4j —
+(~4 MB) and the Obsidian vaults (~tens of KB). Everything else — Qdrant, the SQLite graph —
 is a rebuildable index over that set. So a backup of the `.md` stores, the
 vaults, and the two config files needed to stand the system back up is a
 complete restore, and it is tiny. Until now it had no off-host copy.
 
 This wraps **restic** (https://restic.net), chosen for one property above all:
 client-side AES-256 encryption, always on. The data carries infrastructure
-detail, and the restore set includes `graph/.env` (the Neo4j password), so the
+detail, and the restore set includes the config (which can hold credentials), so the
 backup store — Backblaze B2 or any S3-compatible bucket — must never see
 plaintext. restic also gives content-addressed dedup (a daily snapshot of an
 unchanged 4 MB set is nearly free), snapshot history, retention
 (`forget --prune`), and integrity checking (`check`).
 
-Operator-runnable AND daemon-called, like graph_sync.py. Subcommands:
+Operator-runnable AND daemon-called, like the sync jobs. Subcommands:
 
     init       create the repository (idempotent)
     backup     snapshot + prune; optionally a periodic integrity check
@@ -47,7 +47,6 @@ from pathlib import Path
 
 HOME = Path(os.environ.get("ENGRAM_BIN") or (Path.home() / ".claude"))
 CONFIG_PATH = Path(os.environ.get("ENGRAM_CONFIG") or (HOME / "engram.yaml"))
-GRAPH_DIR = Path(os.environ.get("ENGRAM_GRAPH") or (HOME / "graph"))
 # Our own tiny cadence state, deliberately SEPARATE from the daemon's
 # daemon_state.json: the daemon rewrites that file wholesale each tick, so a key
 # we wrote inside a task would be clobbered. The periodic-check timer lives here.
@@ -193,7 +192,7 @@ def _paths(cfg: dict):
             if vault.is_dir():
                 paths.append(vault)
     # 3. the two files a clean restore needs
-    for extra in (CONFIG_PATH, GRAPH_DIR / ".env"):
+    for extra in (CONFIG_PATH,):
         if extra.is_file():
             paths.append(extra)
     return paths

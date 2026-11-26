@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.6.0 — the Python Graphiti stack is gone
+
+Completes 1.5.0. Nothing in the tree builds, installs, registers or reads Neo4j any more.
+
+- **Removed:** `graph/` (Graphiti scripts, `docker-compose.yml`, the `mg_*` modules, the
+  `engram-graph` MCP server), `bin/memory_recall.py` and the Python recall hook, their tests,
+  and the daemon's `export` and `reconcile` jobs (Graphiti-only). The 315 MB graph venv is no
+  longer built; `install.sh` removes a registered `engram-graph` Graphiti MCP server instead.
+- **Daemon:** the `graph` task runs the Rust SQLite sync and nothing else; a config still on a
+  removed backend fails the task with the migration step instead of running a writer.
+- **Atlas, the Python API and the TUI** read the SQLite graph (stdlib `sqlite3`) and call the
+  Rust recall. Atlas needs FastAPI, which used to come from the graph venv: give it its own
+  (`python3 -m venv ~/.claude/atlas/venv && ~/.claude/atlas/venv/bin/pip install fastapi uvicorn`).
+- **Upgrading:** install every binary, not just some. A daemon pass on 1.5.0 failed its vector
+  task because an older `engram-index` still rejected `graph.backend: sqlite` at config load.
+- Tests no longer write into the real `~/.claude/logs/daemon.log` (they appended fake `FAILED`
+  lines there).
+
 ## 1.5.0 — SQLite is the graph: Neo4j and Graphiti are gone from the Rust side
 
 **Breaking.** `graph.backend` is `sqlite` by default, and `native` (Rust writer into Neo4j)

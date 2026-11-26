@@ -92,14 +92,15 @@ grep -q -- "--no-hermes) WANT_HERMES=\"no\"" "$REPO/install.sh" \
 "$REPO/install.sh" --help | grep -q -- "--hermes" \
     && ok "--hermes documented in --help" || bad "--hermes missing from --help output"
 
-# ── 6. the graph venv must install mcp (mg_mcp_server.py imports it) ─────────
-# The assertion is "the graph venv installs both mcp and graphiti-core", not
-# "they appear in this exact spelling": the literal pattern this used to match
-# stopped matching when graphiti-core gained a version pin, so it reported a
-# missing dependency that was in fact installed.
-grep -qE '"mcp\[cli\]".*graphiti-core' "$REPO/install.sh" \
-    && ok "graph venv build includes mcp" \
-    || bad "graph venv still built without mcp — engram-graph dies at import"
+# ── 6. the Graphiti graph venv is gone ─────────────────────────────────────
+# The graph is a SQLite file read by the Rust recall; nothing builds a graph venv,
+# pins graphiti-core or registers the Python engram-graph server any more. This keeps
+# a copy-paste of the old block from coming back.
+if grep -qE 'graphiti-core|mg_mcp_server\.py"|graph/venv' "$REPO/install.sh"; then
+    bad "install.sh still builds or registers the Graphiti graph venv"
+else
+    ok "install.sh no longer builds the Graphiti graph venv"
+fi
 
 echo "── test_install_hermes: $([[ $fails -eq 0 ]] && echo PASS || echo "FAIL ($fails)") ──"
 exit $((fails > 0))
