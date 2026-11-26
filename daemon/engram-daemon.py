@@ -47,14 +47,16 @@ try:
 except Exception:
     memory_ai = None
 
+# engram.timer ticks ONCE a day (05:00), so a "daily" interval is 22 h, not 24 h: with 86400 a
+# tick that stamped at 05:00:03 finds the task not due at 05:00:01 tomorrow and skips a day.
 # Cadences reflect each stage's real time-constant (Fable 2026-07-12):
 #   harvest = ENCODE  -> frequent (watermark makes it delta-cost; idle-grace skips
 #             active chats so it only pays tokens on FINISHED sessions).
 #   maintenance = fixate SCORE + light_pass -> nightly (signals move over days).
 #   distill (LLM) is gated WEEKLY inside memory_fixate_cron.sh.
 DEFAULT_INTERVALS = {"health": 300, "approvals": 300, "harvest": 3600,
-                     "graph": 1800, "vector": 1800, "wiki": 1800, "maintenance": 86400,
-                     "backup": 86400, "curate": 604800, "export": 86400, "reconcile": 86400}
+                     "graph": 1800, "vector": 1800, "wiki": 1800, "maintenance": 79200,
+                     "backup": 79200, "curate": 604800, "export": 79200, "reconcile": 79200}
 ORDER = ["health", "approvals", "harvest", "graph", "vector", "wiki", "maintenance",
          "backup", "curate", "export", "reconcile"]
 

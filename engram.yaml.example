@@ -376,13 +376,13 @@ mcp_servers:
     note: "Qdrant inspection (optional): memory_vector_search / memory_vector_stats (recall is on engram-rust)"
 
 # Scheduling. Read honestly:
-#   * the heavy pipeline (harvest/graph/vector/maintenance/curate/...) is paced by
-#     `daemon.intervals` above, checked by engram-daemon.py on every tick of
-#     `engram.timer` (the installer copies that unit as-is: OnBootSec=5min,
-#     OnCalendar=*:0/30). Anchor it yourself if you want a fixed hour: edit the
-#     installed ~/.config/systemd/user/engram.timer to e.g.
-#     `OnCalendar=*-*-* 05:00:00` and set every interval at or below the tick
-#     gap so each daily tick runs the full pass.
+#   * the heavy pipeline (harvest/graph/vector/maintenance/curate/...) runs ONCE a day:
+#     `engram.timer` fires engram-daemon.py --once at 05:00 (Persistent=true, so a
+#     missed 05:00 runs at the next boot). The installer copies that unit as-is. Each
+#     task is paced by `daemon.intervals` above; keep every interval at or below
+#     ~22 h (79200) so the daily tick finds it due. To change the hour, edit
+#     ~/.config/systemd/user/engram.timer (`OnCalendar=`) and `systemctl --user
+#     daemon-reload`; update.sh will put the default back.
 #   * `schedule.times` below feeds ONE thing: install_fixate_timer.sh (the
 #     fixate cron). It never paced the daemon, despite what this comment used
 #     to claim — another parsed-but-inert knob of the class this repo keeps

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.3 — the daemon runs once a day by default
+
+`engram.timer` fired every 30 minutes (`OnCalendar=*:0/30`, plus `OnBootSec=5min`), so every
+install started a pass 12 times a day and every reboot. The shipped default is now one pass
+at 05:00 (`OnCalendar=*-*-* 05:00:00`, `Persistent=true` so a missed run happens at next boot).
+The daily default intervals are 22 h instead of 24 h, so a tick a few seconds earlier than
+yesterday's stamp does not skip a day. Existing installs get the new timer on the next
+`update.sh --apply`; a custom hour is edited in the installed unit.
+
 ## 1.2.2 — a permanent skip is not a failure
 
 1.2.1 made `--once` / `--force` exit 1 when a task returns `False`. Under `graph.backend: native`
