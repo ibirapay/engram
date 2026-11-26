@@ -244,10 +244,11 @@ const STOPWORDS: &[&str] = &[
     "pela", "pelos", "pelas", "num", "dum",
     // pt-BR, second rank — added 2026-11-24 after measuring a real false injection: the
     // operator's prompt about store languages injected a memory about his mother and one about
-    // tailscale/ufw, and the tailscale memory matched ONLY these words — as, ou, entao, seja,
-    // todas. Grammar is not a topic. Then the auxiliaries and modals: a verb in a prompt says
-    // what the user wants done, never what the memory is about. "caso" is deliberately absent
-    // — it is also a noun, and it was not needed once its neighbours left.
+    // tailscale/ufw. The tailscale memory shared nothing topical with that prompt; it matched it
+    // through as, ou, entao, seja, todas — grammar, not topic (plus `caso`, which stays content:
+    // it is also a noun, and it was not needed once its neighbours left). Then the auxiliaries
+    // and modals: a verb in a prompt says what the user wants done, never what the memory is
+    // about.
     "as", "os", "todo", "toda", "todos", "todas", "tudo", "cada", "algum", "alguma",
     "ou", "entao", "então", "assim",
     "seja", "sejam", "estava", "estavam", "ter", "tem", "temos", "tinham", "deve", "devem",
@@ -258,11 +259,14 @@ const STOPWORDS: &[&str] = &[
     // counted bytes until PR #50), and these fold to "e"/"a"/"ja"/"ha" — so they are listed in
     // their real shape, per the contract above. "já"/"há" are plain function words in this
     // store's prompts ("o que já temos pronto"). The rest are the ACCENTED TWINS of forms the
-    // lists above already carry: the stopword test runs on the pre-fold word, so "nós" does not
-    // match the "nos" entry and "só" does not match the "so" entry — unlisted, each one folds
-    // into a term that the unaccented shape would have dropped, and a word no prompt is about
-    // gets a full idf vote.
-    "é", "à", "às", "há", "já", "ja", "ha", "só", "nós", "têm", "dá",
+    // lists above already carry: the stopword test runs on the pre-fold word, so "quê" does not
+    // match the "que" entry and "dê" does not match "de". Unlisted, each one folds into a term
+    // the unaccented shape would have dropped — and since the unaccented spelling is dropped from
+    // EVERY document, that term survives only in the few memories that spell it accented: tiny
+    // df, and one of the strongest idf votes in the corpus. That is worse than not listing it.
+    // "nós" is NOT here, on purpose: the contract above says it survives as content, and in this
+    // store it means nodes (headscale, tailnet, Lightning), not "we".
+    "é", "à", "às", "há", "já", "ja", "ha", "só", "têm", "dá", "quê", "porquê", "dê",
     // en.
     "the", "an", "of", "to", "in", "on", "for", "with", "without", "that", "this", "these",
     "those", "it", "its", "is", "are", "was", "were", "been", "being", "have", "has", "had",
@@ -513,14 +517,16 @@ mod tests {
         // informative thing a document can share with a query.
         let grammar = "as os ou entao então assim todas todos tudo cada seja tem temos deve \
                        devem precisa queria usam fazer muito much about their you your already \
-                       só nós têm dá";
+                       só têm dá quê porquê dê";
         for word in grammar.split_whitespace() {
             assert!(is_stopword(word), "{word} must be a function word");
         }
         // Never a topic word — including `mae`, the high-idf word (4 of 1133 memories)
         // that pulled a memory about the owner's mother into a systems prompt, and
-        // `caso`, deliberately left out because it is also a noun.
-        let content = "mae mãe caso engram energia robosats vaultwarden espanhol lingua fatura";
+        // `caso`, deliberately left out because it is also a noun. `nó`/`nós` are the store's
+        // own words for its nodes (headscale, tailnet, Lightning): 12 memories use them.
+        let content = "mae mãe caso engram energia robosats vaultwarden espanhol lingua fatura \
+                       nó nós";
         for word in content.split_whitespace() {
             assert!(!is_stopword(word), "{word} is content");
         }
