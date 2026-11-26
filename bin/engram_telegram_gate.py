@@ -668,6 +668,8 @@ def activity_summary():
     staged = grab(r"candidates staged:\s*(\d+)")
     prov = grab(r"by provenance:\s*(\{[^}]*\})", "{}")
     decisions = grab(r"processed \d+ staged candidate\(s\):\s*(\{[^}]*\})", "{}")
+    ttl = grab(r"pruned (\d+) stale staged")
+    model = grab(r"model time used: ([^\n]+)", "")
     errs = len(re.findall(r"\bERROR\b", run))
     ACTIVITY_STAMP.write_text(run_id)
     # Log ACTIVITY, not idle proof-of-life: skip a run that did nothing and errored
@@ -675,7 +677,8 @@ def activity_summary():
     if transcripts == "0" and staged == "0" and decisions in ("{}", "0") and errs == 0:
         return
     notify(f"🧠 engram run @ {run_id}\nharvested: {transcripts} transcript(s) · staged {staged} {prov}\n"
-           f"graduated/held: {decisions}\nerrors: {errs}")
+           f"graduated/held: {decisions}\nexpired by TTL: {ttl}"
+           + (f" · model time: {model}" if model else "") + f"\nerrors: {errs}")
 
 
 def main():
