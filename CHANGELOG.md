@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.2.1 — the nightly curate runs again, and a failed task no longer looks green
+
+Two fixes found while auditing the autonomous pipeline on 2026-11-25.
+
+### curate: `engram_secrets.credentials()` is back (it was never committed)
+
+`memory_auto_curate.py` (credential reconciliation, 7e0aac9) calls `engram_secrets.credentials()`,
+but that function and `CREDENTIAL_RE` only ever lived in the deployed `~/.claude` copy. When
+`update.sh` reinstalled the repo's `engram_secrets.py` on 2026-11-22, every curate run crashed
+with `AttributeError` — 164 times in three days, retried every 30 minutes, near-duplicate
+memories never merged. `CREDENTIAL_RE` is high precision on purpose (seed phrases, known key
+prefixes, `Bearer`, WIF, `name=value` with 16+ chars and a digit): txids, EVM addresses and UUIDs
+must not block a merge. The module self-check covers both directions.
+
+### daemon: `--once` / `--force` exit 1 when a task failed
+
+`tick()` already refused to stamp a failed task, but nothing told systemd, so the unit showed
+`Finished` while curate crashed on every tick. `tick()` now returns the names of the failed
+tasks and `--once` / `--force` exit 1 if there are any. Behaviour change to know: a task that
+*defers* because a dependency is down (Neo4j, Qdrant, generate backend) also returns `False`,
+so the unit now shows `failed` for that tick too. It is retried next tick as before.
+
 ## 1.2.0 — the Rust engine, tenanted identities, and recall that answers the prompt
 
 Everything merged since 1.1.0 (2026-08-15): the Rust core (markdown retrieval, hybrid recall,

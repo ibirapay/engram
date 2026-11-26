@@ -36,6 +36,37 @@ SECRET_RE = re.compile(
     r")")
 
 
+# HIGH-PRECISION credential detector, used by memory_auto_curate's credential
+# RECONCILIATION (a merge is allowed iff every credential found in the sources still
+# appears verbatim in the umbrella). Unlike SECRET_RE it must NOT fire on public data
+# (txids, EVM addresses, UUIDs, long hex): a false hit only blocks a merge, but the old
+# blanket scanner blocked every cluster that touched a txid. Group "v" is the value to
+# keep verbatim; without it the whole match is the credential. Mirrors the shell block
+# ERE in memory_lib.sh, plus: a name=value pair needs 16+ chars AND a digit.
+CREDENTIAL_RE = re.compile(
+    r"(?i:(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*(?P<v>(?:[a-z]+[\s,]+){5,}[a-z]+))"
+    r"|(?i:(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|"
+    r"access[_-]?token|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\"]?)"
+    r"(?P<v2>(?=[^\s'\"]*\d)[^\s'\"]{16,})"
+    r"|-----BEGIN[ A-Z]*PRIVATE KEY-----"
+    r"|Bearer\s+[A-Za-z0-9._\-]{20,}"
+    r"|xprv[a-zA-Z0-9]{20,}"
+    r"|\b[5KL][1-9A-HJ-NP-Za-km-z]{50,51}\b"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|sk-[A-Za-z0-9_-]{20,}")
+
+
+def credentials(text: str):
+    """Credential strings in `text` that must survive a merge verbatim (deduped, in order)."""
+    out = []
+    for m in CREDENTIAL_RE.finditer(text or ""):
+        c = m.group("v") or m.group("v2") or m.group(0)
+        if c not in out:
+            out.append(c)
+    return out
+
+
 def redact(text: str):
     """Mask secret-looking substrings. Returns (masked_text, n_masked)."""
     return SECRET_RE.subn("«redacted-secret»", text or "")
@@ -63,5 +94,20 @@ if __name__ == "__main__":  # tiny self-check
     for s in samples_clean:
         assert not looks_secret(s), f"false positive: {s}"
     assert redact("api_key=sk-proj-abcdefghijklmnopqrstuvwxyz1234")[1] == 1
+    # credentials(): real secrets are found, with the VALUE as the thing to keep verbatim...
+    assert credentials("api_key=sk-proj-abcdefghijklmnopqrstuvwxyz1234") == ["sk-proj-abcdefghijklmnopqrstuvwxyz1234"]
+    assert credentials("mnemonic: abandon abandon abandon abandon abandon ability") == ["abandon abandon abandon abandon abandon ability"]
+    for s in ("macaroon=0201036c6e6402eb01030a10", "AKIAIOSFODNN7EXAMPLE", "ghp_abcdefghijklmnopqrstuvwxyz0123",
+              "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123", "-----BEGIN RSA PRIVATE KEY-----",
+              "L1aW4aubDFB7yfras2S1mN3bqg9nwySY8nkoLmJebSLD5BWv3ENZ"):
+        assert credentials(s), f"credentials() missed: {s}"
+    # ...and public data / prose are NOT credentials (the reason this is not SECRET_RE).
+    for s in ("tx 3f2a9c1b8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a",
+              "0x71C7656EC7ab88b098defB751B7401B5f6d8976F",
+              "originSessionId=9f8e7d6c-1234-4abc-9def-0123456789ab",
+              "password: correct-horse-battery", "token = account",
+              "rotate the api_key via the console, never in a memory"):
+        assert credentials(s) == [], f"credentials() false positive: {s}"
+    assert credentials("a ghp_abcdefghijklmnopqrstuvwxyz0123 b ghp_abcdefghijklmnopqrstuvwxyz0123") == ["ghp_abcdefghijklmnopqrstuvwxyz0123"]
     print(f"ok — engram_secrets self-check ({len(samples_secret)} secret, "
           f"{len(samples_clean)} clean samples)")

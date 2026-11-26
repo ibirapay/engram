@@ -575,6 +575,7 @@ TASKS = {"health": task_health, "approvals": task_approvals, "harvest": task_har
 
 def tick(force=None):
     iv, st, now = intervals(), load_state(), int(time.time())
+    failed = []
     enabled = memory_ai.local_enabled(cfg()) if memory_ai else True
     if force:
         order = [force]
@@ -596,7 +597,12 @@ def tick(force=None):
             # would not retry until 21:04 tomorrow). Anything else stamps as before.
             if fn() is not False:
                 st[t] = now
+            else:
+                failed.append(t)
     save_state(st)
+    if failed:
+        log(f"FAILED tasks (not stamped, retried next tick): {', '.join(failed)}")
+    return failed
 
 
 _SINGLETON_FD = None  # held open for the process lifetime so the lock persists
@@ -631,9 +637,10 @@ def acquire_singleton_lock():
 def main():
     acquire_singleton_lock()
     a = sys.argv[1:]
+    # --once/--force exit 1 when a task failed, so systemd shows the unit as failed
+    # instead of "Finished" (a broken curate ran green for 3 days, 2026-11-22..25).
     if "--force" in a:
-        tick(force=a[a.index("--force") + 1])
-        return
+        sys.exit(1 if tick(force=a[a.index("--force") + 1]) else 0)
     if "--loop" in a:
         base = int(a[a.index("--tick") + 1]) if "--tick" in a else 60
         log(f"engram-daemon loop start (base tick {base}s; backend={cfg().get('backend','ollama')})")
@@ -643,7 +650,7 @@ def main():
             except Exception as e:
                 log(f"tick ERROR: {e}")
             time.sleep(base)
-    tick()  # default: --once
+    sys.exit(1 if tick() else 0)  # default: --once
 
 
 if __name__ == "__main__":

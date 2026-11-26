@@ -83,5 +83,19 @@ def test_graphiti_compat_uses_legacy_jobs():
     print("ok — graphiti compatibility keeps the legacy writer/export/reconcile path")
 
 
+def test_tick_reports_failed_tasks():
+    """tick() returns the tasks that failed so --once can exit 1 (systemd then shows the
+    unit failed; before, a curate crashing every 30 min ran green for three days)."""
+    d = tempfile.mkdtemp()
+    m = _load(Path(d) / "s.json", {"curate": 0, "health": 0})
+    m.ORDER = ["health", "curate"]
+    m.TASKS = {"health": lambda: None, "curate": lambda: False}
+    assert m.tick() == ["curate"], "failed task not reported"
+    m.TASKS = {"health": lambda: None, "curate": lambda: None}
+    assert m.tick() == [], "healthy tick reported a failure"
+    import shutil; shutil.rmtree(d)
+    print("ok — tick() reports failed tasks, empty when all ran")
+
+
 if __name__ == "__main__":
-    test_deferred_task_is_not_stamped(); test_real_tasks_defer_when_deps_down(); test_graphiti_compat_uses_legacy_jobs()
+    test_tick_reports_failed_tasks(); test_deferred_task_is_not_stamped(); test_real_tasks_defer_when_deps_down(); test_graphiti_compat_uses_legacy_jobs()
