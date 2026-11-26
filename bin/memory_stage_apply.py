@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path.home() / ".claude"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # find engram_secrets in-repo too
 import memory_ai
 import engram_secrets
+import engram_frontmatter
 
 HOME = Path.home()
 
@@ -93,12 +94,9 @@ def parse_frontmatter(text):
         return {}, text
     fm = text[3:end].strip("\n")
     body = text[end + 4:].lstrip("\n")
-    try:
-        import yaml
-        meta = yaml.safe_load(fm) or {}
-    except Exception:
-        meta = {}
-    return meta, body
+    # tolerant: a candidate whose description held ": " used to read as {} and was held as
+    # "provenance unverified" on every run, at the front of the window (2026-11-26)
+    return engram_frontmatter.load(fm), body
 
 
 def embed_key(meta, body):
@@ -126,7 +124,9 @@ def existing_embeddings(cfg):
     for p in MEM_DIR.glob("*.md"):
         if p.name == "MEMORY.md":
             continue
-        mkey = f"{int(p.stat().st_mtime)}:{p.stat().st_size}"
+        # "fm2": vectors cached before the tolerant frontmatter reader were built from the body
+        # alone for 63 memories whose frontmatter read as {}; the new key re-embeds them once
+        mkey = f"fm2:{int(p.stat().st_mtime)}:{p.stat().st_size}"
         hit = cache.get(p.name)
         if hit and hit.get("mkey") == mkey:
             embs[p.name] = hit["vec"]

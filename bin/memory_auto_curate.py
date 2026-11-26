@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path.home() / ".claude" / "vector"))
 import memory_ai
 import engram_secrets
 import memory_distill_verified as mdv
+import engram_frontmatter
 
 HOME = Path.home()
 SLUG = os.environ.get("CLAUDE_MEMORY_SLUG") or str(HOME).replace("/", "-")
@@ -134,12 +135,9 @@ def _fm(p: Path):
     m = _FM_RE.match(t)
     if not m:
         return p.stem, "", ""
-    try:
-        import yaml
-        fm = yaml.safe_load(m.group(1))
-    except Exception:
-        fm = None
-    if not isinstance(fm, dict):
+    # tolerant: a free-text description with ": " used to read as {} (untyped, never curated)
+    fm = engram_frontmatter.load(m.group(1))
+    if not fm:
         return p.stem, "", ""
     meta = fm.get("metadata") if isinstance(fm.get("metadata"), dict) else {}
     return (str(fm.get("name") or p.stem).strip(),
@@ -152,12 +150,7 @@ def _fm_raw(p: Path) -> dict:
     m = _FM_RE.match(p.read_text(errors="ignore"))
     if not m:
         return {}
-    try:
-        import yaml
-        fm = yaml.safe_load(m.group(1))
-    except Exception:
-        return {}
-    return fm if isinstance(fm, dict) else {}
+    return engram_frontmatter.load(m.group(1))
 
 
 def _clusters(pairs, threshold):
