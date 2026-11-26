@@ -2,8 +2,8 @@
 """engram-tui.py — the engram console. Browse, search, recall, inspect, edit.
 
 Replaces the old FastAPI+React GUI. Same seven views, no browser, no server, no
-dependencies: stdlib `curses` plus memory_recall.py's HTTP calls to Qdrant / Neo4j /
-Ollama on localhost. Runs on system python3 — a venv is only needed for the things
+dependencies: stdlib `curses`, the Rust `engram-recall` CLI for recall and the SQLite
+graph file (`index/graph.db`) read with stdlib `sqlite3`. Runs on system python3 — a venv is only needed for the things
 that genuinely need one (vector sync), which are subprocessed exactly as before.
 
 Mutations are NOT reimplemented here: `s` and `d` shell out to save_memory.sh and
@@ -29,15 +29,48 @@ ENGRAM_BIN = Path(os.environ.get("ENGRAM_BIN", Path.home() / ".claude"))
 sys.path.insert(0, str(ENGRAM_BIN))
 try:
     import memory_ai
-    import memory_recall
 except Exception as e:                                   # pragma: no cover
     sys.exit(f"engram engine not importable from {ENGRAM_BIN}: {e}")
 
 TABS = ["Dashboard", "Memories", "Recall", "Vector", "Graph", "Skills", "Queues"]
 
 
+def resolve_slug() -> str:
+    """Which store: explicit env, then the operator pin in engram.env, then $HOME slugified."""
+    slug = os.environ.get("CLAUDE_MEMORY_SLUG", "")
+    if not slug:
+        try:
+            for line in (ENGRAM_BIN / "engram.env").read_text().splitlines():
+                line = line.strip().removeprefix("export ").strip()
+                if line.startswith("CLAUDE_MEMORY_SLUG="):
+                    slug = line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    return slug or str(Path.home()).replace("/", "-")
+
+
 def store() -> Path:
-    return Path.home() / ".claude" / "projects" / memory_recall.resolve_slug() / "memory"
+    return Path.home() / ".claude" / "projects" / resolve_slug() / "memory"
+
+
+def _recall(query: str, k: int) -> list[dict]:
+    """Hybrid recall through the Rust CLI (keyword index + vector + the SQLite graph)."""
+    exe = ENGRAM_BIN / "rust" / "engram-recall"
+    r = subprocess.run([str(exe), query, "--k", str(k), "--slug", resolve_slug()],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode:
+        raise RuntimeError((r.stderr or "engram-recall failed").strip()[-200:])
+    return json.loads(r.stdout).get("results", [])
+
+
+def _graph_rows(sql: str, params: tuple = ()) -> list[tuple]:
+    import sqlite3
+    db = Path(os.environ.get("ENGRAM_GRAPH_DB", ENGRAM_BIN / "index" / "graph.db"))
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+    try:
+        return [tuple(r) for r in con.execute(sql, params)]
+    finally:
+        con.close()
 
 
 def _get(url: str, headers: dict | None = None, timeout: float = 3.0) -> dict:
@@ -120,9 +153,12 @@ def rows_memories(query: str = "") -> list[dict]:
 def rows_recall(query: str = "") -> list[dict]:
     if not query:
         return [{"label": "press / and type a query — fuses graph + vector + keyword (RRF)"}]
-    out = memory_recall.recall(query, k=10)
+    try:
+        results = _recall(query, 10)
+    except Exception as e:
+        return [{"label": f"recall unavailable: {str(e)[:70]}"}]
     rows = [{"label": f"[{'+'.join(r['sources']):<22}] {r['name']}: {r['description']}",
-             "file": r["file"], "detail": "\n".join(r["facts"])} for r in out["results"]]
+             "file": r["file"], "detail": "\n".join(r.get("facts", []))} for r in results]
     return rows or [{"label": f"(nothing matched: {query})"}]
 
 
@@ -141,20 +177,21 @@ def rows_vector(query: str = "") -> list[dict]:
         except Exception as e:
             head = [{"label": f"Qdrant unreachable: {str(e)[:60]}"}]
         return head
-    hits = memory_recall.vector_leg(query, 15, cfg=cfg)
-    return [{"label": f"{h['score']:.3f}  {h['name']}: {(h['description'] or '')[:90]}",
-             "file": h["file"]} for h in hits] or [{"label": f"(no vector hits: {query})"}]
+    try:
+        hits = [r for r in _recall(query, 15) if "vector" in r.get("sources", [])]
+    except Exception as e:
+        return [{"label": f"vector search unavailable: {str(e)[:70]}"}]
+    return [{"label": f"{r['name']}: {(r.get('description') or '')[:90]}",
+             "file": r["file"]} for r in hits] or [{"label": f"(no vector hits: {query})"}]
 
 
 def graph_stats() -> str:
     try:
-        endpoint, auth = memory_recall._neo4j_http()
-        r = memory_recall._post(endpoint, {"statements": [{"statement":
-            "MATCH (e:Episodic) WITH count(e) AS eps MATCH (n:Entity) WITH eps, count(n) AS ents "
-            "OPTIONAL MATCH ()-[r:RELATES_TO]->() RETURN eps AS episodes, ents AS entities, "
-            "count(r) AS facts"}]}, {"Authorization": auth})
-        row = r["results"][0]["data"][0]["row"]
-        return f"{row[0]} episodes, {row[1]} entities, {row[2]} facts"
+        mem, facts, triples = _graph_rows(
+            "SELECT (SELECT COUNT(*) FROM memories), "
+            "(SELECT COUNT(*) FROM facts WHERE valid_until IS NULL), "
+            "(SELECT COUNT(*) FROM triples WHERE status = 'active' AND valid_until IS NULL)")[0]
+        return f"{mem} memories, {facts} facts, {triples} triples (SQLite graph)"
     except Exception as e:
         return f"unavailable ({str(e)[:40]})"
 
@@ -164,16 +201,16 @@ def rows_graph(query: str = "") -> list[dict]:
         return [{"label": graph_stats()},
                 {"label": "press / and type an entity name to see its 1-hop facts"}]
     try:
-        endpoint, auth = memory_recall._neo4j_http()
-        r = memory_recall._post(endpoint, {"statements": [{"statement":
-            "MATCH (n:Entity)-[r:RELATES_TO]-(m:Entity) WHERE toLower(n.name)=toLower($e) "
-            "RETURN r.name AS rel, m.name AS other, r.fact AS fact LIMIT 50",
-            "parameters": {"e": query}}]}, {"Authorization": auth})
-        rows = r["results"][0]["data"]
-    except Exception as e:
-        return [{"label": f"graph unavailable: {str(e)[:60]}"}]
-    return [{"label": f"{d['row'][0]} -> {d['row'][1]}", "detail": d["row"][2] or ""}
-            for d in rows] or [{"label": f"(no entity named {query})"}]
+        e = query.lower()
+        rows = _graph_rows(
+            "SELECT relation, CASE WHEN subject_l = ?1 THEN object ELSE subject END, "
+            "subject || ' ' || relation || ' ' || object FROM triples "
+            "WHERE status = 'active' AND valid_until IS NULL AND (subject_l = ?1 OR object_l = ?1) "
+            "LIMIT 50", (e,))
+    except Exception as err:
+        return [{"label": f"graph unavailable: {str(err)[:60]}"}]
+    return [{"label": f"{rel} -> {other}", "detail": fact or ""}
+            for rel, other, fact in rows] or [{"label": f"(no entity named {query})"}]
 
 
 def rows_skills() -> list[dict]:

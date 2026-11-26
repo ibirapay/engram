@@ -12,6 +12,8 @@ def _load(state_path, intervals):
     sys.modules["memory_ai"].local_enabled = lambda c: True
     sys.modules["memory_ai"].vector_enabled = lambda c: True
     os.environ["ENGRAM_DAEMON_STATE"] = str(state_path)
+    # Never log into the real ~/.claude/logs: these tests used to write fake FAILED lines there.
+    os.environ["ENGRAM_LOG_DIR"] = tempfile.mkdtemp(prefix="engram-test-logs-")
     sp = importlib.util.spec_from_file_location(
         "engd", Path(__file__).resolve().parent.parent / "daemon" / "engram-daemon.py")
     m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
@@ -41,69 +43,13 @@ def test_real_tasks_defer_when_deps_down():
     """The availability gates in the real task functions must return False, not None."""
     d = tempfile.mkdtemp()
     m = _load(Path(d) / "s.json", {})
-    m._neo4j_up = lambda: False
     m._qdrant_up = lambda: False
     m._vector_enabled = lambda: True
     m._generate_available = lambda: False
-    for name in ("graph", "vector", "export", "reconcile", "harvest"):
+    for name in ("vector", "harvest"):
         assert m.TASKS[name]() is False, f"task_{name} must return False when its dependency is down"
     import shutil; shutil.rmtree(d)
-    print("ok — graph/vector/export/reconcile/harvest all defer explicitly")
-
-
-def test_sqlite_backend_does_not_need_neo4j():
-    """graph.backend: sqlite is a local file. A Neo4j that is down (or decommissioned)
-    must not defer the graph sync, and export/reconcile are a permanent skip (None),
-    not a failure, exactly as under `native`."""
-    d = tempfile.mkdtemp()
-    m = _load(Path(d) / "s.json", {})
-    m._neo4j_up = lambda: False
-    os.environ["ENGRAM_GRAPH_BACKEND"] = "sqlite"
-    try:
-        ran = []
-        m._rust = lambda name: "/bin/true"
-        m.rust_native_sync_supported = lambda: True
-        m._per_tenant = lambda label, fn: ran.append(label) or True
-        assert m.TASKS["graph"]() is True and ran == ["graph"], "graph deferred on a sqlite backend"
-        assert m.TASKS["export"]() is None and m.TASKS["reconcile"]() is None
-        os.environ["ENGRAM_GRAPH_BACKEND"] = "native"
-        assert m.TASKS["graph"]() is False, "native still needs Neo4j"
-    finally:
-        os.environ.pop("ENGRAM_GRAPH_BACKEND", None)
-    import shutil; shutil.rmtree(d)
-    print("ok — sqlite backend never waits on Neo4j")
-
-
-def test_graphiti_compat_uses_legacy_jobs():
-    """The selected reader and writer must address the same Graphiti index.
-
-    Parameterised over whether the `engram-graph-sync` wrapper is installed,
-    because it is only a wrapper: it resolves ENGRAM_CONFIG/ENGRAM_GRAPH and hands
-    them to graph_sync.py, so both routes drive the same Graphiti writer. An
-    earlier version asserted that `graph_sync.py` appeared in the command, which
-    made the result depend on which binaries happened to be installed on the host
-    running the tests — it passed until a real install added the wrapper.
-    """
-    import shutil
-    for wrapper in (None, "/opt/engram/rust/engram-graph-sync"):
-        d = tempfile.mkdtemp()
-        m = _load(Path(d) / "s.json", {})
-        m.cfg = lambda: {"graph": {"backend": "graphiti_compat"}}
-        m._neo4j_up = lambda: True
-        m._rust = lambda name, _w=wrapper: _w if name == "engram-graph-sync" else None
-        seen = []
-        m._run = lambda command, **_: seen.append(command) or 0
-        m.task_graph(); m.task_export(); m.task_reconcile()
-        assert len(seen) == 3, f"wrapper={wrapper}: expected three jobs, got {seen}"
-        for command in seen:
-            target = " ".join(str(c) for c in command)
-            assert ("graph_sync.py" in target) or ("engram-graph-sync" in target), \
-                f"wrapper={wrapper}: not the Graphiti path: {command}"
-            # The native writer must never run while Graphiti is the reader.
-            assert "native-graph-sync" not in target, \
-                f"wrapper={wrapper}: native writer under a Graphiti reader: {command}"
-        shutil.rmtree(d)
-    print("ok — graphiti compatibility keeps the legacy writer/export/reconcile path")
+    print("ok — vector/harvest defer explicitly")
 
 
 def test_tick_reports_failed_tasks():
@@ -120,18 +66,5 @@ def test_tick_reports_failed_tasks():
     print("ok — tick() reports failed tasks, empty when all ran")
 
 
-def test_native_skip_is_not_a_failure():
-    """Under graph.backend=native there is no export/reconcile: that skip is permanent by
-    design, so it must not make tick() report a failure (the unit would be red forever)."""
-    d = tempfile.mkdtemp()
-    m = _load(Path(d) / "s.json", {"export": 0, "reconcile": 0})
-    m._neo4j_up = lambda: True
-    m.graphiti_compat_enabled = lambda: False
-    m.ORDER = ["export", "reconcile"]
-    assert m.tick() == [], "native skip of export/reconcile was reported as a failure"
-    import shutil; shutil.rmtree(d)
-    print("ok — native skip of export/reconcile is not a failure")
-
-
 if __name__ == "__main__":
-    test_native_skip_is_not_a_failure(); test_tick_reports_failed_tasks(); test_deferred_task_is_not_stamped(); test_real_tasks_defer_when_deps_down(); test_sqlite_backend_does_not_need_neo4j(); test_graphiti_compat_uses_legacy_jobs()
+    test_tick_reports_failed_tasks(); test_deferred_task_is_not_stamped(); test_real_tasks_defer_when_deps_down()

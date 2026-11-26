@@ -19,7 +19,7 @@ ATLAS_ROOT = Path(__file__).resolve().parent
 DIST = ATLAS_ROOT / "dist"
 ENGRAM_BIN = Path(os.environ.get("ENGRAM_BIN", Path.home() / ".claude"))
 PROJECTS_ROOT = Path.home() / ".claude" / "projects"
-GRAPH_ROOT = Path(os.environ.get("ENGRAM_GRAPH", ENGRAM_BIN / "graph"))
+GRAPH_DB = Path(os.environ.get("ENGRAM_GRAPH_DB", ENGRAM_BIN / "index" / "graph.db"))
 RUST_API = os.environ.get("ENGRAM_RUST_API", "http://127.0.0.1:8787")
 LINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 SAFE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -97,17 +97,24 @@ def _graph_project() -> str:
     hard-coded here, which is one particular host's slug: everywhere else every
     memory showed coverage "unknown" and no shared-entity edge was ever drawn."""
     try:
-        import memory_recall
-        return memory_recall.pinned_slug() or "-root"
-    except Exception:
-        return "-root"
+        for line in (ENGRAM_BIN / "engram.env").read_text().splitlines():
+            line = line.strip().removeprefix("export ").strip()
+            if line.startswith("CLAUDE_MEMORY_SLUG="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'") or "-root"
+    except OSError:
+        pass
+    return "-root"
 
 
-def _graph_backend() -> str:
+def _graph_rows(sql: str, params: tuple = ()) -> list[dict]:
+    """Read-only query against the SQLite graph (`graph.db`). Raises on failure."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{GRAPH_DB}?mode=ro", uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
     try:
-        return ((base.memory_ai.load().get("graph") or {}).get("backend") or "graphiti_compat").lower()
-    except Exception:
-        return "graphiti_compat"
+        return [dict(row) for row in con.execute(sql, params)]
+    finally:
+        con.close()
 
 
 def _project_label(project_id: str) -> str:
@@ -157,39 +164,32 @@ def _slug_owner():
 
 
 def _graph_done(slug: str) -> set[str]:
-    """The set of a slug's memory FILENAMES already harvested into the graph, read
-    from the per-slug ingest state (`graph/state/<slug>/insert_state.json`, whose
-    "done" maps filename -> episode uuid). Empty when there is no state yet — a
-    slug whose memories have not been harvested at all. Never raises."""
-    path = GRAPH_ROOT / "state" / slug / "insert_state.json"
+    """The FILENAMES of a slug's memories the graph has fully synced (a commit
+    marker is set). Empty when the graph has nothing for the slug. Never raises."""
     try:
-        return set((json.loads(path.read_text()).get("done") or {}).keys())
-    except (OSError, ValueError, TypeError, AttributeError):
+        return {row["file"] for row in _graph_rows(
+            "SELECT file FROM memories WHERE slug = ? AND sha IS NOT NULL", (slug,))}
+    except Exception:
         return set()
 
 
 def _stale_count(project_dir: Path, graphed_names: set[str]) -> int:
-    """Among a store's already-harvested files, how many were EDITED since the
-    harvest and so need re-extraction. Measured only where a sha baseline exists:
-    the global `graph/sync_state.json` (filename -> sha256) is keyed by bare
-    filename, which only disambiguates the root store, so this returns 0 for
-    non-root stores (documented limitation — other slugs track no hash). Never
-    raises."""
-    if project_dir.name != "-root" or not graphed_names:
+    """Among a store's already-synced files, how many were EDITED after the sync and
+    so need re-extraction: the file's mtime is newer than the graph's `synced_at`.
+    Never raises."""
+    if not graphed_names:
         return 0
     try:
-        sync = json.loads((GRAPH_ROOT / "sync_state.json").read_text())
-    except (OSError, ValueError, TypeError):
+        synced = {row["file"]: row["synced_at"] or 0 for row in _graph_rows(
+            "SELECT file, synced_at FROM memories WHERE slug = ? AND sha IS NOT NULL",
+            (project_dir.name,))}
+    except Exception:
         return 0
     store = project_dir / "memory"
     stale = 0
     for name in graphed_names:
-        expected = sync.get(name)
-        path = store / name
-        if not expected or not path.exists():
-            continue
         try:
-            if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            if int((store / name).stat().st_mtime) > int(synced.get(name, 0)):
                 stale += 1
         except OSError:
             continue
@@ -239,70 +239,41 @@ def _inventory(scope: str) -> tuple[list[dict], list[dict]]:
 
 
 def _graph_evidence(nodes: list[dict]) -> tuple[list[dict], list[str]]:
-    warnings = []
+    warnings: list[str] = []
     graph_project = _graph_project()
     root_by_file = {n["file"]: n for n in nodes if n["project"] == graph_project}
     if not root_by_file:
         return [], warnings
-    if _graph_backend() == "native":
-        return _native_graph_evidence(nodes, root_by_file, graph_project, warnings)
+    return _native_graph_evidence(nodes, root_by_file, graph_project, warnings)
+
+
+def _native_graph_evidence(nodes, root_by_file, slug, warnings):
+    """Coverage and shared entities from the SQLite graph. A memory with a commit
+    marker is indexed; a row without one is mid-sync or failed (stale); no row at
+    all is unindexed. Entities are the live facts' endpoints plus active triples'
+    subject/object."""
     try:
-        episodes = base._graph_query(
-            "MATCH (e:Episodic) WHERE e.file IS NOT NULL "
-            "RETURN e.uuid AS uuid, e.file AS file, e.valid_at AS valid_at, e.created_at AS created_at")
+        rows = _graph_rows(
+            "SELECT m.file AS file, m.sha IS NOT NULL AS current, "
+            "(SELECT group_concat(x, char(31)) FROM ("
+            "  SELECT f.subject AS x FROM facts f WHERE f.memory_id = m.id AND f.valid_until IS NULL AND f.subject IS NOT NULL "
+            "  UNION SELECT f.object FROM facts f WHERE f.memory_id = m.id AND f.valid_until IS NULL AND f.object IS NOT NULL "
+            "  UNION SELECT t.subject FROM triples t WHERE t.memory_id = m.id AND t.status = 'active' AND t.valid_until IS NULL "
+            "  UNION SELECT t.object FROM triples t WHERE t.memory_id = m.id AND t.status = 'active' AND t.valid_until IS NULL"
+            ")) AS entities "
+            "FROM memories m WHERE m.slug = ?", (slug,))
     except Exception:
         warnings.append("Entity connections are temporarily unavailable.")
         return [], warnings
-
-    episode_to_node = {}
-    file_episodes: dict[str, list[str]] = {}
-    for ep in episodes:
-        fname = ep.get("file")
-        if fname in root_by_file:
-            episode_to_node[ep["uuid"]] = root_by_file[fname]["id"]
-            file_episodes.setdefault(fname, []).append(ep["uuid"])
-    for fname, node in root_by_file.items():
-        if fname in file_episodes:
-            node["indexStatus"] = "indexed"
-            node["episodeCount"] = len(file_episodes[fname])
-
-    sync_state_path = GRAPH_ROOT / "sync_state.json"
-    try:
-        sync_state = json.loads(sync_state_path.read_text())
-    except Exception:
-        sync_state = {}
-    for fname, node in root_by_file.items():
-        expected = sync_state.get(fname)
-        path = PROJECTS_ROOT / graph_project / "memory" / fname
-        if node["indexStatus"] == "indexed" and expected and path.exists():
-            actual = hashlib.sha256(path.read_bytes()).hexdigest()
-            if actual != expected:
-                node["indexStatus"] = "stale"
-
-    ep_ids = list(episode_to_node)
-    if not ep_ids:
-        return [], warnings
-    facts = base._graph_query(
-        "MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity) "
-        "WHERE any(u IN coalesce(r.episodes, []) WHERE u IN $episodes) "
-        "AND r.invalid_at IS NULL AND r.expired_at IS NULL "
-        "RETURN a.name AS source, labels(a) AS source_labels, r.name AS relation, "
-        "r.fact AS fact, b.name AS target, labels(b) AS target_labels, r.episodes AS episodes",
-        episodes=ep_ids,
-    )
     node_entities: dict[str, set[str]] = {}
-    evidence: dict[str, list[dict]] = {}
-    for fact in facts:
-        for ep in fact.get("episodes") or []:
-            node_id = episode_to_node.get(ep)
-            if not node_id:
-                continue
-            ents = node_entities.setdefault(node_id, set())
-            ents.update(x for x in (fact.get("source"), fact.get("target")) if x)
-            evidence.setdefault(node_id, []).append({
-                "source": fact.get("source"), "relation": fact.get("relation"),
-                "target": fact.get("target"), "fact": fact.get("fact", ""),
-            })
+    for node in root_by_file.values():
+        node["indexStatus"] = "unindexed"
+    for row in rows:
+        node = root_by_file.get(row["file"])
+        if not node:
+            continue
+        node["indexStatus"] = "indexed" if row["current"] else "stale"
+        node_entities[node["id"]] = {e for e in (row["entities"] or "").split("\x1f") if e}
     return _shared_entity_edges(nodes, node_entities), warnings
 
 
@@ -332,36 +303,6 @@ def _shared_entity_edges(nodes: list[dict], node_entities: dict[str, set[str]]) 
             "count": len(shared), "entities": shared[:12], "truncated": len(shared) > 12,
         })
     return shared_edges
-
-
-def _native_graph_evidence(nodes, root_by_file, slug, warnings):
-    """Coverage and shared entities from the Rust native graph (graph.backend:
-    native). A memory with a commit marker is indexed; a node without one is
-    mid-sync or failed (stale); no node at all is unindexed. Entities are the live
-    facts' endpoints (imported legacy facts) plus active triples' subject/object."""
-    try:
-        rows = base._graph_query(
-            "MATCH (m:EngramMemory {slug: $slug}) "
-            "OPTIONAL MATCH (m)-[:HAS_FACT]->(f:EngramFact) WHERE f.valid_until IS NULL "
-            "OPTIONAL MATCH (m)-[:HAS_TRIPLE]->(t:EngramTriple {status: 'active'}) "
-            "WHERE t.valid_until IS NULL "
-            "RETURN m.file AS file, m.sha IS NOT NULL AS current, "
-            "collect(DISTINCT f.subject) + collect(DISTINCT f.object) + "
-            "collect(DISTINCT t.subject) + collect(DISTINCT t.object) AS entities",
-            slug=slug)
-    except Exception:
-        warnings.append("Entity connections are temporarily unavailable.")
-        return [], warnings
-    node_entities: dict[str, set[str]] = {}
-    for node in root_by_file.values():
-        node["indexStatus"] = "unindexed"
-    for row in rows:
-        node = root_by_file.get(row["file"])
-        if not node:
-            continue
-        node["indexStatus"] = "indexed" if row["current"] else "stale"
-        node_entities[node["id"]] = {e for e in row["entities"] if e}
-    return _shared_entity_edges(nodes, node_entities), warnings
 
 
 def _wiki_edges(nodes: list[dict]) -> list[dict]:
@@ -445,13 +386,8 @@ def _editable_config(cfg: dict) -> dict:
         "backend": cfg.get("backend", ""),
         "llama_cpp": {key: llama.get(key, "") for key in ("url", "model", "timeout_seconds")},
         "embed": {key: embed.get(key, "") for key in ("provider", "url", "model", "dim")},
-        # graphiti_compat, matching Config::default_graph_backend and the daemon.
-        # Defaulting to "native" here meant that saving ANY unrelated setting
-        # through this fallback materialised a `graph:` block that moved an
-        # upgraded install off its populated Graphiti index — the same bug the
-        # Rust default was changed to fix, reintroduced on the path taken when
-        # the Rust API is down.
-        "graph": {"backend": graph.get("backend", "graphiti_compat")},
+        # sqlite, matching Config::default_graph_backend and the daemon.
+        "graph": {"backend": graph.get("backend", "sqlite")},
     }
 
 
@@ -493,7 +429,7 @@ def _validate_config_patch(patch: dict, current: dict) -> tuple[dict, bool]:
         raise HTTPException(400, "graph must be an object")
     if "backend" in incoming_graph:
         normalized["graph"]["backend"] = str(incoming_graph["backend"]).strip().lower()
-    if normalized["graph"]["backend"] not in ("native", "graphiti_compat"):
+    if normalized["graph"]["backend"] not in ("sqlite",):
         raise HTTPException(400, "unsupported graph backend")
     provider = str(normalized["embed"].get("provider", "")).strip().lower()
     if provider not in ("", "ollama", "fastembed", "llama_cpp", "openai"):

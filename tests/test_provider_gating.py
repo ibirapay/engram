@@ -29,6 +29,7 @@ def load_daemon(home, config_text):
         (claude / f.name).write_bytes(f.read_bytes())
     (claude / "engram.yaml").write_text(config_text)
     os.environ["ENGRAM_BIN"] = str(claude)
+    os.environ["ENGRAM_LOG_DIR"] = str(claude / "logs")  # never the real ~/.claude/logs
     os.environ["HOME"] = str(home)
     os.environ.pop("ENGRAM_GRAPH_BACKEND", None)
     os.environ.pop("CLAUDE_MEMORY_SLUG", None)
@@ -67,33 +68,6 @@ def test_provider_gating(home):
     print(f"ok — Rust indexing claimed only for providers it implements ({len(cases)} configs)")
 
 
-def test_graph_backend_default_and_override(home):
-    mod = load_daemon(home, "backend: ollama\n")
-
-    # No graph block: must stay on the index the install already populated.
-    write_config(home, "backend: ollama\n")
-    assert mod.graph_backend() == "graphiti_compat", mod.graph_backend()
-    assert mod.graphiti_compat_enabled()
-
-    # An explicit choice is honoured.
-    write_config(home, "backend: ollama\ngraph:\n  backend: native\n")
-    assert mod.graph_backend() == "native"
-    assert not mod.graphiti_compat_enabled()
-
-    # The env override must move the WRITER too, not just the reader — otherwise
-    # the daemon writes one index while recall reads the other.
-    try:
-        os.environ["ENGRAM_GRAPH_BACKEND"] = "graphiti_compat"
-        assert mod.graph_backend() == "graphiti_compat", \
-            "the daemon ignored ENGRAM_GRAPH_BACKEND; reader and writer can diverge"
-        assert mod.graphiti_compat_enabled()
-        os.environ["ENGRAM_GRAPH_BACKEND"] = "   "
-        assert mod.graph_backend() == "native", "an empty export is not a choice"
-    finally:
-        os.environ.pop("ENGRAM_GRAPH_BACKEND", None)
-    print("ok — graph backend: graphiti_compat by default, env override honored on the write side")
-
-
 def test_native_sync_needs_an_endpoint_for_each_half(home):
     """A native sync embeds AND extracts, through two different services.
 
@@ -128,60 +102,48 @@ def test_native_sync_needs_an_endpoint_for_each_half(home):
     print(f"ok — native sync requires an endpoint for each half ({len(cases)} configs)")
 
 
-def test_native_backend_never_falls_back_to_the_graphiti_writer(home):
-    """Writing the index nobody is reading is worse than writing nothing.
+def test_graph_backend_default_and_override(home):
+    mod = load_daemon(home, "backend: ollama\n")
 
-    When `graph.backend: native` is selected the reader queries the native index.
-    The old fallback ran graph_sync.py — the GRAPHITI writer — whenever the Rust
-    sync could not serve the config, so saves landed in one index while recall
-    queried the other. That presents as memories that were saved and then cannot
-    be recalled, with nothing in the logs connecting the two.
+    # No graph block: the graph is the SQLite file.
+    write_config(home, "backend: ollama\n")
+    assert mod.graph_backend() == "sqlite", mod.graph_backend()
+
+    # The env override must move the WRITER too, not just the reader.
+    try:
+        os.environ["ENGRAM_GRAPH_BACKEND"] = "native"
+        assert mod.graph_backend() == "native", \
+            "the daemon ignored ENGRAM_GRAPH_BACKEND; reader and writer can diverge"
+        os.environ["ENGRAM_GRAPH_BACKEND"] = "   "
+        assert mod.graph_backend() == "sqlite", "an empty export is not a choice"
+    finally:
+        os.environ.pop("ENGRAM_GRAPH_BACKEND", None)
+    print("ok — graph backend: sqlite by default, env override honored on the write side")
+
+
+def test_graph_task_only_runs_the_sqlite_sync(home):
+    """The graph task writes the SQLite graph with the Rust sync, and nothing else.
+
+    A config still on `native` / `graphiti_compat` (removed in 1.5.0) is reported as a
+    failure with the migration step; an unserviceable sync is a failure too. Neither
+    may fall back to a Python writer: there is none.
     """
     mod = load_daemon(home, "backend: ollama\n")
-    # native selected, but Rust cannot serve it (ollama generation)
-    # Unserviceable because there is no generation endpoint for extraction —
-    # NOT because of the `backend` value, which the Rust sync does not consult.
-    write_config(home, "backend: ollama\ngraph:\n  backend: native\n"
+    ran = []
+    mod._run = lambda cmd, **kw: ran.append(cmd) or 0
+
+    for old in ("native", "graphiti_compat"):
+        write_config(home, f"backend: ollama\ngraph:\n  backend: {old}\n")
+        assert mod.task_graph() is False, f"{old} must report failure, not run a writer"
+    assert ran == [], f"a removed backend ran a writer: {ran}"
+
+    # sqlite, but the Rust sync cannot serve the config (no generation endpoint)
+    write_config(home, "backend: ollama\ngraph:\n  backend: sqlite\n"
                        "embed:\n  provider: llama_cpp\n  url: \"http://e/v1\"\n")
-    assert not mod.graphiti_compat_enabled()
     assert not mod.rust_native_sync_supported()
-
-    ran = []
-    mod._run = lambda cmd, **kw: ran.append(cmd) or 0
-    mod._neo4j_up = lambda *a, **k: True
-    mod._graph_enabled = lambda *a, **k: True
-    assert mod.task_graph() is False, "an unserviceable native sync must report failure"
-    assert ran == [], f"it wrote to an index nothing is reading: {ran}"
-    print("ok — a native backend that Rust cannot serve skips instead of writing Graphiti")
-
-
-def test_graphiti_maintenance_never_runs_under_a_native_reader(home):
-    """Export and reconcile write the LEGACY Graphiti schema.
-
-    `engram-graph-sync` is a wrapper around graph/graph_sync.py, so both branches
-    of these jobs wrote Graphiti. The old condition had it backwards — it reached
-    for the wrapper precisely when the backend was `native` — so a native reader
-    got a nightly Graphiti export, the same split brain task_graph was fixed for.
-    Operating on an index nothing reads is worse than not operating: it looks like
-    maintenance is happening.
-    """
-    mod = load_daemon(home, "backend: ollama\n")
-    mod._neo4j_up = lambda *a, **k: True
-    ran = []
-    mod._run = lambda cmd, **kw: ran.append(cmd) or 0
-
-    write_config(home, "backend: ollama\ngraph:\n  backend: native\n")
-    # None = skipped by design (not False, which tick() reports as a failed task)
-    assert mod.task_export() is None, "a native backend must not export Graphiti"
-    assert mod.task_reconcile() is None, "a native backend must not reconcile Graphiti"
-    assert ran == [], f"it ran the legacy Graphiti writer anyway: {ran}"
-
-    # ...and compatibility mode still does both.
-    write_config(home, "backend: ollama\ngraph:\n  backend: graphiti_compat\n")
-    assert mod.task_export() is True
-    assert mod.task_reconcile() is True
-    assert len(ran) == 2, ran
-    print("ok — Graphiti export/reconcile only run when Graphiti is the reader")
+    assert mod.task_graph() is False, "an unserviceable sync must report failure"
+    assert ran == [], f"it ran something it could not serve: {ran}"
+    print("ok — the graph task runs only the Rust SQLite sync; removed backends fail loudly")
 
 
 def test_config_path_and_slug_resolution(home):
@@ -208,8 +170,7 @@ def main():
         test_provider_gating(d)
         test_graph_backend_default_and_override(d)
         test_native_sync_needs_an_endpoint_for_each_half(d)
-        test_native_backend_never_falls_back_to_the_graphiti_writer(d)
-        test_graphiti_maintenance_never_runs_under_a_native_reader(d)
+        test_graph_task_only_runs_the_sqlite_sync(d)
         test_config_path_and_slug_resolution(d)
 
 

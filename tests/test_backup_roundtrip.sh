@@ -24,7 +24,6 @@ HOME_DIR="$WORK/home/.claude"
 REPO="$WORK/repo"
 mkdir -p "$HOME_DIR/projects/-tenant-a/memory" \
          "$HOME_DIR/projects/-tenant-b/memory" \
-         "$HOME_DIR/graph" \
          "$WORK/vault/Notes" "$WORK/vault/.obsidian" "$WORK/vault/.trash"
 
 # Seed the authoritative set: two memory stores, a vault, and the two config
@@ -34,7 +33,6 @@ printf -- '---\nname: beta\n---\nbeta body\n'   > "$HOME_DIR/projects/-tenant-b/
 printf -- '# Runbook\n\nDNS failover steps.\n'   > "$WORK/vault/Notes/runbook.md"
 printf 'workspace-state'                          > "$WORK/vault/.obsidian/workspace.json"
 printf 'deleted note'                             > "$WORK/vault/.trash/old.md"
-printf 'NEO4J_PASSWORD=should-be-in-the-backup\n' > "$HOME_DIR/graph/.env"
 cat > "$HOME_DIR/engram.yaml" <<YAML
 local_enabled: true
 backup:
@@ -48,7 +46,6 @@ LOG="$WORK/daemon.log"
 SECRET="correct-horse-battery-staple-$RANDOM"
 export ENGRAM_BIN="$HOME_DIR"
 export ENGRAM_CONFIG="$HOME_DIR/engram.yaml"
-export ENGRAM_GRAPH="$HOME_DIR/graph"
 export ENGRAM_LOG_DIR="$WORK/logs"
 export ENGRAM_BACKUP_REPO="$REPO"
 export ENGRAM_BACKUP_PASSWORD="$SECRET"
@@ -63,7 +60,7 @@ run snapshots || fail "snapshots failed"
 grep -q "engram" "$LOG" || fail "no engram-tagged snapshot listed"
 
 # Destroy the live data, then restore from the encrypted repo.
-rm -rf "$HOME_DIR/projects" "$WORK/vault/Notes" "$HOME_DIR/graph/.env"
+rm -rf "$HOME_DIR/projects" "$WORK/vault/Notes"
 TARGET="$WORK/restored"
 run restore --snapshot latest --target "$TARGET" || fail "restore failed"
 
@@ -71,16 +68,16 @@ run restore --snapshot latest --target "$TARGET" || fail "restore failed"
 restored_alpha="$TARGET$HOME_DIR/projects/-tenant-a/memory/alpha.md"
 restored_beta="$TARGET$HOME_DIR/projects/-tenant-b/memory/beta.md"
 restored_run="$TARGET$WORK/vault/Notes/runbook.md"
-restored_env="$TARGET$HOME_DIR/graph/.env"
+restored_cfg="$TARGET$HOME_DIR/engram.yaml"
 
 [ -f "$restored_alpha" ] || fail "alpha.md not restored"
 [ -f "$restored_beta" ]  || fail "beta.md not restored"
 [ -f "$restored_run" ]   || fail "vault runbook not restored"
-[ -f "$restored_env" ]   || fail "graph/.env not restored (restore would be incomplete)"
+[ -f "$restored_cfg" ]   || fail "engram.yaml not restored (restore would be incomplete)"
 
 grep -q "alpha body" "$restored_alpha" || fail "alpha.md content wrong"
 grep -q "DNS failover" "$restored_run" || fail "vault content wrong"
-grep -q "should-be-in-the-backup" "$restored_env" || fail ".env content wrong"
+grep -q "local_enabled" "$restored_cfg" || fail "engram.yaml content wrong"
 
 # Obsidian's own state must NOT be in the backup.
 if [ -e "$TARGET$WORK/vault/.obsidian/workspace.json" ] || [ -e "$TARGET$WORK/vault/.trash/old.md" ]; then

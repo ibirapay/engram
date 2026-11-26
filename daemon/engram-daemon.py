@@ -13,15 +13,13 @@ Safety: respects `local_enabled` and the dry-run apply-gates in engram.yaml — 
 daemon nudges and prepares; a human approves mutations. Apply-gates ship OFF.
 
 Tasks + default intervals (s), override via engram.yaml `daemon.intervals`:
-  health      300     backend (ollama|claude) + Neo4j reachability -> log
-  graph       1800    graph_sync.py --insert  (new memories -> graph)
+  health      300     backend (ollama|claude) + Qdrant reachability -> log
+  graph       1800    engram-native-graph-sync  (new memories -> the SQLite graph)
   maintenance 21600   memory_fixate_cron.sh || memory_pipeline.sh  (light pass + pipeline, gated)
-  export      86400   graph_sync.py --export --verify  (round-trip drift report)
-  reconcile   86400   graph_sync.py --reconcile  (superseded-fact report)
 
 Paths are resolved from env (the installer / container set these):
-  ENGRAM_BIN   engine dir (default ~/.claude)        ENGRAM_GRAPH  graph dir (default $ENGRAM_BIN/graph)
-  ENGRAM_LOG_DIR (default ~/.claude/logs)            NEO4J_URI     (default bolt://127.0.0.1:7687)
+  ENGRAM_BIN   engine dir (default ~/.claude)        ENGRAM_GRAPH_DB  graph file (default $ENGRAM_BIN/index/graph.db)
+  ENGRAM_LOG_DIR (default ~/.claude/logs)
 """
 import fcntl
 import json
@@ -36,7 +34,6 @@ from urllib.parse import urlparse
 HERE = Path(__file__).resolve().parent
 HOME = Path.home()
 ENGRAM_BIN = Path(os.environ.get("ENGRAM_BIN", HOME / ".claude"))
-ENGRAM_GRAPH = Path(os.environ.get("ENGRAM_GRAPH", ENGRAM_BIN / "graph"))
 ENGRAM_VECTOR = Path(os.environ.get("ENGRAM_VECTOR", ENGRAM_BIN / "vector"))
 LOG_DIR = Path(os.environ.get("ENGRAM_LOG_DIR", HOME / ".claude" / "logs"))
 STATE = Path(os.environ.get("ENGRAM_DAEMON_STATE", LOG_DIR / "daemon_state.json"))
@@ -56,9 +53,9 @@ except Exception:
 #   distill (LLM) is gated WEEKLY inside memory_fixate_cron.sh.
 DEFAULT_INTERVALS = {"health": 300, "approvals": 300, "harvest": 3600,
                      "graph": 1800, "vector": 1800, "wiki": 1800, "maintenance": 79200,
-                     "backup": 79200, "curate": 604800, "export": 79200, "reconcile": 79200}
+                     "backup": 79200, "curate": 604800}
 ORDER = ["health", "approvals", "harvest", "graph", "vector", "wiki", "maintenance",
-         "backup", "curate", "export", "reconcile"]
+         "backup", "curate"]
 
 
 def cfg():
@@ -152,19 +149,12 @@ def graph_backend() -> str:
 
     ENGRAM_GRAPH_BACKEND was honoured only on the read side, so exporting it moved
     recall to one index while this daemon kept writing to the other. And a config
-    with no `graph:` block defaults to graphiti_compat here, matching
-    engram-config: almost every upgraded install has no such block, and switching
-    those writes to the unproven native path is not something a default should do.
+    with no `graph:` block defaults to sqlite here, matching engram-config.
     """
     env = (os.environ.get("ENGRAM_GRAPH_BACKEND") or "").strip()
     if env:
         return env
-    return ((cfg().get("graph", {}) or {}).get("backend") or "graphiti_compat").strip()
-
-
-def graphiti_compat_enabled() -> bool:
-    """Keep the Graphiti writer and reader on the same index during migration."""
-    return graph_backend() == "graphiti_compat"
+    return ((cfg().get("graph", {}) or {}).get("backend") or "sqlite").strip()
 
 
 def rust_embedding_supported() -> bool:
@@ -274,21 +264,6 @@ def _neo4j_uri() -> str:
             or (cfg().get("graph", {}) or {}).get("neo4j_uri")
             or "bolt://127.0.0.1:7687")
 
-def _graph_store_up() -> bool:
-    """The graph store the tasks need is reachable. With `graph.backend: sqlite` it is a
-    local file (nothing to probe, and a Neo4j that is down or gone must not defer the
-    sync); otherwise it is Neo4j."""
-    return graph_backend() == "sqlite" or _neo4j_up()
-
-
-def _neo4j_up() -> bool:
-    p = urlparse(_neo4j_uri())
-    try:
-        with socket.create_connection((p.hostname or "127.0.0.1", p.port or 7687), timeout=3):
-            return True
-    except Exception:
-        return False
-
 def _vector_enabled() -> bool:
     return bool(memory_ai and memory_ai.vector_enabled(cfg()))
 
@@ -324,53 +299,30 @@ def task_health():
         h = engram_llm.health(cfg())
     except Exception as e:
         h = {"error": str(e)}
-    if graph_backend() == "sqlite":
-        h["graph"] = "sqlite"
-    else:
-        h["neo4j"] = _neo4j_up()
+    h["graph"] = graph_backend()
     if _vector_enabled():
         h["qdrant"] = _qdrant_up()
     log(f"health: {json.dumps(h)}")
 
 def task_graph():
-    if not _graph_store_up():
-        log("graph: Neo4j down — skipping insert")
+    backend = graph_backend()
+    if backend != "sqlite":
+        log("graph: graph.backend: %s was removed in 1.5.0. Copy the graph once with "
+            "engram-graph-to-sqlite, then set graph.backend: sqlite" % backend)
         return False
-    # --limit: graph_sync extracts every pending memory BEFORE its single terminal
-    # write, so an unbounded run on a large backlog is killed mid-extraction by the
-    # 3600s _run cap and commits NOTHING. That cost 7 consecutive nights (2026-08-08
-    # .. 08-14) with the graph frozen at the 327 the bootstrap left. Keep N * per-
-    # memory-time comfortably under the cap; the backlog drains a batch per night.
-    # Bound the batch: an unbounded run on a large backlog is killed mid-extraction
-    # by the 3600s _run cap, which is how the graph sat frozen at the bootstrap's 327
-    # for 7 nights (2026-08-08..08-14). memory_graph_insert commits per memory, so a
-    # kill costs the in-flight memory, not the batch — size this for the cap, not for
-    # safety. 25 @ ~40s measured (think:false, 2026-08-14) ~= 17 min, 3x headroom.
+    # --limit: the sync extracts every pending memory before its single terminal write, so
+    # an unbounded run on a large backlog is killed mid-extraction by the 3600s _run cap
+    # and commits NOTHING (that froze the graph for 7 nights, 2026-08-08..08-14). The
+    # native sync commits per memory, so a kill costs the in-flight memory, not the batch;
+    # the backlog drains a batch per run.
     rust_sync = _rust("engram-native-graph-sync")
-    if not graphiti_compat_enabled():
-        # The native backend is selected, so the READER queries the native index.
-        # Only the native writer may run here.
-        if rust_sync and rust_native_sync_supported():
-            return _per_tenant("graph", lambda tenant, slug: _run(_scoped(
-                [str(rust_sync), "--config", str(ENGRAM_CONFIG)],
-                tenant, slug) + ["--limit", "25"]) == 0)
-        # Do NOT fall back to graph_sync.py: it writes the Graphiti index, which
-        # nothing is reading in this configuration. The old fallback produced a
-        # split brain — writes landing in one index while recall queried the
-        # other — and presented as memories that were saved and then could not be
-        # recalled. Skipping is visible and recoverable; writing to the wrong
-        # index is neither.
-        log("graph: native backend selected but the Rust sync cannot serve this "
-            "config (embeddings: %s, reasoning: %s) — SKIPPING. Set "
-            "graph.backend: graphiti_compat to use the Python writer."
-            % (rust_embedding_supported(), rust_reasoning_supported()))
-        return False
-    # Per tenant, like the vector task: graph_sync reads ONE store and inserts
-    # into ONE Graphiti group, so a single pass would index whichever store the
-    # environment happened to name and leave the others unsynced.
-    return _per_tenant("graph", lambda tenant, slug: _run(_scoped(
-        [sys.executable, str(ENGRAM_GRAPH / "graph_sync.py"), "--insert"],
-        tenant, slug) + ["--limit", "25"]) == 0)
+    if rust_sync and rust_native_sync_supported():
+        return _per_tenant("graph", lambda tenant, slug: _run(_scoped(
+            [str(rust_sync), "--config", str(ENGRAM_CONFIG)],
+            tenant, slug) + ["--limit", "25"]) == 0)
+    log("graph: the Rust sync cannot serve this config (embeddings: %s, reasoning: %s) — "
+        "SKIPPING" % (rust_embedding_supported(), rust_reasoning_supported()))
+    return False
 
 def task_vector():
     if not _vector_enabled():
@@ -530,48 +482,6 @@ def task_curate():
         _run([_vector_python(), str(ac), "--apply"])
 
 
-def _graphiti_maintenance(mode: str, *python_args: str):
-    """Run a Graphiti export/reconcile pass, or skip it under a native reader.
-
-    `engram-graph-sync` is a thin wrapper that shells out to graph/graph_sync.py,
-    so BOTH branches here write and verify the legacy Graphiti schema. The old
-    condition had it backwards: it reached for the wrapper precisely when the
-    backend was `native`, running a Graphiti export while recall read the native
-    index — the same split brain that task_graph was fixed for, left in place on
-    the export and reconcile jobs.
-
-    There is no native export or reconcile yet, and operating on an index nothing
-    reads is worse than not operating: it looks like maintenance is happening.
-    """
-    if not graphiti_compat_enabled():
-        log(f"{mode}: native backend selected and there is no native {mode} — "
-            f"SKIPPING (graph.backend: graphiti_compat enables the Graphiti one)")
-        # None, not False: this skip is permanent by design, not a deferral. False would
-        # make every tick report export/reconcile as FAILED and the unit never go green.
-        return None
-    # Per tenant: export regenerates .md from ONE store's episodes and reconcile
-    # reads ONE group, so an unscoped pass operates on whichever store the
-    # environment names and reports success for the rest.
-    rust_sync = _rust("engram-graph-sync")
-    if rust_sync:
-        return _per_tenant(mode, lambda tenant, slug: _run(_scoped(
-            [str(rust_sync), "--config", str(ENGRAM_CONFIG),
-             "--graph-dir", str(ENGRAM_GRAPH)], tenant, slug)
-            + ["--mode", mode]) == 0)
-    return _per_tenant(mode, lambda tenant, slug: _run(_scoped(
-        [sys.executable, str(ENGRAM_GRAPH / "graph_sync.py")], tenant, slug)
-        + list(python_args)) == 0)
-
-def task_export():
-    if not _graph_store_up():
-        return False
-    return _graphiti_maintenance("export", "--export", "--verify")
-
-def task_reconcile():
-    if not _graph_store_up():
-        return False
-    return _graphiti_maintenance("reconcile", "--reconcile")
-
 def task_approvals():
     """Process the async human-approval queue: consume Telegram callbacks, expire
     stale proposals (drop), apply approved ops. No-op (cheap) when the queue is
@@ -584,7 +494,7 @@ def task_approvals():
 TASKS = {"health": task_health, "approvals": task_approvals, "harvest": task_harvest,
          "graph": task_graph, "vector": task_vector, "wiki": task_wiki,
          "backup": task_backup, "maintenance": task_maintenance,
-         "curate": task_curate, "export": task_export, "reconcile": task_reconcile}
+         "curate": task_curate}
 
 
 def tick(force=None):

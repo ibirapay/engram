@@ -18,10 +18,9 @@ from pathlib import Path
 
 HOME = Path.home()
 ENGRAM_BIN = Path(os.environ.get("ENGRAM_BIN", HOME / ".claude"))
-ENGRAM_GRAPH = Path(os.environ.get("ENGRAM_GRAPH", ENGRAM_BIN / "graph"))
+GRAPH_DB = Path(os.environ.get("ENGRAM_GRAPH_DB", ENGRAM_BIN / "index" / "graph.db"))
 ENGRAM_VECTOR = Path(os.environ.get("ENGRAM_VECTOR", ENGRAM_BIN / "vector"))
 UI_DIR = Path(os.environ.get("ENGRAM_UI_DIR", Path(__file__).resolve().parent.parent / "ui"))
-GRAPH_PY = os.environ.get("ENGRAM_GRAPH_PYTHON") or str(ENGRAM_GRAPH / "venv" / "bin" / "python")
 
 sys.path.insert(0, str(ENGRAM_BIN))
 # The optional vector store modules live in ~/.claude/vector — make them importable
@@ -219,13 +218,13 @@ async def login(request: Request):
 
 @app.get("/api/health")
 def health():
-    out = {"backend": None, "neo4j": False, "daemon": None, "store": str(STORE()), "memories": 0}
+    out = {"backend": None, "graph": "sqlite", "daemon": None, "store": str(STORE()), "memories": 0}
     try:
         import engram_llm
         out.update(engram_llm.health(memory_ai.load()))
     except Exception as e:
         out["error"] = str(e)
-    out["neo4j"] = _neo4j_up()
+    out["graph_db"] = GRAPH_DB.is_file()
     st = ENGRAM_BIN / "logs" / "daemon_state.json"
     if not st.exists():
         st = HOME / ".claude" / "logs" / "daemon_state.json"
@@ -435,73 +434,55 @@ def recall_hybrid(q: str, k: int = 6, type: str = ""):
         keyword_pairs = memory_keyword.rank(q, want, type or None)
     except Exception:
         keyword_pairs = []
-    # graph leg (subprocess to the graph venv — decoupled, same as /api/graph/recall)
+    # graph leg: the facts live in the SQLite graph and are fused by the Rust recall
+    # (engram-mcp / engram-recall); this Python fallback fuses vector + keyword only.
     graph_records = []
-    script = ENGRAM_GRAPH / "memory_graph_recall.py"
-    if script.exists() and _neo4j_up():
-        py = GRAPH_PY if Path(GRAPH_PY).exists() else _engine_python()
-        try:
-            r = subprocess.run([py, str(script), q, "--k", str(want), "--json"],
-                               capture_output=True, text=True, timeout=120)
-            if r.returncode == 0 and r.stdout.strip():
-                graph_records = json.loads(r.stdout)
-                if type:                            # graph leg type-filter (records carry type)
-                    graph_records = [g for g in graph_records if g.get("type") == type]
-        except Exception:
-            graph_records = []
     results = _hybrid_fuse(graph_records, vector_hits, keyword_pairs, cfg, k)
     sources = sorted({s for r in results for s in r["sources"]})
     return {"query": q, "results": results, "sources_used": sources}
 
 
-# ---- graph (degrades gracefully if the venv/Neo4j is absent) --------------
-def _neo4j_up() -> bool:
-    import socket
-    from urllib.parse import urlparse
-    p = urlparse(os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"))
+# ---- graph (the SQLite file the Rust sync writes: <engram home>/index/graph.db) ----
+def _graph_sql(sql, params=()):
+    """Read-only query against the SQLite graph (stdlib only: no driver, no venv)."""
+    import sqlite3
     try:
-        with socket.create_connection((p.hostname or "127.0.0.1", p.port or 7687), timeout=2):
-            return True
-    except Exception:
-        return False
-
-
-@app.get("/api/graph/recall")
-def graph_recall(q: str, k: int = 6):
-    script = ENGRAM_GRAPH / "memory_graph_recall.py"
-    if not script.exists() or not _neo4j_up():
-        return PlainTextResponse("(graph unavailable — Neo4j down or graph not installed)")
-    py = GRAPH_PY if Path(GRAPH_PY).exists() else _engine_python()
-    r = subprocess.run([py, str(script), q, "--k", str(k)], capture_output=True, text=True, timeout=120)
-    return PlainTextResponse(r.stdout or (r.stderr or "(no output)")[-400:])
-
-
-def _graph_query(cypher, **params):
-    try:
-        import neo4j  # only present under the graph venv
-        sys.path.insert(0, str(ENGRAM_GRAPH))
-        import mg_config
-        drv = neo4j.GraphDatabase.driver(os.environ.get("NEO4J_URI", "bolt://127.0.0.1:7687"),
-                                          auth=(os.environ.get("NEO4J_USER", "neo4j"), mg_config.neo4j_password()))
-        with drv.session() as s:
-            return [dict(r) for r in s.run(cypher, **params)]
+        con = sqlite3.connect(f"file:{GRAPH_DB}?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in con.execute(sql, params)]
+        finally:
+            con.close()
     except Exception as e:
         raise HTTPException(503, f"graph unavailable: {e}")
 
 
+@app.get("/api/graph/recall")
+def graph_recall(q: str, k: int = 6):
+    exe = ENGRAM_BIN / "rust" / "engram-recall"
+    if not exe.exists():
+        return PlainTextResponse("(graph recall unavailable — engram-recall is not installed)")
+    r = subprocess.run([str(exe), q, "--k", str(k)], capture_output=True, text=True, timeout=120)
+    return PlainTextResponse(r.stdout or (r.stderr or "(no output)")[-400:])
+
+
 @app.get("/api/graph/stats")
 def graph_stats():
-    rows = _graph_query(
-        "MATCH (e:Episodic) WITH count(e) AS eps MATCH (n:Entity) WITH eps, count(n) AS ents "
-        "OPTIONAL MATCH ()-[r:RELATES_TO]->() RETURN eps AS episodes, ents AS entities, count(r) AS facts")
+    rows = _graph_sql(
+        "SELECT (SELECT COUNT(*) FROM memories) AS episodes, "
+        "(SELECT COUNT(*) FROM (SELECT subject_l AS n FROM triples UNION SELECT object_l FROM triples)) AS entities, "
+        "(SELECT COUNT(*) FROM facts WHERE valid_until IS NULL) + "
+        "(SELECT COUNT(*) FROM triples WHERE status = 'active' AND valid_until IS NULL) AS facts")
     return rows[0] if rows else {"episodes": 0, "entities": 0, "facts": 0}
 
 
 @app.get("/api/graph/neighbors")
 def graph_neighbors(entity: str):
-    rows = _graph_query(
-        "MATCH (n:Entity)-[r:RELATES_TO]-(m:Entity) WHERE toLower(n.name)=toLower($e) "
-        "RETURN r.name AS rel, m.name AS other, r.fact AS fact LIMIT 50", e=entity)
+    e = entity.lower()
+    rows = _graph_sql(
+        "SELECT relation AS rel, CASE WHEN subject_l = ?1 THEN object ELSE subject END AS other, "
+        "subject || ' ' || relation || ' ' || object AS fact FROM triples "
+        "WHERE status = 'active' AND valid_until IS NULL AND (subject_l = ?1 OR object_l = ?1) LIMIT 50", (e,))
     return {"entity": entity, "edges": rows}
 
 
