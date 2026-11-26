@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.2 — a permanent skip is not a failure
+
+1.2.1 made `--once` / `--force` exit 1 when a task returns `False`. Under `graph.backend: native`
+the `export` and `reconcile` tasks return `False` every tick because there is no native version
+(a permanent skip by design, logged as `SKIPPING`), so the unit showed `failed` on every tick
+and could never go green. They now return `None`; `False` keeps meaning "deferred or failed".
+
 ## 1.2.1 — the nightly curate runs again, and a failed task no longer looks green
 
 Two fixes found while auditing the autonomous pipeline on 2026-11-25.

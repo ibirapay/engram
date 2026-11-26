@@ -171,8 +171,9 @@ def test_graphiti_maintenance_never_runs_under_a_native_reader(home):
     mod._run = lambda cmd, **kw: ran.append(cmd) or 0
 
     write_config(home, "backend: ollama\ngraph:\n  backend: native\n")
-    assert mod.task_export() is False, "a native backend must not export Graphiti"
-    assert mod.task_reconcile() is False, "a native backend must not reconcile Graphiti"
+    # None = skipped by design (not False, which tick() reports as a failed task)
+    assert mod.task_export() is None, "a native backend must not export Graphiti"
+    assert mod.task_reconcile() is None, "a native backend must not reconcile Graphiti"
     assert ran == [], f"it ran the legacy Graphiti writer anyway: {ran}"
 
     # ...and compatibility mode still does both.
