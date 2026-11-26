@@ -285,7 +285,8 @@ def test_descriptions_with_a_colon_survive_every_document_builder():
 
 
 # ── the compress decision, through main() ──────────────────────────────────
-def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=None, cap=None):
+def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=None, cap=None,
+                  umbrella_body="umbrella body\n"):
     """Drive main() through compress merges, every outside dependency stubbed: the vector store pairs
     project_a/project_b (plus `more` pairs: {name: body}), distill returns `report`, the reviewer
     approves. engram_secrets is the real one (its regexes decide the credential and value holds).
@@ -312,7 +313,7 @@ def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=N
 
     def distill(key, files, cfg=None, preserve_sources=None):
         calls["distill"] += 1
-        return "umbrella body\n", report
+        return umbrella_body, report
     mdv.distill_cluster = distill
     ac = {"enabled": True, "autonomous": autonomous, "review_gate": "self", "prune_orphans": False}
     if cap:
@@ -374,28 +375,37 @@ def test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept():
     print("ok — a bloated merge never applies on its own; the notice reports the facts kept")
 
 
-def test_a_merge_that_would_mask_a_txid_or_address_is_held():
-    """The distiller masks every long hex/base64 run before the model sees it, so a txid, an
-    address or a full hash in a source can never reach the umbrella. Such a merge is held in every
-    mode, judged from the sources (no distill, no review, no slot); a session id does not count."""
+def test_public_values_reach_the_umbrella_or_the_merge_is_held():
+    """The distiller swaps txids, addresses and full hashes for stand-ins and restores them, so a
+    cluster that holds one merges (it used to be held forever). Curate still checks the result: an
+    umbrella that lost a value is held, without printing it. A session id is not a value."""
     report = {**BASE, "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0}
     txid = "9f2c" * 16
+    calls = _run_compress(report, body_a=f"refund sent, txid {txid}", umbrella_body=f"refund txid {txid}\n")
+    assert calls["apply"] == 1, f"a merge whose umbrella keeps the txid was held: {calls}"
     for autonomous in (True, False):
         calls = _run_compress(report, autonomous, body_a=f"refund sent, txid {txid}")
-        assert (calls["apply"], calls["verify"], calls["distill"], calls["propose"]) == (0, 0, 0, []), calls
-        assert txid not in calls["out"], "the held value was printed"
-    calls = _run_compress(report, body_a="refund sent to 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed")
-    assert calls["apply"] == 0 and calls["distill"] == 0, f"merge masking an address went ahead: {calls}"
+        assert (calls["apply"], calls["verify"], calls["propose"]) == (0, 0, []), calls
+        assert "lost 1 public value" in calls["out"] and txid not in calls["out"], calls["out"]
+    addr = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+    calls = _run_compress(report, body_a=f"refund sent to {addr}")
+    assert calls["apply"] == 0, f"an umbrella that lost an address was applied: {calls}"
     calls = _run_compress(report, body_a="originSessionId: 5f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b\nplain fact")
     assert calls["apply"] == 1, f"a session id held the merge: {calls}"
-    # a held cluster takes no slot: with a cap of 1, the clean cluster after it still merges
-    calls = _run_compress(report, body_a=f"txid {txid}", cap=1,
+    print("ok — public values reach the umbrella; one that lost a value is held, unprinted")
+
+
+def test_held_clusters_take_no_slot():
+    """A cluster held from its sources (a credential) costs no distill and no slot: with a cap of 1
+    the clean cluster after it still merges, and two clean clusters still get only one attempt."""
+    report = {**BASE, "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0}
+    token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" * 2
+    calls = _run_compress(report, body_a=f"GITHUB_TOKEN={token}", cap=1,
                           more={"project_c.md": "gamma fact", "project_d.md": "delta fact"})
     assert calls["distill"] == 1 and calls["apply"] == 1, f"a held cluster used up the cap: {calls}"
-    # and the cap still bounds real attempts: two clean clusters, cap 1, one distill
     calls = _run_compress(report, cap=1, more={"project_c.md": "gamma fact", "project_d.md": "delta fact"})
     assert calls["distill"] == 1 and calls["apply"] == 1, f"the cap no longer bounds merge attempts: {calls}"
-    print("ok — a merge that would mask a txid or an address is held before distill; a session id is not a value")
+    print("ok — a held cluster takes no slot; the cap still bounds attempts")
 
 
 def test_a_credential_hold_never_prints_the_credential():
@@ -421,5 +431,6 @@ if __name__ == "__main__":
     test_an_earlier_merge_settles_after_settle_days()
     test_descriptions_with_a_colon_survive_every_document_builder()
     test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept()
-    test_a_merge_that_would_mask_a_txid_or_address_is_held()
+    test_public_values_reach_the_umbrella_or_the_merge_is_held()
+    test_held_clusters_take_no_slot()
     test_a_credential_hold_never_prints_the_credential()

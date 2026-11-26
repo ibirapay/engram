@@ -67,6 +67,20 @@ def credentials(text: str):
     return out
 
 
+# The shape of a value SECRET_RE masks that is PUBLIC data rather than a credential: a txid,
+# an address, a full commit/file hash (long hex or base64-like runs with no name attached).
+_PUBLIC_SHAPE_RE = re.compile(r"[0-9a-fA-F]{32,}|[A-Za-z0-9+/]{40,}={0,2}")
+
+
+def public_values(text: str) -> set:
+    """Long hex/base64 runs that redact() masks but that are not credentials (credentials(),
+    session ids and named secrets are left out). Distillation swaps them for placeholders so the
+    model never sees them and the umbrella gets them back verbatim."""
+    creds = credentials(text)
+    return {m.group(0) for m in SECRET_RE.finditer(text or "")
+            if _PUBLIC_SHAPE_RE.fullmatch(m.group(0)) and not any(m.group(0) in c for c in creds)}
+
+
 def redact(text: str):
     """Mask secret-looking substrings. Returns (masked_text, n_masked)."""
     return SECRET_RE.subn("«redacted-secret»", text or "")

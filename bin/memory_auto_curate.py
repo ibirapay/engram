@@ -107,18 +107,6 @@ def ac_cfg(cfg):
 _FM_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.S)
 
 
-_PUBLIC_SHAPE_RE = re.compile(r"[0-9a-fA-F]{32,}|[A-Za-z0-9+/]{40,}={0,2}")
-
-
-def _public_values(text: str) -> set:
-    """Long hex/base64 runs that engram_secrets masks but that are not credentials: txids,
-    addresses, full hashes. Named secrets and session ids are not counted (dropping those is the
-    distiller's policy)."""
-    creds = engram_secrets.credentials(text)
-    return {m.group(0) for m in engram_secrets.SECRET_RE.finditer(text or "")
-            if _PUBLIC_SHAPE_RE.fullmatch(m.group(0)) and not any(m.group(0) in c for c in creds)}
-
-
 def _umbrella_doc(stem: str, desc: str, typ: str, body: str) -> str:
     """The umbrella document. The description goes in as a JSON string, which is a valid YAML
     double-quoted scalar: a plain `description: Fake OTC (live): a Mesa ...` is a YAML
@@ -411,20 +399,15 @@ def main():
         # verbatim in the final doc. Only CREDENTIAL_RE (high-precision) counts —
         # txids/EVM-addresses/UUIDs are public data the aggressive scanner used to
         # block on, which is why secret-bearing clusters never consolidated.
-        # The same for PUBLIC values (2026-11-26): the distiller masks every long hex/base64 run
-        # before the model sees it, so a txid, an address or a full hash in a source can never
-        # reach the umbrella; ~65 of the author's money memories hold one.
         # The umbrella BODY is always redacted, so only its description (kept verbatim) can carry
-        # either: both are judged from the sources here, before a distill call is spent.
+        # a credential: judged from the sources here, before a distill call is spent.
         # Counted, never printed (the credential HOLD used to print the first 50 chars of each).
+        # PUBLIC values (txid, address, full hash) are not held any more: the distiller swaps them
+        # for placeholders the model sees and puts the originals back (checked after distill).
         srcs = [(MEM / f).read_text(errors="ignore") for f in files]
         creds = {c for t in srcs for c in engram_secrets.credentials(t) if c not in (desc or "")}
         if creds:
             print(f"· {files}: HOLD (umbrella would drop {len(creds)} credential(s)) — skipping"); continue
-        masked = {v for t in srcs for v in _public_values(t) if v not in (desc or "")}
-        if masked:
-            print(f"· {files}: HOLD (umbrella would mask {len(masked)} public value(s) the sources hold: "
-                  f"txid, address or full hash) — skipping"); continue
         attempted += 1
         # COMPRESS for real (no preserve_sources) — the umbrella is a tight consolidation.
         # Losslessness is provided by REVERSIBILITY (sources -> quarantine), not by
@@ -441,6 +424,12 @@ def main():
         okdoc, whydoc = gate.validate_memory_doc(doc)
         if not okdoc:
             print(f"· {files}: HOLD (malformed umbrella: {whydoc}) — skipping"); continue
+        # Reconciliation: every public value of the sources must be in the umbrella (the
+        # distiller restores them by construction; this catches a regression). Counted only.
+        lost = {v for t in srcs for v in engram_secrets.public_values(t) if v not in doc}
+        if lost:
+            print(f"· {files}: HOLD (umbrella lost {len(lost)} public value(s): txid, address or "
+                  f"full hash) — skipping"); continue
         absorbed = [f for f in files if f != umbrella.name]
         # transaction id so a second merge on the same umbrella can't clobber the
         # first merge's backup (each merge's originals live under their own dir)
