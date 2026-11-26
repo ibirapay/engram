@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.7.4 — memory frontmatter is read the way it is written
+
+Measured 2026-11-26: 63 of 1120 live memories and 38 of 804 staged candidates had a `name:` or
+`description:` that is not valid YAML (`description: Standing rule: all projects ...`, or a value
+that opens with a quote and continues after it). The Python stages read the whole block as `{}`:
+curate skipped those memories as untyped, and graduation held those candidates as "provenance
+unverified" on every run. Sorted by name, they took 7 of the 8 per-run slots, so one candidate a
+run was really evaluated. The Rust recall was already lenient.
+
+- **New `bin/engram_frontmatter.py`.** Strict YAML first; only on failure, each top-level
+  `name:`/`description:` span that is not valid on its own is read as text and the block is parsed
+  again. A valid span is never touched, a quote that never closes gives up (`{}`), and a block that
+  fails to construct (an impossible date) reads as `{}` instead of crashing the stage. Curate
+  (`_fm`, `_fm_raw`) and graduation (`parse_frontmatter`) read through it. Generated umbrellas are
+  still validated strictly.
+- **The dedup cache is rebuilt once.** Vectors cached for the memories that used to read as `{}`
+  had been built from the body alone; the cache key changed, so every memory is re-embedded once.
+
 ## 1.7.3 — curate merges keep the concrete facts, and say what they kept
 
 Measured on the author's store: two automatic merges logged "near-lossless" with a prose score of
