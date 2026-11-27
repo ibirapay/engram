@@ -300,8 +300,26 @@ harvest:
 
 <!-- staged by memory_harvest.py — quarantined, not in recall. provenance={provenance} -->
 """
-    path.write_text(doc, encoding="utf-8")
+    durable_write(path, doc)
     return path
+
+
+def durable_write(path, text):
+    """On disk when this returns, and a power cut leaves the old file or the new one, never an
+    empty or torn one: a staged candidate must be on disk before the watermark moves past the
+    turns it came from, and a torn state.json reads as {} (every transcript again from byte 0)."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 # ----------------------------------------------------------------------------
@@ -317,7 +335,7 @@ def load_state():
 
 def save_state(state):
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=1))
+    durable_write(STATE_PATH, json.dumps(state, indent=1))
 
 
 # ----------------------------------------------------------------------------

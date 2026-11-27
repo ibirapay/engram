@@ -22,7 +22,8 @@ fi
 # Secret guard: block before writing locally AND before the GitHub push.
 memory_guard_secret_content "$CONTENT" "save-content" || exit 1
 
-printf '%s\n' "$CONTENT" > "${LOCAL_DIR}/${FILENAME}"
+memory_write_durable "${LOCAL_DIR}/${FILENAME}" "$CONTENT" \
+    || { echo "[save-content] ERROR: could not write ${FILENAME}" >&2; exit 1; }
 
 # Push via the shared retry-on-sha-conflict helper (concurrent writers to the
 # same remote path otherwise 409 and silently drop the update).

@@ -42,7 +42,8 @@ memory_guard_secret_content "$CONTENT" "save-memory" || exit 1
 memory_guard_secret_content "$DESCRIPTION" "save-memory-desc" || exit 1
 
 # Save locally
-printf '%s\n' "$CONTENT" > "${LOCAL_DIR}/${FILENAME}"
+memory_write_durable "${LOCAL_DIR}/${FILENAME}" "$CONTENT" \
+    || { echo "[save-memory] ERROR: could not write ${FILENAME}" >&2; exit 1; }
 
 # Push to the remote store only if one is configured (local-first by default).
 # With no CLAUDE_MEMORY_REPO set, the memory lives purely on this machine.
