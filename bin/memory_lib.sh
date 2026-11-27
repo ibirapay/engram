@@ -45,6 +45,23 @@ memory_index()       { printf '%s' "$(memory_dir)/MEMORY.md"; }
 memory_remote_path() { printf '%s' "$(memory_username)/projects/$(memory_slug)/memory"; }
 memory_state_file()  { printf '%s' "$(memory_dir)/.curator_state"; }
 
+# memory_write_durable <path> <content> — write <content> plus a newline to <path> so that it is
+# on disk when this returns, and a power cut leaves the old file or the new one, never an empty
+# or torn one. Callers drop the source right after (graduation deletes the staged candidate), and
+# on 2026-11-27 a power cut 30 s after a batch of graduations left 15 memories empty: written,
+# staged copy deleted, the bytes still in the page cache. Temp in the same dir, fsync, rename,
+# then fsync the dir so the rename itself survives.
+memory_write_durable() {
+    local path="$1" tmp
+    tmp="$(dirname "$path")/.$(basename "$path").tmp.$$"
+    if printf '%s\n' "$2" > "$tmp" && sync "$tmp" && mv -f "$tmp" "$path"; then
+        sync "$(dirname "$path")" || true
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
 # memory_frontmatter_field <file> <field> — echo a top-level frontmatter value.
 memory_frontmatter_field() {
     awk -v f="$2" '

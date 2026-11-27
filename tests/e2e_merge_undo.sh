@@ -23,6 +23,8 @@ ck=lambda c,m:(print(("  ok" if c else "  FAIL")+f": {m}"), globals().__setitem_
 params={"umbrella":"project_a.md",
         "umbrella_content":"---\nname: project_a\ndescription: svc A+B\nmetadata:\n  type: project\n---\nA:8080 B:8081 merged\n",
         "desc":"svc A+B","absorbed":["project_b.md"],"merge_id":"txn123"}
+import hashlib   # the sources as curate saw them (freshness check: a merge never runs on changed files)
+params["src_sha"]={f: hashlib.sha256((MEM/f).read_bytes()).hexdigest() for f in ("project_a.md","project_b.md")}
 ok,_=g._apply_merge(params)
 TXN=MEM/'.quarantine/merge-txn123'
 ck(ok and "A:8080 B:8081" in (MEM/'project_a.md').read_text(), "umbrella written compressed")
@@ -31,7 +33,10 @@ ck("port 8080" in (TXN/'project_a.md.orig').read_text(), "backup holds umbrella'
 ck((TXN/'project_b.md').is_file(), "source quarantined in txn dir (not trashed)")
 ck('](project_b.md)' not in (MEM/'MEMORY.md').read_text(), "source out of index")
 # stacked-merge refusal: a 2nd merge on the same umbrella before undo is refused
-ok2,d2=g._apply_merge({**params,"merge_id":"txn999"})
+# a second merge on the outstanding umbrella, with a FRESH snapshot so only the stacking guard can refuse it
+(MEM/"project_c.md").write_text("---\nname: project_c\ndescription: svc C\nmetadata:\n  type: project\n---\nC runs on port 8082\n")
+ok2,d2=g._apply_merge({**params,"absorbed":["project_c.md"],"merge_id":"txn999",
+    "src_sha":{f: hashlib.sha256((MEM/f).read_bytes()).hexdigest() for f in ("project_a.md","project_c.md")}})
 ck(not ok2 and "outstanding" in d2, "stacked merge refused (Fix 2)")
 ok,_=g._apply_merge_undo({"umbrella":"project_a.md","absorbed":["project_b.md"],"merge_id":"txn123"})
 ck(ok, "undo ok")

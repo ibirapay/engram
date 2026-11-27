@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.9.2 — power-cut safe writes
+
+- **A power cut no longer empties memories.** On 2026-11-27 the power failed 30 seconds after a
+  batch of graduations: 15 memories were left empty. `save_memory.sh` wrote straight into the
+  file and returned while the bytes were still in the page cache, and graduation then deleted
+  the staged candidate, so neither copy survived. Every store writer now goes through
+  `memory_write_durable` (`memory_lib.sh`): a temp file in the same dir, `sync`, a rename, then
+  a sync of the dir. When it returns the memory is on disk, and a cut at any moment leaves the
+  old file or the new one, never an empty or torn one. `save_memory_content_only.sh` uses it too.
+- **The harvest does the same** (`durable_write`) for staged candidates and for its watermark
+  file: a candidate is on disk before the watermark moves past the turns it came from, and a
+  torn `state.json` (which reads as empty, so every transcript again from byte 0) cannot happen.
+- `tests/e2e_merge_undo.sh` (opt-in, `ENGRAM_E2E=1`) carries the source snapshot that merges
+  require since freshness checking, and its stacked-merge case gives the second merge a fresh
+  snapshot so that only the outstanding-merge rule can refuse it.
+
 ## 1.9.1 — every engram function for all three agents
 
 - **Hermes gets automatic recall.** `integrations/hermes/engram-recall-hook.py` is a `pre_llm_call`
