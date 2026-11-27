@@ -20,9 +20,9 @@ SECRET_RE = re.compile(
     r"(?i)("
     # BIP39 / recovery phrases: keyword then 6+ space/comma-separated words —
     # listed FIRST so it masks the whole phrase, not just the first word.
-    r"(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*(?:[a-z]+[\s,]+){5,}[a-z]+"
+    r"(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)(?:\s*\([^)\n]{0,40}\))?\s*[:=]\s*(?:[a-z]+[\s,]+){5,}[a-z]+"
     # named credential = VALUE (incl. crypto key material)
-    r"|(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[_-]?phrase|recovery[_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\"]?[^\s'\"]{6,}"
+    r"|(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\"]?[^\s'\"]{6,}"
     r"|originSessionId\s*[:=]?\s*[0-9a-fA-F-]{8,}"
     r"|-----BEGIN[ A-Z]*PRIVATE KEY"
     r"|Bearer\s+[A-Za-z0-9._\-]{20,}"
@@ -44,7 +44,7 @@ SECRET_RE = re.compile(
 # keep verbatim; without it the whole match is the credential. Mirrors the shell block
 # ERE in memory_lib.sh, plus: a name=value pair needs 16+ chars AND a digit.
 CREDENTIAL_RE = re.compile(
-    r"(?i:(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*(?P<v>(?:[a-z]+[\s,]+){5,}[a-z]+))"
+    r"(?i:(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)(?:\s*\([^)\n]{0,40}\))?\s*[:=]\s*(?P<v>(?:[a-z]+[\s,]+){5,}[a-z]+))"
     r"|(?i:(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|"
     r"access[_-]?token|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\"]?)"
     r"(?P<v2>(?=[^\s'\"]*\d)[^\s'\"]{16,})"
@@ -68,59 +68,54 @@ def credentials(text: str):
 
 
 # PUBLIC values: what SECRET_RE masks that is positively public data, by an ALLOWLIST of shapes
-# (anything else masked stays masked). Two independent reviews (2026-11-26) broke looser versions:
-# a denylist restored bare private keys; a label anywhere in a two-line window let
-# "signing key (HMAC-SHA256): <hex>" through, and a URL's API key passed as a "path". So:
+# that CANNOT be a secret (anything else masked stays masked). Three independent review passes
+# (2026-11-26) broke every rule that tried to tell a tx hash from a private key by its label:
+# a 64-hex is a 64-hex. Measured on the author's store, label rules served 3 values; the shapes
+# kept here serve the other ~100 (76 EVM addresses, 10 bech32 addresses, 15 paths).
 #   0x + exactly 40 hex                 an EVM address (a private key is 32 bytes, 64 hex)
 #   bech32 with a chain-address prefix  bc1 / tb1 / bcrt1 / lq1 / tlq1 / ex1 / el1 / ert1 (nsec1 is a key: not listed)
-#   64 hex RIGHT AFTER tx / txid / tx hash / block hash / hash, 40 hex right after commit / rev
-#                                       (same line, only punctuation between), AND no secret word
-#                                       anywhere in the paragraph
-#   a filesystem path: lowercase, digits and /, not inside a URL, every segment short and not hex,
-#                                       no secret word in the paragraph
-# A value that is ALSO seen in any other context in the cluster (inside a credential, unlabelled,
-# near a secret word) is not public anywhere.
-_SECRET_WORDS = {"key", "keys", "pk", "seed", "seeds", "wif", "nsec", "xprv", "hmac", "preimage",
-                 "mnemonic", "macaroon", "apikey", "privkey", "passphrase", "cred", "creds"}
-_SECRET_PREFIXES = ("priv", "secret", "passw", "auth", "credential", "sign")
-_TX_ADJ_RE = re.compile(r"(?i)\b(tx|txid|tx[ _-]?(?:id|hash)|block[ _-]?hash|hash)\s*[:=#]?\s*[`'\"*(\[]*\s*(?:0x)?$")
-_COMMIT_ADJ_RE = re.compile(r"(?i)\b(commit|rev(?:ision)?)\s*[:=#]?\s*[`'\"*(\[]*\s*$")
+#   a filesystem path                   the run starts its word (not inside a URL or after a host),
+#                                       lowercase, digits and /, every segment short and not hex,
+#                                       and no secret word in its paragraph
+# A value that is ALSO seen in any other context in the cluster is not public anywhere.
+_SECRET_WORD_PREFIXES = (
+    "key", "pk", "sk", "seed", "wif", "nsec", "xprv", "hmac", "preimage", "mnemonic", "macaroon",
+    "apikey", "privkey", "passphrase", "cred", "priv", "secret", "passw", "pwd", "auth", "sign",
+    "token", "otp", "jwt", "bearer", "cookie", "salt", "entropy", "blinder",
+    "senha", "chave", "segredo", "semente")
 _BECH32_RE = re.compile(r"(?:bc1|tb1|bcrt1|lq1|tlq1|ex1|el1|ert1)[ac-hj-np-z02-9]{25,}")
 _HEX_RE = re.compile(r"[0-9a-fA-F]+")
 _BLOB_RE = re.compile(r"[0-9a-fA-F]{32,}|[A-Za-z0-9+/]{40,}={0,2}")    # what SECRET_RE masks as a bare run
 
 
 def _secret_word_near(text: str, start: int, end: int) -> bool:
-    """A secret word anywhere in the paragraph around [start, end): names split on _ - and
-    camelCase first, so PRIVATE_KEY, signerPrivateKey and signing-key all count."""
+    """A secret word anywhere in the paragraph around [start, end): normalised (NFKC, invisible
+    characters dropped), names split on _ - and camelCase, every word matched as a prefix."""
+    import unicodedata
     p0 = text.rfind("\n\n", 0, start); p0 = 0 if p0 < 0 else p0
     p1 = text.find("\n\n", end); p1 = len(text) if p1 < 0 else p1
-    para = re.sub(r"([a-z])([A-Z])", r"\1 \2", text[p0:p1]).lower()
-    return any(w in _SECRET_WORDS or w.startswith(_SECRET_PREFIXES) for w in re.findall(r"[a-z0-9]+", para))
+    para = unicodedata.normalize("NFKC", text[p0:p1])
+    para = "".join(c for c in para if unicodedata.category(c) != "Cf")
+    para = re.sub(r"([a-z])([A-Z])", r"\1 \2", para).lower()
+    return any(w.startswith(_SECRET_WORD_PREFIXES) for w in re.findall(r"[a-z0-9]+", para))
 
 
 def _is_public(m) -> bool:
     v, text = m.group(0), m.string
-    line_start = text.rfind("\n", 0, m.start()) + 1
-    before = text[line_start:m.start()]                  # same line only: a label must be adjacent
     # the run may carry its own 0x (SECRET_RE's base64 alternative takes it) or follow one
     prefixed = v[:2].lower() == "0x" or text[max(0, m.start() - 2):m.start()].lower() == "0x"
     h = v[2:] if v[:2].lower() == "0x" else v
-    if _HEX_RE.fullmatch(h):                             # hex: only by length + adjacent label
-        if prefixed and len(h) == 40:
-            return True                                  # an EVM address
-        if len(h) == 64:
-            ok = bool(_TX_ADJ_RE.search(before))
-        elif len(h) == 40 and not prefixed:
-            ok = bool(_COMMIT_ADJ_RE.search(before))
-        else:
-            return False
-        return ok and not _secret_word_near(text, m.start(), m.end())
+    if _HEX_RE.fullmatch(h):
+        nxt = text[m.end():m.end() + 1]
+        return prefixed and len(h) == 40 and not _HEX_RE.fullmatch(nxt or "g")    # an EVM address
     if _BECH32_RE.fullmatch(v):
-        return True                                      # a chain address
-    # a filesystem path: not inside a URL, short non-hex segments, no secret word around
+        return True                                                               # a chain address
+    # a filesystem path: the run must START its word (a URL's path follows a scheme or a host),
+    # be lowercase with short non-hex segments, and have no secret word around it
     word_start = max(text.rfind(c, 0, m.start()) for c in " \t\n`'\"(<[") + 1
-    if "://" in text[word_start:m.start()] or "/" not in v or not re.fullmatch(r"[a-z0-9/]+", v):
+    if text[word_start:m.start()] not in ("", "~", "~/", ".", "./", "..", "../") or v.startswith("//"):
+        return False
+    if "/" not in v or not re.fullmatch(r"[a-z0-9/]+", v):
         return False
     if any(len(seg) >= 24 or re.fullmatch(r"[0-9a-f]{16,}", seg) for seg in v.split("/")):
         return False
@@ -157,12 +152,17 @@ def classify_values(texts) -> tuple:
 # memory_lib.sh _MEMORY_SECRET_ERE, the guard save_memory.sh applies (grep -iE): curate checks an
 # umbrella against it before writing, instead of failing the write and retrying every run.
 WRITER_BLOCK_RE = re.compile(
-    r"((mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*([a-z]+[\s,]+){5,}[a-z]+"
+    r"((mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)(\s*\([^)\n]{0,40}\))?\s*[:=]\s*([a-z]+[\s,]+){5,}[a-z]+"
     r"|(client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token"
-    r"|mnemonic|seed[_-]?phrase|recovery[_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*.?[A-Za-z0-9_/+-]{8,}"
+    r"|mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*.?[A-Za-z0-9_/+-]{8,}"
     r"|BEGIN\s+[A-Z ]*PRIVATE KEY|-----BEGIN\s|Bearer\s+[A-Za-z0-9._-]{20,}|xprv[a-zA-Z0-9]{20,}"
     r"|[5KL][1-9A-HJ-NP-Za-km-z]{50,51}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}"
     r"|[0-9a-f]{80,})", re.I)
+
+
+def writer_would_block(text: str) -> bool:
+    """save_memory.sh greps line by line; \\s in the pattern would otherwise match across lines."""
+    return any(WRITER_BLOCK_RE.search(ln) for ln in (text or "").splitlines())
 
 
 def public_values(text: str) -> set:

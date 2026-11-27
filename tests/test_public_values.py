@@ -19,14 +19,15 @@ def main():
     leaked = [s[:24] for s in corpus["secret"] if es.public_values(s)]
     assert not leaked, f"corpus secrets classified public: {leaked}"
 
-    public = [f"refund tx {TX}", f"refund tx 0x{TX} on polygon", f"sent to {ADDR}", f"to {ADDR.lower()}",
-              "commit 6cad780be93835b962af735171fae872f9526503",
-              "address bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", "path home/user/src/engram/crates/engramgraph/src/lib",
-              f"txid: `{TX}`", f"block hash **{TX}**", f"tx hash 0x{TX}"]
+    public = [f"sent to {ADDR}", f"to {ADDR.lower()}", f"payer `{ADDR}` paid",
+              "address bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", "liquid lq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn",
+              "path home/user/src/engram/crates/engramgraph/src/lib", "see ~/ops/tools/engram/crates/engramgraph/srcx"]
     for t in public:
         assert es.public_values(t), f"not restored: {t!r}"
-    # (text, the part that must never come back as public)
-    secret = [(f"deployer pk 0x{PK}", PK),                       # a secret word on the line
+    # (text, the part that must never come back as public). A bare hex is never public, labelled
+    # or not: a tx hash and a private key are the same 64 hex (three review passes broke labels).
+    secret = [(f"refund tx {TX}", TX), (f"txid: `{TX}`", TX), (f"tx hash 0x{TX}", TX),
+              ("commit 6cad780be93835b962af735171fae872f9526503", "6cad780b"),(f"deployer pk 0x{PK}", PK),                       # a secret word on the line
               (f"deployer 0x{PK}", PK),                          # 0x + 64 hex with no tx label
               (f'{{"private_key": "{PK}"}}', PK),
               ("aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalrXUtnFEMI"),
@@ -55,14 +56,24 @@ def main():
               (f"The key for refund tx {TX}", TX),                         # "key" alone is a secret word
               ("see https://api.example.com/v1/abcdefgh/ijklmnop/qrstuvwx/yz0123456789abcd", "yz0123"),  # in a URL
               ("dir abcdefghijklmnopqrstuvwxyzabcd/xyz/files/x", "abcdefghij"),                # a 24+ segment
-              ("dir store/4c0883a69102937d62/files/archive/xy", "4c0883")]                    # a hex segment
+              ("dir store/4c0883a69102937d62/files/archive/xy", "4c0883"),                    # a hex segment
+              # review round 3: a path inside a URL with a dotless host or no scheme; a zero-width
+              # character inside a secret word; a secret word as a prefix (plural, compound, pt-BR)
+              ("alerts go to http://iaserver/ntfy/k3xq9m2v7w8z4p5r6t2y8nq/send/x", "k3xq9m"),
+              ("rpc.example.com/api/v1/k3xq9m2v7w8z4p5r6t2y8nq/eth/main/x", "k3xq9m"),
+              ("k\u200bey dir home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
+              ("tokens in home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
+              ("chave em home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
+              ("blob wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalr")]   # mixed case with slashes: base64, not a path
     for text, part in secret:
         vals = es.public_values(text)
         assert not any(part in v for v in vals), f"restored: {text!r} -> {vals}"
 
-    # cluster level: public in one file, unlabelled in another -> not public, and held
-    pub, held = es.classify_values([f"refund tx {TX}", f"see {TX}"])
-    assert TX not in pub and TX in held, (pub, held)
+    # cluster level: public in one file, suspect in another -> public nowhere, and held
+    path = "home/user/src/engram/crates/engramgraph/src/lib"
+    assert es.classify_values([f"see {path}"])[0] == {path}
+    pub, held = es.classify_values([f"see {path}", f"secret at {path}"])
+    assert path not in pub and path in held, (pub, held)
     # a value inside a credential anywhere in the cluster is never public (nor "held")
     pub, held = es.classify_values([f"refund tx {TX}", f"api_key={TX}9z"])
     assert TX not in pub, pub
@@ -87,9 +98,10 @@ def writer_guard_parity():
     samples = corpus["secret"] + corpus["clean"] + [
         "A1" * 45, "a1" * 45, "token: 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "plain prose",
         f"refund tx {TX}", "PASSWORD = Hunter2Hunter2"]
+    samples += ["secret:\n    secretName: wallet-api-tls"]           # \s must not reach across lines
     for s in samples:
         shell = subprocess.run(["grep", "-qiE", "--", ere], input=s, text=True).returncode == 0
-        assert shell == bool(es.WRITER_BLOCK_RE.search(s)), f"writer guard drift on {s[:40]!r}: shell={shell}"
+        assert shell == es.writer_would_block(s), f"writer guard drift on {s[:40]!r}: shell={shell}"
     print("ok — the writer-guard pattern matches save_memory.sh's grep -iE on every sample")
 
 

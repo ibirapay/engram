@@ -491,7 +491,7 @@ def main():
                   f"full hash) — skipping"); remember("umbrella lost public values"); continue
         # The writer (save_memory.sh) would block this umbrella: refuse here instead of failing the
         # write (and retrying every run). Same pattern, case-insensitive like its grep -iE.
-        if engram_secrets.WRITER_BLOCK_RE.search(doc):
+        if engram_secrets.writer_would_block(doc):
             print(f"· {files}: HOLD (the memory writer's secret guard would block this umbrella) — skipping")
             remember("writer guard would block"); continue
         absorbed = [f for f in files if f != umbrella.name]

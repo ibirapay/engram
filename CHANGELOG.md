@@ -23,11 +23,13 @@ in. Each is now resolved by the pipeline itself.
   `auto_curate.settle_days` (7) now settles when needed: its backup moves to `.trash/` (as the
   probation sweep does at 30 days) and its UNDO record closes, only after the new umbrella was
   written. A younger one still blocks.
-- **Txids, addresses and full hashes reach the umbrella.** Which masked values are public is decided
-  by an ALLOWLIST over the whole cluster (`engram_secrets.classify_values`): an EVM address
-  (`0x` + 40 hex), a chain bech32 address, a 64-hex right after tx/txid/tx hash/block hash/hash or a
-  40-hex right after commit/rev with no secret word anywhere in the paragraph (names split on `_`,
-  `-` and camelCase), a filesystem path (not in a URL, short non-hex segments). The distiller swaps each for a stand-in
+- **Addresses and paths reach the umbrella.** Which masked values are public is decided by an
+  ALLOWLIST of shapes that cannot be a secret, over the whole cluster
+  (`engram_secrets.classify_values`): an EVM address (`0x` + 40 hex), a chain bech32 address, a
+  filesystem path (starts its word, not in a URL, lowercase, short non-hex segments, no secret word
+  in its paragraph after NFKC, invisible-character removal and `_`/`-`/camelCase splitting). A bare
+  hex is never public, labelled or not: a tx hash and a private key are the same 64 hex, and three
+  review passes broke every label rule (they served 3 values on the author's store). The distiller swaps each for a stand-in
   (`«v1»`, with a letter no source uses) in one pass over the scanner's spans; the model, the
   checklist and the appendix only see the stand-in, and the final document gets the original back.
   Everything else stays masked: every sample of the shared secret corpus, a bare 64-hex key, a
@@ -44,6 +46,12 @@ in. Each is now resolved by the pipeline itself.
   passed as a path). All findings are fixed with tests. Trade-off, measured: 121 of 1125 live
   memories hold a value that cannot be told apart from a secret, so their clusters are held rather
   than merged with the value masked away.
+- **Security (pre-existing, all detectors):** a seed phrase written with a space ("seed phrase:",
+  "recovery phrase =", "seed words:", "mnemonic (BIP39):") was neither masked nor blocked, in Python
+  (`engram_secrets`), the shell writer guard (`memory_lib.sh`) and the Rust crate
+  (`engram-secrets`). All three now match it; the shared corpus has the four spellings.
+- The writer-guard check runs line by line like save_memory.sh's grep; settle closes the UNDO record
+  before moving the backup, and an UNDO whose umbrella was absorbed since is refused.
 
 ## 1.7.4 — memory frontmatter is read the way it is written
 

@@ -209,7 +209,7 @@ memory_push_index() {
 # analyzer only if a real keyless-secret leak is observed.
 # A named-credential match needs an ASSIGNMENT and an 8+ char value, so prose like
 # "the DB password lives in Vault" doesn't trip it.
-_MEMORY_SECRET_ERE='((mnemonic|seed[_-]?phrase|recovery[_-]?phrase)[[:space:]]*[:=][[:space:]]*([a-z]+[[:space:],]+){5,}[a-z]+|(client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[_-]?phrase|recovery[_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)[[:space:]]*[:=][[:space:]]*.?[[:alnum:]_/+-]{8,}|BEGIN[[:space:]]+[A-Z ]*PRIVATE KEY|-----BEGIN[[:space:]]|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}|xprv[a-zA-Z0-9]{20,}|[5KL][1-9A-HJ-NP-Za-km-z]{50,51}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|[0-9a-f]{80,})'
+_MEMORY_SECRET_ERE='((mnemonic|seed[[:space:]_-]?(phrase|words)|recovery[[:space:]_-]?phrase)([[:space:]]*\([^)]{0,40}\))?[[:space:]]*[:=][[:space:]]*([a-z]+[[:space:],]+){5,}[a-z]+|(client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[[:space:]_-]?(phrase|words)|recovery[[:space:]_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)[[:space:]]*[:=][[:space:]]*.?[[:alnum:]_/+-]{8,}|BEGIN[[:space:]]+[A-Z ]*PRIVATE KEY|-----BEGIN[[:space:]]|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}|xprv[a-zA-Z0-9]{20,}|[5KL][1-9A-HJ-NP-Za-km-z]{50,51}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|[0-9a-f]{80,})'
 
 # memory_scan_secret <file> — echo the offending LINE NUMBERS (never the content,
 # so a secret can't leak into the transcript). Returns 0 if a secret was found,

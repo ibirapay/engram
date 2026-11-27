@@ -380,20 +380,21 @@ def test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept():
 
 
 def test_public_values_reach_the_umbrella_or_the_merge_is_held():
-    """The distiller swaps txids, addresses and full hashes for stand-ins and restores them, so a
+    """The distiller swaps public values (addresses, paths) for stand-ins and restores them, so a
     cluster that holds one merges (it used to be held forever). Curate still checks the result: an
-    umbrella that lost a value is held, without printing it. A session id is not a value."""
+    umbrella that lost a value is held, without printing it. A bare hex (a tx hash or a key: the
+    same shape) is held before distill. A session id is not a value."""
     report = {**BASE, "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0}
-    txid = "9f2c" * 16
-    calls = _run_compress(report, body_a=f"refund sent, txid {txid}", umbrella_body=f"refund txid {txid}\n")
-    assert calls["apply"] == 1, f"a merge whose umbrella keeps the txid was held: {calls}"
-    for autonomous in (True, False):
-        calls = _run_compress(report, autonomous, body_a=f"refund sent, txid {txid}")
-        assert (calls["apply"], calls["verify"], calls["propose"]) == (0, 0, []), calls
-        assert "lost 1 public value" in calls["out"] and txid not in calls["out"], calls["out"]
     addr = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
-    calls = _run_compress(report, body_a=f"refund sent to {addr}")
-    assert calls["apply"] == 0, f"an umbrella that lost an address was applied: {calls}"
+    calls = _run_compress(report, body_a=f"refund sent to {addr}", umbrella_body=f"refund to {addr}\n")
+    assert calls["apply"] == 1, f"a merge whose umbrella keeps the address was held: {calls}"
+    for autonomous in (True, False):
+        calls = _run_compress(report, autonomous, body_a=f"refund sent to {addr}")
+        assert (calls["apply"], calls["verify"], calls["propose"]) == (0, 0, []), calls
+        assert "lost 1 public value" in calls["out"] and addr[2:] not in calls["out"], calls["out"]
+    txid = "9f2c" * 16
+    calls = _run_compress(report, body_a=f"refund sent, txid {txid}")
+    assert calls["distill"] == 0 and "cannot be told apart from a secret" in calls["out"], calls["out"]
     calls = _run_compress(report, body_a="originSessionId: 5f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b\nplain fact")
     assert calls["apply"] == 1, f"a session id held the merge: {calls}"
     print("ok — public values reach the umbrella; one that lost a value is held, unprinted")
@@ -446,7 +447,7 @@ def test_a_skipped_cluster_is_not_distilled_again_until_it_changes():
     # a dry run writes nothing, not even a remembered skip (this hold fires before the dry-run exit)
     d = Path(tempfile.mkdtemp())
     report = {**BASE, "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0}
-    dry = _run_compress(report, body_a=f"txid {'9f2c' * 16}", store=d, dry=True)
+    dry = _run_compress(report, body_a="refund to 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", store=d, dry=True)
     assert "lost 1 public value" in dry["out"] and not (d / ".curate_skips.json").exists(), dry["out"]
     shutil.rmtree(d)
     print("ok — a skipped cluster is not distilled again until it changes or retry_days pass")
@@ -516,6 +517,19 @@ def test_settle_waits_for_a_successful_write():
                               "absorbed": [], "merge_id": "later", "src_sha": sha, "settle_days": 7})
     assert not ok and "write failed" in why, why
     assert prior.is_dir() and (g._dir("undo") / "u1.json").is_file(), "a failed write settled the earlier merge"
+    # _settle closes the undo record BEFORE moving the backup: a failed move leaves no live undo
+    import shutil as _sh
+    real_move = _sh.move
+    _sh.move = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    try:
+        g._settle(prior)
+        raise AssertionError("the failing move did not raise")
+    except OSError:
+        pass
+    finally:
+        _sh.move = real_move
+    assert (g._dir("undone") / "u1.json").is_file() and prior.is_dir(), "undo left open by a failed settle"
+    (g._dir("undone") / "u1.json").rename(g._dir("undo") / "u1.json")      # back to the state under test
     # a settle that fails AFTER a good write is reported; the merge itself stands
     save.write_text(f'#!/bin/sh\ncat > "{d}/$1"\n')
 
@@ -525,6 +539,10 @@ def test_settle_waits_for_a_successful_write():
     ok, why = g._apply_merge({"umbrella": "b.md", "umbrella_content": doc.replace("body", "merged"), "desc": "d",
                               "absorbed": [], "merge_id": "later", "src_sha": sha, "settle_days": 7})
     assert ok and "WARNING could not settle" in why and "disk full" in why, why
+    # an undo whose umbrella was absorbed since (gone) is refused instead of restoring duplicates
+    (d / "b.md").unlink()
+    ok, why = g._apply_merge_undo({"umbrella": "b.md", "absorbed": [], "merge_id": "later"})
+    assert not ok and "is gone since the merge" in why, why
     shutil.rmtree(d)
     print("ok — settle happens only after the umbrella write succeeded")
 

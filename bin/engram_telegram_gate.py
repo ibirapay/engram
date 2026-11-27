@@ -405,6 +405,9 @@ def _apply_merge_undo(params):
     # FRESHNESS: refuse if the umbrella was legitimately edited since the merge —
     # restoring the stale original would silently erase newer facts.
     post = txn / ".post_sha"
+    if post.is_file() and not (MEM / umbrella).is_file():
+        # absorbed by a later merge (or deleted): restoring would duplicate what lives elsewhere now
+        return False, f"umbrella {umbrella} is gone since the merge — undo refused"
     if post.is_file() and (MEM / umbrella).is_file():
         live = hashlib.sha256((MEM / umbrella).read_bytes()).hexdigest()
         if live != post.read_text().strip():
@@ -441,7 +444,7 @@ def _settle(d: Path) -> None:
     import shutil
     trash = MEM / ".trash"; trash.mkdir(parents=True, exist_ok=True)
     mid = d.name[len("merge-"):]
-    shutil.move(str(d), str(trash / f"{d.name}-{_now()}"))
+    # close the undo record FIRST: if the move below fails, a late tap must still not restore
     for u in _dir("undo").glob("*.json"):
         try:
             rec = json.loads(u.read_text())
@@ -449,6 +452,7 @@ def _settle(d: Path) -> None:
             continue
         if rec.get("op") == "merge_undo" and (rec.get("params") or {}).get("merge_id") == mid:
             u.rename(_dir("undone") / u.name)
+    shutil.move(str(d), str(trash / f"{d.name}-{_now()}"))
 
 
 def _apply_merge(params):
