@@ -27,7 +27,7 @@ const PATTERN: &str = concat!(
     r"(?i)(",
     // BIP39 / recovery phrases: keyword then 6+ separated words — FIRST so the
     // whole phrase masks, not just its first word.
-    r"(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)(?:\s*\([^)\n]{0,40}\))?\s*[:=]\s*(?:[a-z]+[\s,]+){5,}[a-z]+",
+    r"(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?:[a-z]{3,8}[\s,]+){5,}[a-z]{3,8}",
     // named credential = VALUE (including crypto key material)
     r"|(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\x22]?[^\s'\x22]{6,}",
     r"|originSessionId\s*[:=]?\s*[0-9a-fA-F-]{8,}",

@@ -26,7 +26,8 @@ in. Each is now resolved by the pipeline itself.
 - **Addresses and paths reach the umbrella.** Which masked values are public is decided by an
   ALLOWLIST of shapes that cannot be a secret, over the whole cluster
   (`engram_secrets.classify_values`): an EVM address (`0x` + 40 hex), a chain bech32 address, a
-  filesystem path (starts its word, not in a URL, lowercase, short non-hex segments, no secret word
+  filesystem path (starts its word, not in a URL, lowercase, short segments that are neither hex nor
+  a letters-and-digits token, no secret word
   in its paragraph after NFKC, invisible-character removal and `_`/`-`/camelCase splitting). A bare
   hex is never public, labelled or not: a tx hash and a private key are the same 64 hex, and three
   review passes broke every label rule (they served 3 values on the author's store). The distiller swaps each for a stand-in
@@ -46,10 +47,14 @@ in. Each is now resolved by the pipeline itself.
   passed as a path). All findings are fixed with tests. Trade-off, measured: 121 of 1125 live
   memories hold a value that cannot be told apart from a secret, so their clusters are held rather
   than merged with the value masked away.
-- **Security (pre-existing, all detectors):** a seed phrase written with a space ("seed phrase:",
-  "recovery phrase =", "seed words:", "mnemonic (BIP39):") was neither masked nor blocked, in Python
-  (`engram_secrets`), the shell writer guard (`memory_lib.sh`) and the Rust crate
-  (`engram-secrets`). All three now match it; the shared corpus has the four spellings.
+- **Security (pre-existing, all detectors):** a seed phrase was neither masked nor blocked when
+  written with a space ("seed phrase:", "recovery phrase =", "seed words:", "mnemonic (BIP39):") or
+  the way a model writes it (`**Seed phrase:** words`, the words in backticks, or in a code block on
+  the lines below), in Python (`engram_secrets`), the shell writer guard (`memory_lib.sh`) and the
+  Rust crate (`engram-secrets`). All three now match 6+ BIP39-shaped words (3-8 letters) after the
+  label, which also stops prose like "Recovery phrase: shown once during onboarding" from matching;
+  the writer guard adds a whole-file pass for the multi-line form. The shared corpus has every
+  spelling, and the Python side now checks the corpus too (only Rust did).
 - The writer-guard check runs line by line like save_memory.sh's grep; settle closes the UNDO record
   before moving the backup, and an UNDO whose umbrella was absorbed since is refused.
 

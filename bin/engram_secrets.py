@@ -20,7 +20,7 @@ SECRET_RE = re.compile(
     r"(?i)("
     # BIP39 / recovery phrases: keyword then 6+ space/comma-separated words —
     # listed FIRST so it masks the whole phrase, not just the first word.
-    r"(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)(?:\s*\([^)\n]{0,40}\))?\s*[:=]\s*(?:[a-z]+[\s,]+){5,}[a-z]+"
+    r"(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?:[a-z]{3,8}[\s,]+){5,}[a-z]{3,8}"
     # named credential = VALUE (incl. crypto key material)
     r"|(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\"]?[^\s'\"]{6,}"
     r"|originSessionId\s*[:=]?\s*[0-9a-fA-F-]{8,}"
@@ -44,7 +44,7 @@ SECRET_RE = re.compile(
 # keep verbatim; without it the whole match is the credential. Mirrors the shell block
 # ERE in memory_lib.sh, plus: a name=value pair needs 16+ chars AND a digit.
 CREDENTIAL_RE = re.compile(
-    r"(?i:(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)(?:\s*\([^)\n]{0,40}\))?\s*[:=]\s*(?P<v>(?:[a-z]+[\s,]+){5,}[a-z]+))"
+    r"(?i:(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?P<v>(?:[a-z]{3,8}[\s,]+){5,}[a-z]{3,8}))"
     r"|(?i:(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|"
     r"access[_-]?token|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\"]?)"
     r"(?P<v2>(?=[^\s'\"]*\d)[^\s'\"]{16,})"
@@ -117,7 +117,10 @@ def _is_public(m) -> bool:
         return False
     if "/" not in v or not re.fullmatch(r"[a-z0-9/]+", v):
         return False
-    if any(len(seg) >= 24 or re.fullmatch(r"[0-9a-f]{16,}", seg) for seg in v.split("/")):
+    # a long segment, a hex one, or a 12+ one mixing letters with 2+ digits (a random token: the
+    # capability part of a webhook or ntfy URL written without its scheme)
+    if any(len(seg) >= 24 or re.fullmatch(r"[0-9a-f]{16,}", seg)
+           or re.fullmatch(r"(?=(?:.*\d){2})(?=.*[a-z])[a-z0-9]{12,}", seg) for seg in v.split("/")):
         return False
     return not _secret_word_near(text, m.start(), m.end())
 
@@ -152,7 +155,7 @@ def classify_values(texts) -> tuple:
 # memory_lib.sh _MEMORY_SECRET_ERE, the guard save_memory.sh applies (grep -iE): curate checks an
 # umbrella against it before writing, instead of failing the write and retrying every run.
 WRITER_BLOCK_RE = re.compile(
-    r"((mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)(\s*\([^)\n]{0,40}\))?\s*[:=]\s*([a-z]+[\s,]+){5,}[a-z]+"
+    r"((mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`\x22]*([a-z]{3,8}[\s,]+){5,}[a-z]{3,8}"
     r"|(client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token"
     r"|mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*.?[A-Za-z0-9_/+-]{8,}"
     r"|BEGIN\s+[A-Z ]*PRIVATE KEY|-----BEGIN\s|Bearer\s+[A-Za-z0-9._-]{20,}|xprv[a-zA-Z0-9]{20,}"
@@ -160,9 +163,18 @@ WRITER_BLOCK_RE = re.compile(
     r"|[0-9a-f]{80,})", re.I)
 
 
+# memory_lib.sh _MEMORY_SEED_ERE: the seed arm alone, matched over the whole file (grep -z).
+SEED_BLOCK_RE = re.compile(
+    r"(mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(\s*\([^)]{0,40}\))?[*_]*\s*[:=]"
+    r"[\s*_`\x22]*([a-z]{3,8}[\s,]+){5,}[a-z]{3,8}", re.I)
+
+
 def writer_would_block(text: str) -> bool:
-    """save_memory.sh greps line by line; \\s in the pattern would otherwise match across lines."""
-    return any(WRITER_BLOCK_RE.search(ln) for ln in (text or "").splitlines())
+    """What save_memory.sh's guard blocks: its pattern line by line (grep splits on \\n only, so
+    \\s must not reach across lines and \\v or \\f must not split one), plus the seed phrase over
+    the whole text (grep -z)."""
+    text = text or ""
+    return any(WRITER_BLOCK_RE.search(ln) for ln in text.split("\n")) or bool(SEED_BLOCK_RE.search(text))
 
 
 def public_values(text: str) -> set:

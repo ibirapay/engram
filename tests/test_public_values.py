@@ -18,6 +18,10 @@ def main():
     corpus = json.loads((ROOT / "tests" / "fixtures" / "secret_samples.json").read_text())
     leaked = [s[:24] for s in corpus["secret"] if es.public_values(s)]
     assert not leaked, f"corpus secrets classified public: {leaked}"
+    # the shared corpus, on the Python side (the Rust crate checks the same file): every secret is
+    # masked, no clean sample is
+    assert all(es.looks_secret(s) for s in corpus["secret"]), [s[:30] for s in corpus["secret"] if not es.looks_secret(s)]
+    assert not any(es.looks_secret(s) for s in corpus["clean"]), [s[:30] for s in corpus["clean"] if es.looks_secret(s)]
 
     public = [f"sent to {ADDR}", f"to {ADDR.lower()}", f"payer `{ADDR}` paid",
               "address bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", "liquid lq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn",
@@ -64,7 +68,10 @@ def main():
               ("k\u200bey dir home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
               ("tokens in home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
               ("chave em home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
-              ("blob wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalr")]   # mixed case with slashes: base64, not a path
+              ("blob wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalr"),   # mixed case with slashes: base64, not a path
+              # review round 4: a capability path without its scheme or host
+              ("alerts: curl -d up iaserver/ntfy/k3xq9m2v7w8z4p5r6t2y8nq/send", "k3xq9m"),
+              ("POST /hooks/k3xq9m2v7w8z4p5r6t2y8nq/deploy/now", "k3xq9m")]
     for text, part in secret:
         vals = es.public_values(text)
         assert not any(part in v for v in vals), f"restored: {text!r} -> {vals}"
@@ -98,10 +105,20 @@ def writer_guard_parity():
     samples = corpus["secret"] + corpus["clean"] + [
         "A1" * 45, "a1" * 45, "token: 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "plain prose",
         f"refund tx {TX}", "PASSWORD = Hunter2Hunter2"]
-    samples += ["secret:\n    secretName: wallet-api-tls"]           # \s must not reach across lines
+    samples += ["secret:\n    secretName: wallet-api-tls",           # \s must not reach across lines
+                "Bearer\vabcdefghijklmnopqrstuvwxyz0123"]           # \v does not split a line for grep
+    import tempfile
     for s in samples:
-        shell = subprocess.run(["grep", "-qiE", "--", ere], input=s, text=True).returncode == 0
+        # the REAL guard: memory_lib.sh's memory_scan_secret (per line + the whole-file seed pass)
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
+            fh.write(s + "\n")
+        shell = subprocess.run(["bash", "-c", 'source "$1"; memory_scan_secret "$2" >/dev/null', "_",
+                                str(ROOT / "bin" / "memory_lib.sh"), fh.name]).returncode == 0
+        Path(fh.name).unlink()
         assert shell == es.writer_would_block(s), f"writer guard drift on {s[:40]!r}: shell={shell}"
+        if any(k in s.lower() for k in ("seed phrase", "seed words", "recovery phrase", "mnemonic (")) \
+                and s in corpus["secret"]:
+            assert shell, f"the writer guard lets a seed phrase through: {s[:40]!r}"
     print("ok — the writer-guard pattern matches save_memory.sh's grep -iE on every sample")
 
 
