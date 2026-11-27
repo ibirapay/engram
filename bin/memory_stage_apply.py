@@ -256,6 +256,19 @@ _Provenance: auto-harvested from session {sid} ({provenance}); auto-graduated {n
 _clock = time.monotonic          # patched by tests
 
 
+def _capped(cfg: dict, seconds: float) -> dict:
+    """cfg with every backend's timeout lowered to `seconds` (at least 30) and no retries."""
+    t = max(30, int(seconds))
+    out = dict(cfg)
+    for k in ("llama_cpp", "ollama", "claude"):
+        sec = dict(out.get(k) or {})
+        sec["timeout_seconds"] = min(int(sec.get("timeout_seconds", t)), t)
+        if k == "claude":
+            sec["retries"] = 1
+        out[k] = sec
+    return out
+
+
 def _expire(p: Path, apply: bool) -> None:
     """Terminal decision: the candidate leaves the queue for .staging/.expired/ (recoverable, the
     same place the TTL sweep uses), so it never takes a slot again."""
@@ -295,6 +308,14 @@ def main():
     if not STAGING.is_dir():
         print("no .staging/ — nothing to do.")
         return
+    # One graduation at a time: a timed-out pipeline can leave this script running as an orphan.
+    import fcntl
+    lock = open(STAGING / ".stage_apply.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[stage-apply] another graduation run holds the lock — skipping this one")
+        return
 
     # Prune stale staged candidates so held (never-graduating) items can't pile up.
     # RENAME to .staging/.expired/ (not unlink) so a starved/never-evaluated
@@ -310,22 +331,23 @@ def main():
                 p.rename(expired / p.name)
                 pruned += 1
 
-    def _prov(p):
-        m = re.search(r"^\s*provenance:\s*(\S+)", p.read_text(errors="ignore"), re.M)
-        return m.group(1) if m else "unverified"
-    # Priority, not name order: user-direct first, then the OLDEST (closest to the TTL sweep).
-    cands = sorted(STAGING.glob("*.md"),
-                   key=lambda p: (_prov(p) != "user-direct", p.stat().st_mtime, p.name))
-    if max_per > 0:
-        cands = cands[:max_per]
+    # One parse per candidate, used for the order AND the gates (a regex for the order used to
+    # disagree with the parser). Priority, not name order: user-direct first, then the OLDEST
+    # (closest to the TTL sweep).
+    parsed = []
+    for p in STAGING.glob("*.md"):
+        meta, body = parse_frontmatter(p.read_text(errors="ignore"))
+        parsed.append((p, meta, body))
+    prov_of = lambda m: (m.get("harvest") or {}).get("provenance", "unverified")
+    parsed.sort(key=lambda x: (prov_of(x[1]) != "user-direct", x[0].stat().st_mtime, x[0].name))
+    cands = parsed[:max_per] if max_per > 0 else parsed
     decisions = []
     embs = existing_embeddings(cfg) if cands else {}
     llm_spent, llm_fails, llm_off = 0.0, 0, ""
     budget = float(ag.get("llm_budget_seconds") or 0)
     max_fails = int(ag.get("llm_max_failures") or 3)
 
-    for p in cands:
-        meta, body = parse_frontmatter(p.read_text(errors="ignore"))
+    for p, meta, body in cands:
         h = meta.get("harvest") or {}
         prov = h.get("provenance", "unverified")
         conf = float(h.get("confidence") or 0.0)
@@ -339,6 +361,11 @@ def main():
             if apply:
                 p.unlink(missing_ok=True)
             d.update(action="drop-noise", reason="transient session-status pattern (not durable)")
+            decisions.append(d); continue
+        # A file whose frontmatter does not read (or has no harvest block) is NOT judged: a
+        # reader fix can recover it (v1.7.4 recovered 38 this way). Held, so the TTL decides.
+        if not h:
+            d.update(action="hold", reason="unreadable frontmatter or no harvest block — not judged")
             decisions.append(d); continue
         # Gates 1-2 are TERMINAL: provenance and confidence never change, so a candidate that
         # fails them leaves the queue (.expired, recoverable) instead of coming back every run.
@@ -396,7 +423,11 @@ def main():
                 decisions.append(d); continue
             t0 = _clock()
             try:
-                v = injection_verdict(body, cfg)
+                # one call may not outlive the budget (the backend timeout can be an hour)
+                v = injection_verdict(body, _capped(cfg, budget - llm_spent) if budget else cfg)
+                if v not in ("SAFE", "SUSPECT"):
+                    # no verdict (empty or thinking-only reply): a model failure, not a judgment
+                    raise RuntimeError(f"no verdict ({v})")
             except Exception as e:
                 llm_spent += _clock() - t0
                 llm_fails += 1

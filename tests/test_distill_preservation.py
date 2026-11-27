@@ -51,7 +51,8 @@ def concrete_tokens():
     }
     (tmp / "reference_a.md").write_text(
         "---\nname: a\n---\n" + "\n".join(isolated) + "\n"
-        "Pinned `6cad780be93835b962af735171fae872f9526503` for good.\n"
+        "Pinned commit `6cad780be93835b962af735171fae872f9526503` for good.\n"
+        "Unlabelled `ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12` here.\n"
         "Session key `sk-abcdefghijklmnopqrstuvwxyz123456` rotated.\n"
         "- Mount /srv/data/x, run `podman ps -a`, then `podman logs x`.\n"
         # over 80 chars in backticks is a sentence, kept as prose: never restated as a token
@@ -71,8 +72,10 @@ def concrete_tokens():
         assert tok in final, f"concrete token lost in a rewrite: {tok}"
     assert rep["final_fact_coverage"] == 1.0, rep
     appendix = final.split("### Hard facts", 1)[1]
-    # a full hash is a PUBLIC value: restored verbatim (it used to be masked and lost)
-    assert "Pinned `6cad780be93835b962af735171fae872f9526503` for good." in appendix, appendix
+    # a labelled full commit hash is a PUBLIC value: restored verbatim (it used to be masked and lost)
+    assert "Pinned commit `6cad780be93835b962af735171fae872f9526503` for good." in appendix, appendix
+    # the same shape with no label is not provably public: it stays masked
+    assert "ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12" not in final, "an unlabelled 40-hex was restored"
     # a masked credential is not a fact to keep: its line holds nothing else, so it is not restated
     assert "Session key" not in appendix and "sk-abcdef" not in final, "a credential or its placeholder was kept"
     # the number the curate gate reads is the size of the entries actually written (none carried)
@@ -300,6 +303,27 @@ def public_values_round_trip():
     print("ok — public values: stand-ins for the model, originals in the umbrella, credentials masked")
 
 
+def stand_in_never_collides_with_text():
+    """A source that already says «v1» (a memory about this very feature) keeps its text: the
+    stand-ins switch to a letter no source uses, and only they are restored."""
+    tmp = ROOT / "tests" / "_tmp_collide"; tmp.mkdir(exist_ok=True); mdv.MEM = tmp
+    tx = "cd" * 32
+    (tmp / "reference_a.md").write_text("---\nname: a\n---\nThe model sees «v1» instead of a txid.\n")
+    (tmp / "reference_b.md").write_text(f"---\nname: b\n---\nRefund tx {tx} went out.\n")
+    seen = {}
+
+    def model(prompt, cfg):
+        seen["prompt"] = prompt
+        return ("Umbrella: the model sees «v1» instead of a txid.", "stop", 0.0)   # echoes the literal
+    mdv.ollama_stream = model
+    final, rep = mdv.distill_cluster("reference", ["reference_a.md", "reference_b.md"])
+    assert "«w1»" in seen["prompt"] and tx not in seen["prompt"], seen["prompt"]
+    assert "the model sees «v1» instead of a txid." in final, "the literal text was rewritten"
+    assert f"Refund tx {tx} went out." in final, "the value was not restored"
+    shutil.rmtree(tmp)
+    print("ok — stand-ins use a letter no source uses; literal «v1» text survives")
+
+
 if __name__ == "__main__":
     main()
     concrete_tokens()
@@ -308,3 +332,4 @@ if __name__ == "__main__":
     second_review_findings()
     third_review_findings()
     public_values_round_trip()
+    stand_in_never_collides_with_text()

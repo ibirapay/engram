@@ -114,18 +114,24 @@ _FM_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.S)
 SKIPS_FILE = ".curate_skips.json"
 
 
-def _load_skips(retry_days: float) -> dict:
-    """Remembered skips younger than retry_days, keyed by the cluster's files and content hashes."""
+def _load_skips(retry_days: float, run_start: float) -> dict:
+    """Remembered skips still inside retry_days. Each records the START of the run that skipped,
+    and the window closes a minute early, so a run exactly retry_days later (the curate interval
+    can equal it) retries instead of depending on how long the earlier run took."""
     try:
         skips = json.loads((MEM / SKIPS_FILE).read_text())
     except Exception:
         return {}
-    cutoff = __import__("time").time() - retry_days * 86400
+    cutoff = run_start - retry_days * 86400 + 60
     return {k: v for k, v in skips.items() if isinstance(v, dict) and v.get("at", 0) >= cutoff}
 
 
-def _skip_key(sha0: dict) -> str:
-    return json.dumps(sorted(sha0.items()))
+def _skip_key(sha0: dict, ac: dict) -> str:
+    """The cluster's files and content hashes, plus the settings that decided the skip: changing
+    the gate or a ratio is a reason to try again."""
+    knobs = {k: ac.get(k) for k in ("review_gate", "autonomous", "max_appendix_ratio",
+                                    "min_auto_coverage", "settle_days")}
+    return json.dumps([sorted(sha0.items()), knobs], sort_keys=True)
 
 
 def _umbrella_doc(stem: str, desc: str, typ: str, body: str) -> str:
@@ -357,7 +363,8 @@ def main():
     import engram_telegram_gate as gate
     done = queued = attempted = 0
     retry_days = float(ac.get("retry_days", 7))
-    skips = _load_skips(retry_days)
+    run_start = int(__import__("time").time())
+    skips = _load_skips(retry_days, run_start)
     for files in typed:
         # The cap counts clusters that cost a merge attempt. A cluster held from its sources alone
         # (credential or public value, below) costs nothing and must not take a slot: those holds
@@ -371,16 +378,18 @@ def main():
         # produced, so _apply_merge would wave through an umbrella computed from the OLD
         # bytes while a newly added fact sat unread in the source.
         sha0 = _src_sha(files)
-        key = _skip_key(sha0)
+        key = _skip_key(sha0, ac)
         if key in skips:
             print(f"· {files}: SKIP (unchanged since: {skips[key]['reason']}; retried after "
                   f"{retry_days:g} days or an edit)")
             continue
 
         def remember(why, key=key, files=files):
-            """A skip that cost a distill call: do not pay for the same answer again tomorrow."""
+            """A skip that cost a distill call: do not pay for the same answer again tomorrow.
+            Only DETERMINISTIC answers are remembered: a model or backend that was down, or a
+            write that failed, says nothing about the cluster and is retried on the next run."""
             if apply:
-                skips[key] = {"files": files, "reason": why[:160], "at": int(__import__("time").time())}
+                skips[key] = {"files": files, "reason": why[:160], "at": run_start}
                 try:
                     (MEM / SKIPS_FILE).write_text(json.dumps(skips, indent=1))
                 except OSError:
@@ -424,7 +433,9 @@ def main():
                                  f"🧠 superseded (lossless): {preview}\nTap UNDO to reverse.")
                 print(f"  APPLIED ({detail})"); done += 1
             else:
-                print(f"  FAILED ({detail})"); remember(f"supersede failed: {detail}")
+                print(f"  FAILED ({detail})")
+                if "outstanding merge backup" in detail:
+                    remember(f"supersede refused: {detail}")
             continue
         umbrella = max(paths, key=lambda p: _score(p, scores))   # keep the highest-trust member's name
         name, desc, typ = _fm(umbrella)
@@ -445,6 +456,12 @@ def main():
         creds = {c for t in srcs for c in engram_secrets.credentials(t) if c not in (desc or "")}
         if creds:
             print(f"· {files}: HOLD (umbrella would drop {len(creds)} credential(s)) — skipping"); continue
+        # A masked run that is neither a credential nor positively public (a 64-hex with no tx
+        # label could be a private key) cannot be restored and would be lost: hold.
+        public, held = engram_secrets.classify_values(srcs)
+        if held:
+            print(f"· {files}: HOLD ({len(held)} masked value(s) that cannot be told apart from a "
+                  f"secret) — skipping"); continue
         attempted += 1
         # COMPRESS for real (no preserve_sources) — the umbrella is a tight consolidation.
         # Losslessness is provided by REVERSIBILITY (sources -> quarantine), not by
@@ -464,10 +481,14 @@ def main():
             remember(f"malformed umbrella: {whydoc}"); continue
         # Reconciliation: every public value of the sources must be in the umbrella (the
         # distiller restores them by construction; this catches a regression). Counted only.
-        lost = {v for t in srcs for v in engram_secrets.public_values(t) if v not in doc}
+        lost = {v for v in public if v not in doc}
         if lost:
             print(f"· {files}: HOLD (umbrella lost {len(lost)} public value(s): txid, address or "
                   f"full hash) — skipping"); remember("umbrella lost public values"); continue
+        # The writer (save_memory.sh) blocks 80+ hex; refuse here instead of failing the write.
+        if re.search(r"[0-9a-f]{80,}", doc):
+            print(f"· {files}: HOLD (the memory writer's secret guard would block this umbrella) — skipping")
+            remember("writer guard would block"); continue
         absorbed = [f for f in files if f != umbrella.name]
         # transaction id so a second merge on the same umbrella can't clobber the
         # first merge's backup (each merge's originals live under their own dir)
@@ -519,7 +540,7 @@ def main():
                                  {"umbrella": umbrella.name, "absorbed": absorbed, "merge_id": merge_id},
                                  f"🧠 auto-merged: {preview}\nTap UNDO to reverse.")
                 done += 1
-            else:
+            elif "outstanding merge backup" in detail:     # waits for settle_days: deterministic
                 remember(f"apply refused: {detail}")
         else:
             if verdict == "BLOATED":
@@ -530,7 +551,10 @@ def main():
             else:
                 why = f"lossy compression (cov={cov} < {ac['min_auto_coverage']})"
             if ac.get("autonomous"):
-                print(f"· {files}: SKIP ({why}) — not queued"); remember(why); continue
+                print(f"· {files}: SKIP ({why}) — not queued")
+                if not verdict.startswith("DEFER"):          # a down reviewer is not an answer
+                    remember(why)
+                continue
             gate.propose("merge_apply", params, f"Needs approval — {why}. {preview}",
                          files=files, verdict=verdict)
             print(f"  QUEUED for human approval ({why})"); queued += 1

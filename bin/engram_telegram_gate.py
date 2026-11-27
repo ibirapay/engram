@@ -526,8 +526,6 @@ def _apply_merge(params):
     if txn.exists():
         return False, (f"transaction dir {txn.name} already exists (unresolved prior merge) "
                        f"— undo or clear it first; nothing changed")
-    for d in settling:                                 # every check passed: settle, then merge
-        _settle(d)
     txn.mkdir(parents=True, exist_ok=False)
     had_orig = (MEM / umbrella).is_file()
     if had_orig:                                       # 1. back up umbrella ORIGINAL
@@ -546,6 +544,8 @@ def _apply_merge(params):
     # record the post-merge umbrella hash so undo can refuse if it was edited since
     if (MEM / umbrella).is_file():
         (txn / ".post_sha").write_text(hashlib.sha256((MEM / umbrella).read_bytes()).hexdigest())
+    for d in settling:              # only now: a failed write above left them (and their undo) as they were
+        _settle(d)
     moved, deindex_failed = [], []
     for f in absorbed:                                 # 3. absorbed -> txn dir + de-index
         src = MEM / f

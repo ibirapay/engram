@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def _run(cands, ag=None, verdict=lambda body: "SAFE", apply=False, clock_step=0.0):
+def _run(cands, ag=None, verdict=lambda body: "SAFE", apply=False, clock_step=0.0, raw=None, cfg_extra=None):
     """Drive main() on a temp store. cands: [(name, provenance, confidence, tag, age_hours)];
     candidates with the same tag embed identically (cosine 1), different tags are orthogonal.
     Returns (decisions in order, staging dir)."""
@@ -32,9 +32,12 @@ def _run(cands, ag=None, verdict=lambda body: "SAFE", apply=False, clock_step=0.
                      f"harvest:\n  status: quarantined\n  provenance: {prov}\n  confidence: {conf}\n"
                      f"  source_session: s\n---\n\nbody of {tag}\n")
         os.utime(p, (now - age_h * 3600, now - age_h * 3600))
+    for name, text in (raw or {}).items():
+        (staging / name).write_text(text)
+    _run.cfgs = []
     mai = types.ModuleType("memory_ai")
     mai.load = lambda: {"auto_graduate": {"enabled": True, "allow_provenance": ["user-direct", "assistant"],
-                                          "staging_ttl_days": 0, **(ag or {})}}
+                                          "staging_ttl_days": 0, **(ag or {})}, **(cfg_extra or {})}
     mai.ollama_embed = embed
     mai.is_transient_fact = lambda name, desc: False
     sys.modules["memory_ai"] = mai
@@ -47,6 +50,7 @@ def _run(cands, ag=None, verdict=lambda body: "SAFE", apply=False, clock_step=0.
 
     def model(body, cfg):
         t["now"] += clock_step          # each model call takes clock_step seconds
+        _run.cfgs.append(cfg)
         return verdict(body)
     sa.injection_verdict = model
     sa.graduate = lambda fname, content, desc, apply: "graduated" if apply else "would-graduate"
@@ -144,6 +148,49 @@ def test_activity_summary_reports_ttl_and_model_time():
     print("ok — the Telegram run summary shows TTL expiries and model time")
 
 
+def test_review_round_graduation():
+    """Independent review 2026-11-26."""
+    # a reply with no verdict is a model failure (held, counts toward the breaker), never a quarantine
+    cands = [(f"k_{i}.md", "assistant", 0.9, f"tag-k{i}", 10 - i) for i in range(4)]
+    decs, staging = _run(cands, verdict=lambda b: "UNKNOWN", apply=True)
+    assert [x["action"] for x in decs] == ["hold", "hold", "hold", "defer"], decs
+    assert len(list(staging.glob("*.md"))) == 4 and not (staging.parent / ".quarantine").exists()
+    # an unreadable frontmatter is held for a later reader fix, not expired
+    decs, staging = _run([], apply=True, raw={"m_bad.md": "---\nname: m\ndescription: \"open quote\nharvest:\n---\nb\n"})
+    assert [x["action"] for x in decs] == ["hold"] and (staging / "m_bad.md").exists(), decs
+    # each model call is capped to what is left of the budget (the backend timeout can be an hour)
+    _run([("n_a.md", "assistant", 0.9, "tag-n", 1)], ag={"llm_budget_seconds": 300},
+         cfg_extra={"llama_cpp": {"timeout_seconds": 3600}})
+    assert _run.cfgs and _run.cfgs[0]["llama_cpp"]["timeout_seconds"] == 300, _run.cfgs
+    # the secret scan runs before the model: a 64-hex body never reaches it
+    secret_body = "---\nname: o\ndescription: tag-o\nharvest:\n  provenance: assistant\n  confidence: 0.9\n---\n" \
+                  + "key " + "ab" * 32 + "\n"
+    decs, _ = _run([], raw={"o_secret.md": secret_body})
+    assert decs[0]["action"] == "quarantine" and not _run.cfgs, (decs, len(_run.cfgs))
+    print("ok — review round: no-verdict is a failure, unreadable is held, calls capped, secrets before the model")
+
+
+def test_one_graduation_at_a_time():
+    """A timed-out pipeline can leave stage-apply running; a second one must not run beside it."""
+    import fcntl
+    d = Path(tempfile.mkdtemp()); staging = d / "memory" / ".staging"; staging.mkdir(parents=True)
+    held = open(staging / ".stage_apply.lock", "w"); fcntl.flock(held, fcntl.LOCK_EX)
+    mai = types.ModuleType("memory_ai"); mai.load = lambda: {"auto_graduate": {"enabled": True}}
+    sys.modules["memory_ai"] = mai
+    sp = importlib.util.spec_from_file_location("sa_lock", ROOT / "bin" / "memory_stage_apply.py")
+    sa = importlib.util.module_from_spec(sp); sp.loader.exec_module(sa)
+    sa.MEM_DIR, sa.STAGING = d / "memory", staging
+    out = io.StringIO()
+    argv, sys.argv = sys.argv, ["sa"]
+    try:
+        with contextlib.redirect_stdout(out):
+            sa.main()
+    finally:
+        sys.argv = argv
+    assert "holds the lock" in out.getvalue(), out.getvalue()
+    print("ok — one graduation run at a time")
+
+
 if __name__ == "__main__":
     test_whole_queue_in_priority_order()
     test_terminal_holds_leave_the_queue()
@@ -151,3 +198,5 @@ if __name__ == "__main__":
     test_breaker_stops_a_dead_model()
     test_near_copy_in_the_same_run_drops()
     test_activity_summary_reports_ttl_and_model_time()
+    test_review_round_graduation()
+    test_one_graduation_at_a_time()

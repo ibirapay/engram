@@ -67,9 +67,10 @@ FACT_PATTERNS = [
 # Kinds whose token IS the fact: a flag, a ref or an identifier is only conveyed by the exact
 # string, as a whole word ("--keep" is not "keep" in the prose, ENGRAM_URL is not ENGRAM_URL_FALLBACK).
 VERBATIM_KINDS = {"code", "hash", "env", "carried"}
-# A public value's stand-in: what the model sees instead of a txid, an address or a full hash.
-# Self-delimiting («v1» is never inside «v10»), so a plain substring check is exact.
-VALUE_TOKEN_RE = re.compile(r"«v\d+»")
+# A public value's stand-in («v1», «v2»...): what the model sees instead of a txid, an address or a
+# full hash. Self-delimiting («v1» is never inside «v10»). The letter is one no source uses in that
+# shape, so a memory that talks about stand-ins can never be rewritten by the restore.
+STAND_IN_LETTERS = "vwxyzjkq"
 FACT_STOP = {"0.0", "1.0", "2.0", "3.0"}
 # A memory file's own name is not a fact about the world: the model labels the umbrella's subsections
 # with the source file names, and those files are quarantined after the merge.
@@ -330,12 +331,22 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
     # masked by the redaction below and lost to the umbrella. Each becomes a stable stand-in «vN»
     # first: the model, the checklist and the appendix only ever see the stand-in, and the final
     # document gets the original back. Only values that were in the sources are restored.
+    # Which values are public is decided over the whole cluster by an allowlist of shapes
+    # (engram_secrets.classify_values); everything else masked stays masked.
+    raws = {f: (MEM / f).read_text(errors="ignore") for f in files}
+    public, _held = engram_secrets.classify_values(list(raws.values()))
+    letter = next((c for c in STAND_IN_LETTERS
+                   if not any(re.search(rf"«{c}\d+»", t) for t in raws.values())), None)
+    if letter is None:
+        public = set()                         # no safe stand-in: mask them, as before
+    token_re = re.compile(rf"«{letter}\d+»") if letter else None
     values = {}           # original value -> stand-in
+
+    def stand_in(v):
+        return values.setdefault(v, f"«{letter}{len(values) + 1}»")
     for f in files:
-        raw = (MEM / f).read_text(errors="ignore")
-        for v in sorted(engram_secrets.public_values(raw), key=len, reverse=True):
-            raw = raw.replace(v, values.setdefault(v, f"«v{len(values) + 1}»"))
-        body, n = redact_secrets(raw)
+        # one pass over the scanner's match spans: public -> stand-in, anything else -> masked
+        body, n = engram_secrets.swap_values(raws[f], public, stand_in)
         n_redacted += n
         prose = strip_prior_appendix(body)
         sources[f] = prose
@@ -366,7 +377,7 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
                 if src is not None:
                     fact_src[norm] = (f, src.strip())
         # each stand-in is a verbatim fact: if the model drops it, its line goes to the appendix
-        for tok in sorted(set(VALUE_TOKEN_RE.findall(keep))):
+        for tok in sorted(set(token_re.findall(keep))) if token_re else []:
             facts.setdefault(tok, (tok, "value"))
             if tok not in fact_src:
                 fact_src[tok] = (f, next(ln.strip() for ln in keep.splitlines() if tok in ln))

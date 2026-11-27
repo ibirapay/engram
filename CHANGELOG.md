@@ -11,24 +11,34 @@ in. Each is now resolved by the pipeline itself.
   unevaluated). Now every staged candidate goes through the cheap gates each run (noise, provenance,
   confidence, dedup, denylist, secret scan), user-direct first and then oldest first:
   - a failed provenance or confidence gate is terminal: the candidate moves to `.staging/.expired/`
-    (recoverable) instead of coming back every run;
+    (recoverable) instead of coming back every run; an unreadable frontmatter is held, not judged;
   - the injection check, the only model call, is bounded by `auto_graduate.llm_budget_seconds`
-    (1800) and stops after 3 failures in a row; what does not fit is deferred to the front of the
-    next run;
+    (1800), each call capped to what is left of it, and stops after 3 failures in a row (a reply
+    with no verdict counts as a failure, it no longer quarantines); what does not fit is deferred to
+    the front of the next run; the secret scan runs before the model; one run at a time (lock);
   - a near-copy of something graduated earlier in the same run is dropped;
   - `max_per_run` defaults to 0 (no cap); the Telegram run summary shows TTL expiries and model time.
 - **Earlier merges settle.** A merge could not touch a file of another merge still inside its
   30-day undo window, which locked 18 live memories out of curation. A merge nobody undid for
   `auto_curate.settle_days` (7) now settles when needed: its backup moves to `.trash/` (as the
-  probation sweep does at 30 days) and its UNDO record closes. A younger one still blocks.
-- **Txids, addresses and full hashes reach the umbrella.** The distiller swaps each public value for
-  a stand-in `«vN»` before redaction; the model, the checklist and the appendix only see the
-  stand-in, and the final document gets the original back. Only values from the sources are
-  restored and credentials stay masked. The public-value HOLD (about 65 money memories) is replaced
-  by a reconciliation after distill. `engram_secrets.public_values()` is the shared definition.
+  probation sweep does at 30 days) and its UNDO record closes, only after the new umbrella was
+  written. A younger one still blocks.
+- **Txids, addresses and full hashes reach the umbrella.** Which masked values are public is decided
+  by an ALLOWLIST over the whole cluster (`engram_secrets.classify_values`): an EVM address
+  (`0x` + 40 hex), a chain bech32 address, a 64-hex labelled tx/hash/sha256 or a 40-hex labelled
+  commit/rev with no secret word nearby, a lowercase path. The distiller swaps each for a stand-in
+  (`«v1»`, with a letter no source uses) in one pass over the scanner's spans; the model, the
+  checklist and the appendix only see the stand-in, and the final document gets the original back.
+  Everything else stays masked: every sample of the shared secret corpus, a bare 64-hex key, a
+  base64 secret, `nsec1...`. A cluster holding a masked value that is neither public nor a
+  credential is held before distill (it cannot be restored); curate also reconciles after distill
+  and holds an umbrella the writer's secret guard would block.
 - **A skipped cluster is not distilled again for nothing.** A cluster skipped after a distill call
-  (bloated, REJECT, malformed, a refused apply) is remembered in `.curate_skips.json` and retried
-  only when one of its files changes or `auto_curate.retry_days` (7) pass.
+  for a deterministic reason (bloated, REJECT, malformed, waiting for an earlier merge to settle) is
+  remembered in `.curate_skips.json` and retried when one of its files or a deciding setting
+  changes, or `auto_curate.retry_days` (7) pass. A down reviewer or a failed write is not remembered.
+- **Reviewed** by an independent Opus 5.5 xhigh pass: 1 HIGH (the first public-value design was a
+  denylist and would have restored real keys) and 7 MEDIUM/LOW, all fixed with tests.
 
 ## 1.7.4 — memory frontmatter is read the way it is written
 

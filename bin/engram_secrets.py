@@ -67,18 +67,98 @@ def credentials(text: str):
     return out
 
 
-# The shape of a value SECRET_RE masks that is PUBLIC data rather than a credential: a txid,
-# an address, a full commit/file hash (long hex or base64-like runs with no name attached).
-_PUBLIC_SHAPE_RE = re.compile(r"[0-9a-fA-F]{32,}|[A-Za-z0-9+/]{40,}={0,2}")
+# PUBLIC values: what SECRET_RE masks that is positively public data, by an ALLOWLIST of shapes
+# (anything else masked stays masked). A denylist ("masked minus known credentials") restored a
+# bare 64-hex private key or a base64 secret into a pushed memory (review 2026-11-26).
+#   0x + exactly 40 hex                 an EVM address (a private key is 32 bytes, 64 hex)
+#   bech32 with a chain-address prefix  bc1 / tb1 / bcrt1 / lq1 / tlq1 / ex1 / el1 / ert1 (nsec1 is a key: not listed)
+#   64 hex labelled tx/txid/hash/sha256/digest/block, 40 hex labelled commit/sha/rev
+#                                       and no secret word anywhere on the line
+#   a non-hex run of lowercase, digits and at least one / (a path: random base64 is mixed case;
+#                                       40+ chars of [a-z0-9/] by chance is ~1e-10)
+# A value that is ALSO seen in any other context in the cluster (inside a credential, unlabelled,
+# next to a secret word) is not public anywhere.
+_SECRET_WORD_RE = re.compile(r"(?i)\b(priv(ate)?|secret|seed|mnemonic|macaroon|passw(or)?d|pk|wif|xprv|nsec|"
+                             r"token|api[_ -]?key|auth)\b")
+_TX_LABEL_RE = re.compile(r"(?i)\b(tx|txid|txhash|tx_hash|hash|sha-?256|digest|block)\b")
+_COMMIT_LABEL_RE = re.compile(r"(?i)\b(commit|sha1?|rev(ision)?)\b")
+_BECH32_RE = re.compile(r"(?:bc1|tb1|bcrt1|lq1|tlq1|ex1|el1|ert1)[ac-hj-np-z02-9]{25,}")
+_HEX_RE = re.compile(r"[0-9a-fA-F]+")
+_BLOB_RE = re.compile(r"[0-9a-fA-F]{32,}|[A-Za-z0-9+/]{40,}={0,2}")    # what SECRET_RE masks as a bare run
+
+
+def _is_public(m) -> bool:
+    v, text = m.group(0), m.string
+    # the window is the value's line AND the one before: markdown wraps a sentence, so the label
+    # ("refund tx") often ends the previous line. The secret-word check uses the same window.
+    cur_start = text.rfind("\n", 0, m.start())
+    line_start = text.rfind("\n", 0, max(cur_start, 0)) + 1 if cur_start > 0 else 0
+    line_end = text.find("\n", m.end()); line_end = len(text) if line_end < 0 else line_end
+    # a label belongs to the NEXT value only: start after any earlier masked run in the window
+    label_start = line_start
+    for prev in SECRET_RE.finditer(text, line_start, m.start()):
+        label_start = prev.end()
+    before, line = text[label_start:m.start()], text[line_start:line_end]
+    # the run may carry its own 0x (SECRET_RE's base64 alternative takes it) or follow one
+    prefixed = v[:2].lower() == "0x" or text[max(0, m.start() - 2):m.start()].lower() == "0x"
+    h = v[2:] if v[:2].lower() == "0x" else v
+    if _HEX_RE.fullmatch(h):                             # hex: only by length + label, never "identifier"
+        if prefixed and len(h) == 40:
+            return True                                  # an EVM address
+        if _SECRET_WORD_RE.search(line):
+            return False
+        if len(h) == 64:
+            return bool(_TX_LABEL_RE.search(before))     # tx/block hash, sha256 digest
+        if len(h) == 40 and not prefixed:
+            return bool(_COMMIT_LABEL_RE.search(before)) # git commit
+        return False
+    if _BECH32_RE.fullmatch(v):
+        return True                                      # a chain address
+    if _SECRET_WORD_RE.search(line):
+        return False
+    # a path: lowercase segments joined by / (a bare lowercase run is NOT enough: nsec1..., a
+    # lowercase bech32 private key, is one)
+    return "/" in v and bool(re.fullmatch(r"[a-z0-9/]+", v))
+
+
+def classify_values(texts) -> tuple:
+    """(public, held) over a whole cluster. public: bare masked runs on the allowlist in every
+    context they appear in, which distillation may swap for stand-ins and restore. held: bare
+    masked runs that are neither public nor a recognised credential (a merge would mask them, so
+    curate holds it). Named secrets and credentials are in neither: they stay masked."""
+    texts = [t or "" for t in texts]
+    creds = [c for t in texts for c in credentials(t)]
+    ok, bad = set(), set()
+    for t in texts:
+        for m in SECRET_RE.finditer(t):
+            v = m.group(0)
+            if not _BLOB_RE.fullmatch(v):
+                continue                                   # a named secret: stays masked
+            if any(v in c or c in v for c in creds) or not _is_public(m):
+                bad.add(v)
+            else:
+                ok.add(v)
+    public = ok - bad
+    held = {v for v in bad if not any(v in c or c in v for c in creds)}
+    return public, held
 
 
 def public_values(text: str) -> set:
-    """Long hex/base64 runs that redact() masks but that are not credentials (credentials(),
-    session ids and named secrets are left out). Distillation swaps them for placeholders so the
-    model never sees them and the umbrella gets them back verbatim."""
-    creds = credentials(text)
-    return {m.group(0) for m in SECRET_RE.finditer(text or "")
-            if _PUBLIC_SHAPE_RE.fullmatch(m.group(0)) and not any(m.group(0) in c for c in creds)}
+    return classify_values([text])[0]
+
+
+def swap_values(text: str, public: set, stand_in) -> tuple:
+    """One pass over SECRET_RE's match spans: a public value becomes stand_in(value), everything
+    else the redaction marker. Never a global str.replace, which also rewrote a value's copy
+    inside a credential span and left the credential unmasked. Returns (text, n_masked)."""
+    n = [0]
+
+    def sub(m):
+        if m.group(0) in public:
+            return stand_in(m.group(0))
+        n[0] += 1
+        return "«redacted-secret»"
+    return SECRET_RE.sub(sub, text or ""), n[0]
 
 
 def redact(text: str):

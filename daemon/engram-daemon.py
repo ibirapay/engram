@@ -439,8 +439,9 @@ def task_harvest():
             _run([sys.executable, str(gate), "--activity"], timeout=30)
     # Report the PIPELINE's result, not the activity ping's: a timed-out encode must
     # not stamp as a completed run (it did until 2026-08-14). Each pipeline stage is
-    # already bounded internally (harvest max_files_per_run, stage-apply max_per_run),
-    # so a failure here is a real fault worth retrying, not runaway work.
+    # already bounded internally (harvest max_files_per_run, stage-apply by its model-time
+    # budget auto_graduate.llm_budget_seconds, each call capped to what is left of it), so a
+    # failure here is a real fault worth retrying, not runaway work.
     return ok
 
 
