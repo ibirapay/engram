@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.8.1 — graduation lets public values through
+
+- The graduation secret scan quarantined any candidate with a long hex or base64 run, so a fact
+  holding a contract address never graduated (4 of the 804 queued on the author's store, and
+  every future one). It now uses the same allowlist as curate (`engram_secrets.classify_values`):
+  only a credential or a value that cannot be told apart from a secret quarantines.
+
 ## 1.8.0 — the pipeline drains on its own: nothing waits for a person
 
 A full run on 2026-11-26 showed four places where "autonomous" work stalled until someone stepped

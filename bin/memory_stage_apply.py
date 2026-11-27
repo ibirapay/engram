@@ -409,7 +409,12 @@ def main():
         # the AGGRESSIVE variant: 32+ hex, 40+ base64, mnemonics, WIF/xprv). save_memory.sh only
         # applies the high-precision block ERE, which misses a bare 64-hex EVM key or a base64
         # macaroon a user pasted into chat. Quarantine (reviewable) rather than write a secret.
-        if engram_secrets.looks_secret(f"{desc}\n{body}"):
+        # Public values (an EVM address, a chain address, a path: engram_secrets.classify_values)
+        # are not secrets: a candidate holding only those used to be quarantined, so contract
+        # addresses never graduated. Anything held or a credential still quarantines.
+        text = f"{desc}\n{body}"
+        _public, held = engram_secrets.classify_values([text])
+        if held or engram_secrets.credentials(text):
             if apply:
                 QUAR.mkdir(parents=True, exist_ok=True)
                 p.rename(QUAR / p.name)
