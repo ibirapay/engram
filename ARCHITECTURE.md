@@ -42,8 +42,10 @@ The core is agent-agnostic; an agent is an adapter on three seams:
    registered with each agent's own MCP mechanism.
 2. **Prompt-time recall** — `engram-recall-hook` takes `{prompt, session_id, cwd}` on stdin and prints
    a `<relevant-memory>` block. Claude Code runs it as a `UserPromptSubmit` hook; opencode through
-   `integrations/opencode/engram-recall.ts`. Hermes has no prompt hook that can inject text, so its
-   `SOUL.md` block (`integrations/hermes`) tells the model to call the recall tool.
+   `integrations/opencode/engram-recall.ts`; Hermes through a `pre_llm_call` shell hook
+   (`integrations/hermes/engram-recall-hook.py`), whose `{"context": ...}` Hermes appends to the user
+   message. Each agent also gets standing instructions on when to recall and how to save
+   (`SOUL.md` for Hermes, `AGENTS.md` for opencode).
 3. **Encode** — harvest reads Claude-shaped JSONL transcripts. `bin/engram_sources.py` converts opencode
    (`opencode.db`) and Hermes (`state.db`) sessions into that shape under `<store>/.sources/`, keeping only
    user and assistant text. The harvester's injection stripping and provenance rules then apply unchanged.
