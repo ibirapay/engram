@@ -79,9 +79,10 @@ def credentials(text: str):
 # kept here serve the other ~100 (76 EVM addresses, 10 bech32 addresses, 15 paths).
 #   0x + exactly 40 hex                 an EVM address (a private key is 32 bytes, 64 hex)
 #   bech32 with a chain-address prefix  bc1 / tb1 / bcrt1 / lq1 / tlq1 / ex1 / el1 / ert1 (nsec1 is a key: not listed)
-#   a filesystem path                   the run starts its word (not inside a URL or after a host),
-#                                       lowercase, digits and /, every segment short and not hex,
-#                                       and no secret word in its paragraph
+#   a filesystem path                   the masked run starts with / and its word (not inside a URL
+#                                       or after a host), lowercase, digits and /, every segment
+#                                       short and not hex, and no secret word in its paragraph.
+#                                       (No leading /: "abandon/ability/..." is a seed with slashes.)
 # A value that is ALSO seen in any other context in the cluster is not public anywhere.
 _SECRET_WORD_PREFIXES = (
     "key", "pk", "sk", "seed", "wif", "nsec", "xprv", "hmac", "preimage", "mnemonic", "macaroon",
@@ -120,7 +121,7 @@ def _is_public(m) -> bool:
     word_start = max(text.rfind(c, 0, m.start()) for c in " \t\n`'\"(<[") + 1
     if text[word_start:m.start()] not in ("", "~", "~/", ".", "./", "..", "../") or v.startswith("//"):
         return False
-    if "/" not in v or not re.fullmatch(r"[a-z0-9/]+", v):
+    if not v.startswith("/") or not re.fullmatch(r"[a-z0-9/]+", v):
         return False
     # a long segment, a hex one, or a 12+ one mixing letters with 2+ digits (a random token: the
     # capability part of a webhook or ntfy URL written without its scheme)

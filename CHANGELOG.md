@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.8.1 — graduation lets public values through
+
+- The graduation secret scan quarantined any candidate with a long hex or base64 run, so a fact
+  holding a contract address never graduated (4 of the 804 queued on the author's store, and
+  every future one). It now uses the same allowlist as curate (`engram_secrets.classify_values`):
+  any masked match that is not a public value still quarantines (no originSessionId exception:
+  graduation writes the body as it is), and the harvested `name` is scanned too (it becomes the
+  file name). Reviewed: CLEAN, its three LOW findings fixed with tests.
+- A path is public only when its masked run starts with `/` ("abandon/ability/..." is a seed
+  written with slashes, not a path).
+- The flaky `a_stalled_vector_leg_does_not_starve_the_local_legs` test asserts against a 4 s
+  budget instead of 1 s: same claim (the vector leg does not eat the whole budget), CI headroom.
+
 ## 1.8.0 — the pipeline drains on its own: nothing waits for a person
 
 A full run on 2026-11-26 showed four places where "autonomous" work stalled until someone stepped

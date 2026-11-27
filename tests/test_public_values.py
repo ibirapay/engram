@@ -25,7 +25,7 @@ def main():
 
     public = [f"sent to {ADDR}", f"to {ADDR.lower()}", f"payer `{ADDR}` paid",
               "address bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", "liquid lq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn",
-              "path home/user/src/engram/crates/engramgraph/src/lib", "see ~/ops/tools/engram/crates/engramgraph/srcx"]
+              "path /home/user/src/engram/crates/engramgraph/src/lib", "see ~/ops/tools/engram/crates/engramgraph/srcx"]
     for t in public:
         assert es.public_values(t), f"not restored: {t!r}"
     # (text, the part that must never come back as public). A bare hex is never public, labelled
@@ -39,7 +39,7 @@ def main():
               (f"tx {TX} and the private key is in vault", TX),
               ("nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5", "nsec1"),
               ("QWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo0NTY3ODkwREU=", "QWJj"),
-              ("secret at home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
+              ("secret at /home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
               # the label on the previous line belongs to the value right after it, not this one
               (f"commit 6cad780be93835b962af735171fae872f9526503 then\n{PK[:40]} unlabelled", PK[:40]),
               # review round 2: a label that is not adjacent, or a secret word anywhere in the paragraph
@@ -65,13 +65,15 @@ def main():
               # character inside a secret word; a secret word as a prefix (plural, compound, pt-BR)
               ("alerts go to http://iaserver/ntfy/k3xq9m2v7w8z4p5r6t2y8nq/send/x", "k3xq9m"),
               ("rpc.example.com/api/v1/k3xq9m2v7w8z4p5r6t2y8nq/eth/main/x", "k3xq9m"),
-              ("k\u200bey dir home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
-              ("tokens in home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
-              ("chave em home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
+              ("k\u200bey dir /home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
+              ("tokens in /home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
+              ("chave em /home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
               ("blob wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalr"),   # mixed case with slashes: base64, not a path
               # review round 4: a capability path without its scheme or host
               ("alerts: curl -d up iaserver/ntfy/k3xq9m2v7w8z4p5r6t2y8nq/send", "k3xq9m"),
-              ("POST /hooks/k3xq9m2v7w8z4p5r6t2y8nq/deploy/now", "k3xq9m")]
+              ("POST /hooks/k3xq9m2v7w8z4p5r6t2y8nq/deploy/now", "k3xq9m"),
+              # a seed written with slashes is not a path: a path's masked run starts with /
+              ("backup words: abandon/ability/able/about/above/absent/absorb/abstract/absurd/abuse/access/accident", "abandon")]
     for text, part in secret:
         vals = es.public_values(text)
         assert not any(part in v for v in vals), f"restored: {text!r} -> {vals}"
@@ -87,7 +89,7 @@ def main():
     words = "abandon ability able about above absent absorb abstract absurd abuse access accident"
     assert es.credentials(f"**Seed phrase:** {words}") == [words], es.credentials(f"**Seed phrase:** {words}")
     # cluster level: public in one file, suspect in another -> public nowhere, and held
-    path = "home/user/src/engram/crates/engramgraph/src/lib"
+    path = "/home/user/src/engram/crates/engramgraph/src/lib"
     assert es.classify_values([f"see {path}"])[0] == {path}
     pub, held = es.classify_values([f"see {path}", f"secret at {path}"])
     assert path not in pub and path in held, (pub, held)

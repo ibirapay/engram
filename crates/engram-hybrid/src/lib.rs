@@ -738,7 +738,7 @@ mod tests {
                 "graph: {{backend: sqlite}}\n\
                  vector_store: {{enabled: true, url: 'http://127.0.0.1:{port}'}}\n\
                  embed: {{provider: llama_cpp, url: 'http://127.0.0.1:{port}/v1', model: m, dim: 1024}}\n\
-                 recall: {{inject: {{timeout_ms: 1000}}}}\n"
+                 recall: {{inject: {{timeout_ms: 4000}}}}\n"
             ),
         )
         .unwrap();
@@ -763,10 +763,12 @@ mod tests {
             "expected an explicit vector timeout, got {:?}",
             output.legs["vector"]
         );
-        // ...and the leg's own deadline is a FRACTION of the prompt budget, so
-        // there is time left to do the local work and return.
+        // ...and the leg's own deadline is a FRACTION of the prompt budget (2/5: 1.6s of 4s),
+        // so there is time left to do the local work and return. The budget is 4s, not 1s, so a
+        // slow CI runner's local work (it took 0.7s there) still fits: the claim is "the vector
+        // leg did not eat the whole budget", not "the machine is fast".
         assert!(
-            elapsed < Duration::from_millis(1000),
+            elapsed < Duration::from_millis(4000),
             "the vector leg consumed the whole prompt budget: {elapsed:?}"
         );
         std::fs::remove_dir_all(&dir).ok();

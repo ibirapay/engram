@@ -176,6 +176,20 @@ def test_review_round_graduation():
                   + "key " + "ab" * 32 + "\n"
     decs, _ = _run([], raw={"o_secret.md": secret_body})
     assert decs[0]["action"] == "quarantine" and not _run.cfgs, (decs, len(_run.cfgs))
+    # a candidate whose only masked values are public (a contract address) is not a secret
+    addr_body = "---\nname: r\ndescription: tag-r\nharvest:\n  provenance: assistant\n  confidence: 0.9\n---\n" \
+                + "USDT contract on Polygon is 0xc2132D05D31c914a87C6611C10748AEb04B58e8F.\n"
+    decs, _ = _run([], raw={"r_addr.md": addr_body})
+    assert decs[0]["action"] == "would-graduate", decs
+    # a named credential still quarantines; so does a short named secret credentials() misses,
+    # a key next to originSessionId (curation drops that field, graduation does not), and a key
+    # in the name (it becomes the file name)
+    for name, needle in (("s_cred.md", "api_key=sk_live_51H8xYzAbCdEf12345 and"), ("t_pwd.md", "password: hunter2xx and"),
+                         ("u_sid.md", "originSessionId: " + "4c" * 32 + " and")):
+        decs, _ = _run([], raw={name: addr_body.replace("USDT contract", needle + " USDT contract")})
+        assert decs[0]["action"] == "quarantine", (name, decs)
+    decs, _ = _run([], raw={"v_name.md": addr_body.replace("name: r", "name: wallet-" + "4c" * 32)})
+    assert decs[0]["action"] == "quarantine", decs
     print("ok — review round: no-verdict is a failure, unreadable is held, calls capped, secrets before the model")
 
 
