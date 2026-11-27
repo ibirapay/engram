@@ -20,11 +20,11 @@ SECRET_RE = re.compile(
     r"(?i)("
     # BIP39 / recovery phrases: keyword then 6+ space/comma-separated words —
     # listed FIRST so it masks the whole phrase, not just the first word.
-    r"(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*(?:[a-z]+[\s,]+){5,}[a-z]+"
+    r"(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*(?:[a-z]+[\s,]+){5,}[a-z]+\b(?:\s*[:=]\s*['\x22]?[^\s'\x22]{6,})?"
     # the same written the way a model writes it: a label with a space or markdown around it,
     # the words in backticks, quotes or a code block. 12+ BIP39-shaped words (3-8 letters), so
     # prose such as "Seed phrase: shown once during onboarding" does not match.
-    r"|(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?:[a-z]{3,8}[\s,]+){11,}[a-z]{3,8}"
+    r"|(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?:[a-z]{3,8}[\s,]+){11,}[a-z]{3,8}\b(?:\s*[:=]\s*['\x22]?[^\s'\x22]{6,})?"
     # named credential = VALUE (incl. crypto key material)
     r"|(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[_-]?phrase|recovery[_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\"]?[^\s'\"]{6,}"
     r"|originSessionId\s*[:=]?\s*[0-9a-fA-F-]{8,}"

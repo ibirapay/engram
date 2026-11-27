@@ -76,6 +76,13 @@ def main():
         vals = es.public_values(text)
         assert not any(part in v for v in vals), f"restored: {text!r} -> {vals}"
 
+    # a seed arm must not swallow the next label as its last word and leave that label's value in clear
+    for sample in ["**Seed phrase:** abandon ability able about above absent absorb abstract absurd abuse access "
+                   "accident\npassword: Hunter2Hunter2",
+                   "seed words: zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong token=abc123def456",
+                   "mnemonic: abandon abandon abandon abandon abandon ability\npassword: Hunter2Hunter2"]:
+        masked = es.redact(sample)[0]
+        assert "Hunter2" not in masked and "abc123def456" not in masked, masked
     # credentials() returns the WORDS of a seed written the markdown way, like the plain form
     words = "abandon ability able about above absent absorb abstract absurd abuse access accident"
     assert es.credentials(f"**Seed phrase:** {words}") == [words], es.credentials(f"**Seed phrase:** {words}")
@@ -103,7 +110,6 @@ def main():
 def writer_guard_parity():
     """WRITER_BLOCK_RE must block exactly what save_memory.sh's guard (grep -iE) blocks."""
     import re, subprocess
-    ere = re.search(r"^_MEMORY_SECRET_ERE='(.*)'$", (ROOT / "bin" / "memory_lib.sh").read_text(), re.M).group(1)
     corpus = json.loads((ROOT / "tests" / "fixtures" / "secret_samples.json").read_text())
     samples = corpus["secret"] + corpus["clean"] + [
         "A1" * 45, "a1" * 45, "token: 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "plain prose",

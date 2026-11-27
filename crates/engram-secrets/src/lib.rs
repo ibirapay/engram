@@ -27,10 +27,10 @@ const PATTERN: &str = concat!(
     r"(?i)(",
     // BIP39 / recovery phrases: keyword then 6+ separated words — FIRST so the
     // whole phrase masks, not just its first word.
-    r"(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*(?:[a-z]+[\s,]+){5,}[a-z]+",
+    r"(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*(?:[a-z]+[\s,]+){5,}[a-z]+\b(?:\s*[:=]\s*['\x22]?[^\s'\x22]{6,})?",
     // the same written the way a model writes it: a label with a space or markdown around it,
     // the words in backticks, quotes or a code block; 12+ BIP39-shaped words (3-8 letters)
-    r"|(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?:[a-z]{3,8}[\s,]+){11,}[a-z]{3,8}",
+    r"|(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?:[a-z]{3,8}[\s,]+){11,}[a-z]{3,8}\b(?:\s*[:=]\s*['\x22]?[^\s'\x22]{6,})?",
     // named credential = VALUE (including crypto key material)
     r"|(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[_-]?phrase|recovery[_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\x22]?[^\s'\x22]{6,}",
     r"|originSessionId\s*[:=]?\s*[0-9a-fA-F-]{8,}",
@@ -103,6 +103,17 @@ mod tests {
         let (clean, n) = redact("deploy on port 9000 at /home/x/y.py");
         assert_eq!(n, 0);
         assert_eq!(clean, "deploy on port 9000 at /home/x/y.py");
+
+        // a seed arm must not swallow the next label as its last word and leave that label's
+        // value in clear (both arms)
+        for sample in [
+            "**Seed phrase:** abandon ability able about above absent absorb abstract absurd abuse access accident\npassword: Hunter2Hunter2",
+            "seed words: zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong token=abc123def456",
+            "mnemonic: abandon abandon abandon abandon abandon ability\npassword: Hunter2Hunter2",
+        ] {
+            let (masked, _) = redact(sample);
+            assert!(!masked.contains("Hunter2") && !masked.contains("abc123def456"), "{masked}");
+        }
     }
 
     /// The classes the replaced one-line regex could not see. These are the reason
