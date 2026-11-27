@@ -27,9 +27,12 @@ const PATTERN: &str = concat!(
     r"(?i)(",
     // BIP39 / recovery phrases: keyword then 6+ separated words — FIRST so the
     // whole phrase masks, not just its first word.
-    r"(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?:[a-z]{3,8}[\s,]+){5,}[a-z]{3,8}",
+    r"(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*(?:[a-z]+[\s,]+){5,}[a-z]+",
+    // the same written the way a model writes it: a label with a space or markdown around it,
+    // the words in backticks, quotes or a code block; 12+ BIP39-shaped words (3-8 letters)
+    r"|(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?:[a-z]{3,8}[\s,]+){11,}[a-z]{3,8}",
     // named credential = VALUE (including crypto key material)
-    r"|(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\x22]?[^\s'\x22]{6,}",
+    r"|(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[_-]?phrase|recovery[_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\x22]?[^\s'\x22]{6,}",
     r"|originSessionId\s*[:=]?\s*[0-9a-fA-F-]{8,}",
     r"|-----BEGIN[ A-Z]*PRIVATE KEY",
     r"|Bearer\s+[A-Za-z0-9._\-]{20,}",

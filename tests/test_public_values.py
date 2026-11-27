@@ -76,6 +76,9 @@ def main():
         vals = es.public_values(text)
         assert not any(part in v for v in vals), f"restored: {text!r} -> {vals}"
 
+    # credentials() returns the WORDS of a seed written the markdown way, like the plain form
+    words = "abandon ability able about above absent absorb abstract absurd abuse access accident"
+    assert es.credentials(f"**Seed phrase:** {words}") == [words], es.credentials(f"**Seed phrase:** {words}")
     # cluster level: public in one file, suspect in another -> public nowhere, and held
     path = "home/user/src/engram/crates/engramgraph/src/lib"
     assert es.classify_values([f"see {path}"])[0] == {path}
@@ -106,7 +109,10 @@ def writer_guard_parity():
         "A1" * 45, "a1" * 45, "token: 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "plain prose",
         f"refund tx {TX}", "PASSWORD = Hunter2Hunter2"]
     samples += ["secret:\n    secretName: wallet-api-tls",           # \s must not reach across lines
-                "Bearer\vabcdefghijklmnopqrstuvwxyz0123"]           # \v does not split a line for grep
+                "Bearer\vabcdefghijklmnopqrstuvwxyz0123",           # \v does not split a line for grep
+                "Bearer\u00a0abcdefghijklmnopqrstuvwxyz0123",       # a no-break space, per-line path
+                "Seed phrase:\n```\n" + "\u00a0".join(["abandon", "ability", "able", "about", "above", "absent",
+                 "absorb", "abstract", "absurd", "abuse", "access", "accident"]) + "\n```"]   # whole-file path
     import tempfile
     for s in samples:
         # the REAL guard: memory_lib.sh's memory_scan_secret (per line + the whole-file seed pass)
@@ -116,9 +122,17 @@ def writer_guard_parity():
                                 str(ROOT / "bin" / "memory_lib.sh"), fh.name]).returncode == 0
         Path(fh.name).unlink()
         assert shell == es.writer_would_block(s), f"writer guard drift on {s[:40]!r}: shell={shell}"
-        if any(k in s.lower() for k in ("seed phrase", "seed words", "recovery phrase", "mnemonic (")) \
-                and s in corpus["secret"]:
+        if re.search(r"(?i)mnemonic|seed|recovery", s) and s in corpus["secret"]:
             assert shell, f"the writer guard lets a seed phrase through: {s[:40]!r}"
+        if s in corpus["clean"]:
+            assert not shell, f"the writer guard blocks clean prose: {s[:40]!r}"
+    # a stray non-UTF-8 byte on the line must not hide a hit ("binary file matches")
+    with tempfile.NamedTemporaryFile("wb", suffix=".md", delete=False) as fh:
+        fh.write(b"api_key=sk-live-abcdefghijklmnop1234 conta da loja \xe7\n")
+    shell = subprocess.run(["bash", "-c", 'source "$1"; memory_scan_secret "$2" >/dev/null', "_",
+                            str(ROOT / "bin" / "memory_lib.sh"), fh.name]).returncode == 0
+    Path(fh.name).unlink()
+    assert shell, "a Latin-1 byte on the line hid a credential from the writer guard"
     print("ok — the writer-guard pattern matches save_memory.sh's grep -iE on every sample")
 
 

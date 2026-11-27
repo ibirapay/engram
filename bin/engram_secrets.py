@@ -20,9 +20,13 @@ SECRET_RE = re.compile(
     r"(?i)("
     # BIP39 / recovery phrases: keyword then 6+ space/comma-separated words —
     # listed FIRST so it masks the whole phrase, not just the first word.
-    r"(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?:[a-z]{3,8}[\s,]+){5,}[a-z]{3,8}"
+    r"(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*(?:[a-z]+[\s,]+){5,}[a-z]+"
+    # the same written the way a model writes it: a label with a space or markdown around it,
+    # the words in backticks, quotes or a code block. 12+ BIP39-shaped words (3-8 letters), so
+    # prose such as "Seed phrase: shown once during onboarding" does not match.
+    r"|(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?:[a-z]{3,8}[\s,]+){11,}[a-z]{3,8}"
     # named credential = VALUE (incl. crypto key material)
-    r"|(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\"]?[^\s'\"]{6,}"
+    r"|(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[_-]?phrase|recovery[_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\"]?[^\s'\"]{6,}"
     r"|originSessionId\s*[:=]?\s*[0-9a-fA-F-]{8,}"
     r"|-----BEGIN[ A-Z]*PRIVATE KEY"
     r"|Bearer\s+[A-Za-z0-9._\-]{20,}"
@@ -44,7 +48,8 @@ SECRET_RE = re.compile(
 # keep verbatim; without it the whole match is the credential. Mirrors the shell block
 # ERE in memory_lib.sh, plus: a name=value pair needs 16+ chars AND a digit.
 CREDENTIAL_RE = re.compile(
-    r"(?i:(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?P<v>(?:[a-z]{3,8}[\s,]+){5,}[a-z]{3,8}))"
+    r"(?i:(?:mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*(?P<v>(?:[a-z]+[\s,]+){5,}[a-z]+))"
+    r"|(?i:(?:mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(?:\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`'\x22]*(?P<v3>(?:[a-z]{3,8}[\s,]+){11,}[a-z]{3,8}))"
     r"|(?i:(?:client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|"
     r"access[_-]?token|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*['\"]?)"
     r"(?P<v2>(?=[^\s'\"]*\d)[^\s'\"]{16,})"
@@ -61,7 +66,7 @@ def credentials(text: str):
     """Credential strings in `text` that must survive a merge verbatim (deduped, in order)."""
     out = []
     for m in CREDENTIAL_RE.finditer(text or ""):
-        c = m.group("v") or m.group("v2") or m.group(0)
+        c = m.group("v") or m.group("v3") or m.group("v2") or m.group(0)
         if c not in out:
             out.append(c)
     return out
@@ -155,9 +160,10 @@ def classify_values(texts) -> tuple:
 # memory_lib.sh _MEMORY_SECRET_ERE, the guard save_memory.sh applies (grep -iE): curate checks an
 # umbrella against it before writing, instead of failing the write and retrying every run.
 WRITER_BLOCK_RE = re.compile(
-    r"((mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`\x22]*([a-z]{3,8}[\s,]+){5,}[a-z]{3,8}"
+    r"((mnemonic|seed[_-]?phrase|recovery[_-]?phrase)\s*[:=]\s*([a-z]+[\s,]+){5,}[a-z]+"
+    r"|(mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(\s*\([^)\n]{0,40}\))?[*_]*\s*[:=][\s*_`\x22']*([a-z]{3,8}[\s,]+){11,}[a-z]{3,8}"
     r"|(client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token"
-    r"|mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*.?[A-Za-z0-9_/+-]{8,}"
+    r"|mnemonic|seed[_-]?phrase|recovery[_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)\s*[:=]\s*.?[A-Za-z0-9_/+-]{8,}"
     r"|BEGIN\s+[A-Z ]*PRIVATE KEY|-----BEGIN\s|Bearer\s+[A-Za-z0-9._-]{20,}|xprv[a-zA-Z0-9]{20,}"
     r"|[5KL][1-9A-HJ-NP-Za-km-z]{50,51}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}"
     r"|[0-9a-f]{80,})", re.I)
@@ -166,7 +172,7 @@ WRITER_BLOCK_RE = re.compile(
 # memory_lib.sh _MEMORY_SEED_ERE: the seed arm alone, matched over the whole file (grep -z).
 SEED_BLOCK_RE = re.compile(
     r"(mnemonic|seed[\s_-]?(?:phrase|words)|recovery[\s_-]?phrase)[*_]*(\s*\([^)]{0,40}\))?[*_]*\s*[:=]"
-    r"[\s*_`\x22]*([a-z]{3,8}[\s,]+){5,}[a-z]{3,8}", re.I)
+    r"[\s*_`\x22']*([a-z]{3,8}[\s,]+){11,}[a-z]{3,8}", re.I)
 
 
 def writer_would_block(text: str) -> bool:

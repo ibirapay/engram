@@ -47,14 +47,19 @@ in. Each is now resolved by the pipeline itself.
   passed as a path). All findings are fixed with tests. Trade-off, measured: 121 of 1125 live
   memories hold a value that cannot be told apart from a secret, so their clusters are held rather
   than merged with the value masked away.
-- **Security (pre-existing, all detectors):** a seed phrase was neither masked nor blocked when
-  written with a space ("seed phrase:", "recovery phrase =", "seed words:", "mnemonic (BIP39):") or
-  the way a model writes it (`**Seed phrase:** words`, the words in backticks, or in a code block on
-  the lines below), in Python (`engram_secrets`), the shell writer guard (`memory_lib.sh`) and the
-  Rust crate (`engram-secrets`). All three now match 6+ BIP39-shaped words (3-8 letters) after the
-  label, which also stops prose like "Recovery phrase: shown once during onboarding" from matching;
-  the writer guard adds a whole-file pass for the multi-line form. The shared corpus has every
-  spelling, and the Python side now checks the corpus too (only Rust did).
+- **Security (pre-existing, all detectors):** a seed phrase written with a space ("seed phrase:",
+  "recovery phrase =", "seed words:", "mnemonic (BIP39):") or the way a model writes it
+  (`**Seed phrase:** words`, the words in backticks or quotes, or in a code block below the label)
+  was neither masked nor blocked, in Python (`engram_secrets`), the shell writer guard
+  (`memory_lib.sh`) and the Rust crate (`engram-secrets`). All three gain a second arm for these
+  forms that needs 12+ BIP39-shaped words (3-8 letters), so prose about seeds ("Seed phrase:
+  per-shop, shared by every till") is not blocked; the original arm is unchanged. The writer guard
+  adds a whole-file pass for the multi-line form, reads no-break spaces as spaces (glibc
+  `[[:space:]]` does not) and greps with `-a` (a stray Latin-1 byte hid a line's hit). The shared
+  corpus has every form, and the Python side now checks the corpus too (only Rust did).
+  **Known gap, next step:** a seed written as a numbered list, under a label outside the list
+  ("Seed:", "Secret phrase:", pt-BR labels) or with no separator still passes; the fix is a
+  detector by the BIP39 wordlist (12+ consecutive list words), measured on the store first.
 - The writer-guard check runs line by line like save_memory.sh's grep; settle closes the UNDO record
   before moving the backup, and an UNDO whose umbrella was absorbed since is refused.
 
