@@ -244,7 +244,17 @@ def save_state(s: dict):
     STATE.parent.mkdir(parents=True, exist_ok=True)
     STATE.write_text(json.dumps(s, indent=1))
 
-def _run(cmd, timeout=3600) -> int:
+def _task_timeout():
+    """daemon.task_timeout_seconds; 0 (the default since 1.9.0) = no cap. Every stage bounds its
+    own model calls, and a nightly run that reads everything can take hours on its first night:
+    a fixed hour killed it mid-way."""
+    t = int(((cfg().get("daemon") or {}).get("task_timeout_seconds")) or 0)
+    return t if t > 0 else None
+
+
+def _run(cmd, timeout="task") -> int:
+    if timeout == "task":
+        timeout = _task_timeout()
     log("run: " + " ".join(str(c) for c in cmd))
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -304,22 +314,25 @@ def task_health():
         h["qdrant"] = _qdrant_up()
     log(f"health: {json.dumps(h)}")
 
+def _graph_sync_limit() -> int:
+    n = int(((cfg().get("daemon") or {}).get("graph_sync_limit")) or 0)
+    return n if n > 0 else 1_000_000
+
+
 def task_graph():
     backend = graph_backend()
     if backend != "sqlite":
         log("graph: graph.backend: %s was removed in 1.5.0. Copy the graph once with "
             "engram-graph-to-sqlite, then set graph.backend: sqlite" % backend)
         return False
-    # --limit: the sync extracts every pending memory before its single terminal write, so
-    # an unbounded run on a large backlog is killed mid-extraction by the 3600s _run cap
-    # and commits NOTHING (that froze the graph for 7 nights, 2026-08-08..08-14). The
-    # native sync commits per memory, so a kill costs the in-flight memory, not the batch;
-    # the backlog drains a batch per run.
+    # --limit: daemon.graph_sync_limit, 0 (the default since 1.9.0) = every pending memory. The
+    # native sync commits per memory, so a run cut short costs only the memory in flight. A
+    # fixed 25 a night left 220 freshly graduated memories ~9 nights from the graph.
     rust_sync = _rust("engram-native-graph-sync")
     if rust_sync and rust_native_sync_supported():
         return _per_tenant("graph", lambda tenant, slug: _run(_scoped(
             [str(rust_sync), "--config", str(ENGRAM_CONFIG)],
-            tenant, slug) + ["--limit", "25"]) == 0)
+            tenant, slug) + ["--limit", str(_graph_sync_limit())]) == 0)
     log("graph: the Rust sync cannot serve this config (embeddings: %s, reasoning: %s) — "
         "SKIPPING" % (rust_embedding_supported(), rust_reasoning_supported()))
     return False
@@ -439,8 +452,8 @@ def task_harvest():
             _run([sys.executable, str(gate), "--activity"], timeout=30)
     # Report the PIPELINE's result, not the activity ping's: a timed-out encode must
     # not stamp as a completed run (it did until 2026-08-14). Each pipeline stage is
-    # already bounded internally (harvest max_files_per_run, stage-apply by its model-time
-    # budget auto_graduate.llm_budget_seconds, each call capped to what is left of it), so a
+    # bounded by its own settings (harvest max_files_per_run, stage-apply
+    # auto_graduate.llm_budget_seconds; 0 = no limit, the default since 1.9.0), so a
     # failure here is a real fault worth retrying, not runaway work.
     return ok
 

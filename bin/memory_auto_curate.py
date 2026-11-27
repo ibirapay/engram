@@ -17,7 +17,7 @@ call is delegated to a model. Two different operations come out of that:
                  review/human gate plus REVERSIBILITY, not from the score.
   * RECOVERABLE — absorbed sources go to .quarantine/ (undo) and are de-indexed via
                  delete_memory.sh, which snapshots to .trash/ (90-day undo) first.
-  * BOUNDED    — at most `max_merges_per_run` merge attempts per run (a cluster held from its
+  * BOUNDED    — at most `max_merges_per_run` merge attempts per run when set (0 = all; a cluster held from its
                  sources alone does not count).
 Everything a model can't make safe (pruning distinct memories, deleting suspects)
 stays in the human-gated /memory-curate. This never deletes a memory that isn't
@@ -51,7 +51,7 @@ DELETE = HOME / ".claude" / "delete_memory.sh"
 AC_DEFAULTS = {
     "enabled": False,
     "merge_threshold": 0.92,      # cosine >= this to auto-merge (stricter than the 0.86 finder)
-    "max_merges_per_run": 2,
+    "max_merges_per_run": 0,      # 0 = every cluster (the default since 1.9.0)
     # Who reviews a merge before it can auto-apply:
     #   self   (default) — engram's OWN generate backend (the same dependency harvest
     #                      and distill already use, so this adds no new one). No
@@ -369,7 +369,7 @@ def main():
         # The cap counts clusters that cost a merge attempt. A cluster held from its sources alone
         # (credential or public value, below) costs nothing and must not take a slot: those holds
         # never clear, and in filename order two of them used to stall every compress merge.
-        if attempted >= ac["max_merges_per_run"]:
+        if ac["max_merges_per_run"] > 0 and attempted >= ac["max_merges_per_run"]:
             print(f"[auto-curate] cap of {ac['max_merges_per_run']} merge attempt(s) reached")
             break
         paths = [MEM / f for f in files]
