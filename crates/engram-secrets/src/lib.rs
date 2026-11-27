@@ -112,7 +112,10 @@ mod tests {
             "mnemonic: abandon abandon abandon abandon abandon ability\npassword: Hunter2Hunter2",
         ] {
             let (masked, _) = redact(sample);
-            assert!(!masked.contains("Hunter2") && !masked.contains("abc123def456"), "{masked}");
+            assert!(
+                !masked.contains("Hunter2") && !masked.contains("abc123def456"),
+                "{masked}"
+            );
         }
     }
 
