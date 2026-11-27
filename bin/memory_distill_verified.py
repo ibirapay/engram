@@ -503,6 +503,7 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
         "possible_hallucinations": invented,
         "secrets_redacted": n_redacted, "public_values_restored": len(values),
         "draft_chars": len(final), "gen_done": done,
+        "gen_empty": not out.strip(),          # the model returned nothing: not a judgment on the cluster
     }
     return final, report
 

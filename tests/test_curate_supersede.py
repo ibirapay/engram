@@ -462,8 +462,14 @@ def test_review_round_holds_and_skip_rules():
     calls = _run_compress(report, body_a=f"deployer 0x{pk}")
     assert calls["distill"] == 0 and "cannot be told apart from a secret" in calls["out"], calls["out"]
     assert pk not in calls["out"]
-    calls = _run_compress(report, umbrella_body="umbrella " + "a1" * 45 + "\n")
+    calls = _run_compress(report, umbrella_body="umbrella " + "A1" * 45 + "\n")      # case-insensitive, like grep -iE
     assert calls["apply"] == 0 and "secret guard would block" in calls["out"], calls["out"]
+    # an empty model reply is not a judgment: no apply, no queue, not remembered
+    d0 = Path(tempfile.mkdtemp())
+    empty = _run_compress({**report, "gen_empty": True}, store=d0, autonomous=False)
+    assert empty["apply"] == 0 and not empty["propose"] and "returned nothing" in empty["out"], empty
+    assert not (d0 / ".curate_skips.json").exists(), "an empty reply was remembered"
+    shutil.rmtree(d0)
 
     # a DEFER verdict (reviewer down) is not remembered: the next run distills again
     d = Path(tempfile.mkdtemp())
@@ -510,6 +516,15 @@ def test_settle_waits_for_a_successful_write():
                               "absorbed": [], "merge_id": "later", "src_sha": sha, "settle_days": 7})
     assert not ok and "write failed" in why, why
     assert prior.is_dir() and (g._dir("undo") / "u1.json").is_file(), "a failed write settled the earlier merge"
+    # a settle that fails AFTER a good write is reported; the merge itself stands
+    save.write_text(f'#!/bin/sh\ncat > "{d}/$1"\n')
+
+    def broken(_d):
+        raise OSError("disk full")
+    g._settle = broken
+    ok, why = g._apply_merge({"umbrella": "b.md", "umbrella_content": doc.replace("body", "merged"), "desc": "d",
+                              "absorbed": [], "merge_id": "later", "src_sha": sha, "settle_days": 7})
+    assert ok and "WARNING could not settle" in why and "disk full" in why, why
     shutil.rmtree(d)
     print("ok — settle happens only after the umbrella write succeeded")
 

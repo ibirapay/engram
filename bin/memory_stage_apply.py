@@ -260,10 +260,10 @@ def _capped(cfg: dict, seconds: float) -> dict:
     """cfg with every backend's timeout lowered to `seconds` (at least 30) and no retries."""
     t = max(30, int(seconds))
     out = dict(cfg)
-    for k in ("llama_cpp", "ollama", "claude"):
+    for k in ("llama_cpp", "ollama", "claude", "ccg"):
         sec = dict(out.get(k) or {})
         sec["timeout_seconds"] = min(int(sec.get("timeout_seconds", t)), t)
-        if k == "claude":
+        if k in ("claude", "ccg"):
             sec["retries"] = 1
         out[k] = sec
     return out
@@ -338,7 +338,8 @@ def main():
     for p in STAGING.glob("*.md"):
         meta, body = parse_frontmatter(p.read_text(errors="ignore"))
         parsed.append((p, meta, body))
-    prov_of = lambda m: (m.get("harvest") or {}).get("provenance", "unverified")
+    harvest_of = lambda m: m.get("harvest") if isinstance(m.get("harvest"), dict) else {}
+    prov_of = lambda m: harvest_of(m).get("provenance", "unverified")
     parsed.sort(key=lambda x: (prov_of(x[1]) != "user-direct", x[0].stat().st_mtime, x[0].name))
     cands = parsed[:max_per] if max_per > 0 else parsed
     decisions = []
@@ -348,7 +349,7 @@ def main():
     max_fails = int(ag.get("llm_max_failures") or 3)
 
     for p, meta, body in cands:
-        h = meta.get("harvest") or {}
+        h = harvest_of(meta)
         prov = h.get("provenance", "unverified")
         conf = float(h.get("confidence") or 0.0)
         sid = h.get("source_session", "?")

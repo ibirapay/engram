@@ -544,8 +544,12 @@ def _apply_merge(params):
     # record the post-merge umbrella hash so undo can refuse if it was edited since
     if (MEM / umbrella).is_file():
         (txn / ".post_sha").write_text(hashlib.sha256((MEM / umbrella).read_bytes()).hexdigest())
+    settle_errors = []
     for d in settling:              # only now: a failed write above left them (and their undo) as they were
-        _settle(d)
+        try:
+            _settle(d)
+        except OSError as e:        # the merge is committed: report it, keep the undo path below
+            settle_errors.append(f"{d.name}: {e}")
     moved, deindex_failed = [], []
     for f in absorbed:                                 # 3. absorbed -> txn dir + de-index
         src = MEM / f
@@ -564,6 +568,8 @@ def _apply_merge(params):
     detail = f"umbrella {umbrella} written; backup in merge-{merge_id} (orig+{moved})"
     if settling:
         detail += f"; settled earlier merge(s) {[d.name for d in settling]} (→ .trash, undo closed)"
+    if settle_errors:
+        detail += f"; WARNING could not settle {settle_errors}"
     if deindex_failed:
         # SUCCESS-WITH-WARNING, deliberately not False: by this point the umbrella is
         # overwritten and the sources are moved. Returning False would make callers skip

@@ -25,8 +25,9 @@ in. Each is now resolved by the pipeline itself.
   written. A younger one still blocks.
 - **Txids, addresses and full hashes reach the umbrella.** Which masked values are public is decided
   by an ALLOWLIST over the whole cluster (`engram_secrets.classify_values`): an EVM address
-  (`0x` + 40 hex), a chain bech32 address, a 64-hex labelled tx/hash/sha256 or a 40-hex labelled
-  commit/rev with no secret word nearby, a lowercase path. The distiller swaps each for a stand-in
+  (`0x` + 40 hex), a chain bech32 address, a 64-hex right after tx/txid/tx hash/block hash/hash or a
+  40-hex right after commit/rev with no secret word anywhere in the paragraph (names split on `_`,
+  `-` and camelCase), a filesystem path (not in a URL, short non-hex segments). The distiller swaps each for a stand-in
   (`«v1»`, with a letter no source uses) in one pass over the scanner's spans; the model, the
   checklist and the appendix only see the stand-in, and the final document gets the original back.
   Everything else stays masked: every sample of the shared secret corpus, a bare 64-hex key, a
@@ -37,8 +38,12 @@ in. Each is now resolved by the pipeline itself.
   for a deterministic reason (bloated, REJECT, malformed, waiting for an earlier merge to settle) is
   remembered in `.curate_skips.json` and retried when one of its files or a deciding setting
   changes, or `auto_curate.retry_days` (7) pass. A down reviewer or a failed write is not remembered.
-- **Reviewed** by an independent Opus 5.5 xhigh pass: 1 HIGH (the first public-value design was a
-  denylist and would have restored real keys) and 7 MEDIUM/LOW, all fixed with tests.
+- **Reviewed** by independent Opus 5.5 xhigh passes. The first found the public-value design was a
+  denylist and would have restored real keys (HIGH); the second broke the first allowlist twice (a
+  label anywhere in the window let "signing key (HMAC-SHA256): <hex>" through; a URL's API key
+  passed as a path). All findings are fixed with tests. Trade-off, measured: 121 of 1125 live
+  memories hold a value that cannot be told apart from a secret, so their clusters are held rather
+  than merged with the value masked away.
 
 ## 1.7.4 — memory frontmatter is read the way it is written
 

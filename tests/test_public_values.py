@@ -22,7 +22,7 @@ def main():
     public = [f"refund tx {TX}", f"refund tx 0x{TX} on polygon", f"sent to {ADDR}", f"to {ADDR.lower()}",
               "commit 6cad780be93835b962af735171fae872f9526503",
               "address bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", "path home/user/src/engram/crates/engramgraph/src/lib",
-              f"Refund tx sent\nin `0x{TX}`"]                       # label wrapped onto the previous line
+              f"txid: `{TX}`", f"block hash **{TX}**", f"tx hash 0x{TX}"]
     for t in public:
         assert es.public_values(t), f"not restored: {t!r}"
     # (text, the part that must never come back as public)
@@ -36,7 +36,26 @@ def main():
               ("QWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo0NTY3ODkwREU=", "QWJj"),
               ("secret at home/user/src/engram/crates/engramgraph/src/lib", "home/user"),
               # the label on the previous line belongs to the value right after it, not this one
-              (f"commit 6cad780be93835b962af735171fae872f9526503 then\n{PK[:40]} unlabelled", PK[:40])]
+              (f"commit 6cad780be93835b962af735171fae872f9526503 then\n{PK[:40]} unlabelled", PK[:40]),
+              # review round 2: a label that is not adjacent, or a secret word anywhere in the paragraph
+              (f"Webhook signing key (HMAC-SHA256): {PK}", PK),
+              (f"The PRIVATE_KEY for the tx relayer is {PK}", PK),
+              (f"Boltz reverse swap, claim tx pending\npreimage {PK}", PK),
+              (f'{{"block": 840000, "signer_private_key": "{PK}"}}', PK),
+              (f"**Hot wallet private key** (never share):\nsigns every refund tx\n{PK}", PK),
+              (f"GitHub webhook HMAC-SHA1 key: {PK[:40]}", PK[:40]),
+              (f"Refund tx sent\nin `0x{TX}`", TX),              # label on the line above: held, by design
+              # a key inside a URL path is not a "path"
+              (f"RPC: https://black-sly-frost.quiknode.pro/{PK[:40]}/", PK[:40]),
+              (f"RPC https://rpc.ankr.com/eth/{PK}", PK),
+              ("rpc https://api.example.com/key/abcdefghijklmnopqrstuvwxyzabcdefghij/x", "abcdefghij"),
+              # one case per guard, each with no other guard to catch it
+              (f"refund tx\n{TX}", TX),                                   # a label must be on the SAME line
+              (f"hotWalletKey stored; refund tx {TX}", TX),                # camelCase is split before matching
+              (f"The key for refund tx {TX}", TX),                         # "key" alone is a secret word
+              ("see https://api.example.com/v1/abcdefgh/ijklmnop/qrstuvwx/yz0123456789abcd", "yz0123"),  # in a URL
+              ("dir abcdefghijklmnopqrstuvwxyzabcd/xyz/files/x", "abcdefghij"),                # a 24+ segment
+              ("dir store/4c0883a69102937d62/files/archive/xy", "4c0883")]                    # a hex segment
     for text, part in secret:
         vals = es.public_values(text)
         assert not any(part in v for v in vals), f"restored: {text!r} -> {vals}"
@@ -51,8 +70,29 @@ def main():
     text = f"refund tx {TX}\nsecret: {TX}"
     out, n = es.swap_values(text, {TX}, lambda v: "«v1»")
     assert out == "refund tx «v1»\n«redacted-secret»" and n == 1, out
+    # a short named secret no credential covers is held (the merge would mask it away); the
+    # originSessionId metadata a merge drops on purpose is not
+    pub, held = es.classify_values(["db password: hunter2hunter"])
+    assert not pub and held, (pub, held)
+    pub, held = es.classify_values(["originSessionId: 5f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"])
+    assert not held, held
     print("ok — public values by allowlist: corpus secrets, bare keys and base64 never restored")
+
+
+def writer_guard_parity():
+    """WRITER_BLOCK_RE must block exactly what save_memory.sh's guard (grep -iE) blocks."""
+    import re, subprocess
+    ere = re.search(r"^_MEMORY_SECRET_ERE='(.*)'$", (ROOT / "bin" / "memory_lib.sh").read_text(), re.M).group(1)
+    corpus = json.loads((ROOT / "tests" / "fixtures" / "secret_samples.json").read_text())
+    samples = corpus["secret"] + corpus["clean"] + [
+        "A1" * 45, "a1" * 45, "token: 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "plain prose",
+        f"refund tx {TX}", "PASSWORD = Hunter2Hunter2"]
+    for s in samples:
+        shell = subprocess.run(["grep", "-qiE", "--", ere], input=s, text=True).returncode == 0
+        assert shell == bool(es.WRITER_BLOCK_RE.search(s)), f"writer guard drift on {s[:40]!r}: shell={shell}"
+    print("ok — the writer-guard pattern matches save_memory.sh's grep -iE on every sample")
 
 
 if __name__ == "__main__":
     main()
+    writer_guard_parity()

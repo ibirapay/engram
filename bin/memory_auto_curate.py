@@ -467,6 +467,10 @@ def main():
         # Losslessness is provided by REVERSIBILITY (sources -> quarantine), not by
         # appending everything. sentence_coverage is recorded, not gated.
         final, report = mdv.distill_cluster(umbrella.stem, files, cfg=cfg, preserve_sources=False)
+        if report.get("gen_empty"):
+            # everything would land in the appendix and read as BLOATED; it says nothing about the
+            # cluster, so it is neither remembered nor queued: the next run tries again
+            print(f"· {files}: HOLD (the model returned nothing) — retried next run"); continue
         # share of the doc THIS rewrite left to the appendix; carried lines are out of both sides
         ratio = report.get("appendix_fresh_chars", 0) / max(
             1, (report.get("draft_chars") or 0) - report.get("appendix_carried_chars", 0))
@@ -485,8 +489,9 @@ def main():
         if lost:
             print(f"· {files}: HOLD (umbrella lost {len(lost)} public value(s): txid, address or "
                   f"full hash) — skipping"); remember("umbrella lost public values"); continue
-        # The writer (save_memory.sh) blocks 80+ hex; refuse here instead of failing the write.
-        if re.search(r"[0-9a-f]{80,}", doc):
+        # The writer (save_memory.sh) would block this umbrella: refuse here instead of failing the
+        # write (and retrying every run). Same pattern, case-insensitive like its grep -iE.
+        if engram_secrets.WRITER_BLOCK_RE.search(doc):
             print(f"· {files}: HOLD (the memory writer's secret guard would block this umbrella) — skipping")
             remember("writer guard would block"); continue
         absorbed = [f for f in files if f != umbrella.name]

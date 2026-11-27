@@ -53,7 +53,7 @@ def concrete_tokens():
         "---\nname: a\n---\n" + "\n".join(isolated) + "\n"
         "Pinned commit `6cad780be93835b962af735171fae872f9526503` for good.\n"
         "Unlabelled `ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12` here.\n"
-        "Session key `sk-abcdefghijklmnopqrstuvwxyz123456` rotated.\n"
+        "\nSession key `sk-abcdefghijklmnopqrstuvwxyz123456` rotated.\n"   # own paragraph: "key" holds its neighbours
         "- Mount /srv/data/x, run `podman ps -a`, then `podman logs x`.\n"
         # over 80 chars in backticks is a sentence, kept as prose: never restated as a token
         "The app said `Depósito na rede tron só é executado pela Mesa OTC, ligue a Mesa OTC antes de tentar de novo`.\n")

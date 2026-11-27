@@ -158,10 +158,19 @@ def test_review_round_graduation():
     # an unreadable frontmatter is held for a later reader fix, not expired
     decs, staging = _run([], apply=True, raw={"m_bad.md": "---\nname: m\ndescription: \"open quote\nharvest:\n---\nb\n"})
     assert [x["action"] for x in decs] == ["hold"] and (staging / "m_bad.md").exists(), decs
+    # a harvest block that is not a mapping is held, it never aborts the run
+    decs, _ = _run([("p_ok.md", "assistant", 0.9, "tag-p", 1)],
+                   raw={"q_scalar.md": "---\nname: q\ndescription: d\nharvest: quarantined\n---\nb\n"})
+    assert sorted(x["action"] for x in decs) == ["hold", "would-graduate"], decs
     # each model call is capped to what is left of the budget (the backend timeout can be an hour)
     _run([("n_a.md", "assistant", 0.9, "tag-n", 1)], ag={"llm_budget_seconds": 300},
          cfg_extra={"llama_cpp": {"timeout_seconds": 3600}})
     assert _run.cfgs and _run.cfgs[0]["llama_cpp"]["timeout_seconds"] == 300, _run.cfgs
+    sys.modules["memory_ai"] = types.ModuleType("memory_ai")
+    sp = importlib.util.spec_from_file_location("sa_cap", ROOT / "bin" / "memory_stage_apply.py")
+    sa = importlib.util.module_from_spec(sp); sp.loader.exec_module(sa)
+    capped = sa._capped({"ccg": {"timeout_seconds": 3600, "retries": 3}}, 100)
+    assert capped["ccg"] == {"timeout_seconds": 100, "retries": 1}, capped
     # the secret scan runs before the model: a 64-hex body never reaches it
     secret_body = "---\nname: o\ndescription: tag-o\nharvest:\n  provenance: assistant\n  confidence: 0.9\n---\n" \
                   + "key " + "ab" * 32 + "\n"
