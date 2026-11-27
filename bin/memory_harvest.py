@@ -426,11 +426,11 @@ def main():
     max_chars = 24000
     if "--max-chars" in args:
         max_chars = int(args[args.index("--max-chars") + 1])
-    # Backfill guard: each invocation harvests at most this many transcripts that
-    # actually have new content (one slow LLM call each). The watermark means the
-    # next run picks up where this left off, so a 102-transcript backfill spreads
-    # over nights instead of pinning the 8GB host for hours in one go.
-    max_files = int((cfg.get("harvest") or {}).get("max_files_per_run", 4))
+    # Transcripts per run that have new content; 0 (the default since 1.9.0) = all of them. A
+    # cap of 4, one window each, with a daily timer, left 430 transcripts (8.7 M chars) behind
+    # (2026-11-26): every night now reads everything new. Set it only on a host that cannot
+    # spend the model time.
+    max_files = int((cfg.get("harvest") or {}).get("max_files_per_run", 0))
     if "--max-files" in args:
         max_files = int(args[args.index("--max-files") + 1])
     dry_run = "--dry-run" in args
@@ -474,16 +474,28 @@ def main():
             off = int(state["files"].get(t.name, {}).get("offset", 0))
             if off >= t.stat().st_size:
                 continue
-        if processed >= max_files:
+        if max_files > 0 and processed >= max_files:
             break
-        try:
-            res = harvest_transcript(t, role, max_chars, state, use_watermark, dry_run)
-        except Exception as e:
-            print(f"[harvest] {t.name}: ERROR {e}", file=sys.stderr)
-            continue
-        summary.append(res)
-        if res.get("segments"):
-            processed += 1
+        # Drain the transcript: one model call per window of max_chars, until its watermark
+        # reaches the end. Progress is saved after every window, so a run killed hours in
+        # loses one window, not the night. A dry run previews one window (it moves nothing).
+        counted = False
+        while True:
+            before = int(state["files"].get(t.name, {}).get("offset", 0))
+            try:
+                res = harvest_transcript(t, role, max_chars, state, use_watermark, dry_run)
+            except Exception as e:
+                print(f"[harvest] {t.name}: ERROR {e}", file=sys.stderr)
+                break
+            summary.append(res)
+            if res.get("segments") and not counted:
+                processed += 1; counted = True
+            if use_watermark and not dry_run:
+                save_state(state)
+            after = int(state["files"].get(t.name, {}).get("offset", 0))
+            if (not use_watermark or dry_run or res.get("error") or res.get("skipped")
+                    or after <= before or after >= t.stat().st_size):
+                break
 
     if use_watermark and not dry_run:
         save_state(state)

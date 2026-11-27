@@ -252,7 +252,7 @@ light_pass:
 # The `enabled` flags below are LIGHTS-OUT switches. They ship OFF: the pipeline
 # runs every stage in DRY-RUN so you can watch it before granting unattended writes.
 harvest:
-  max_files_per_run: 4
+  max_files_per_run: 0
   idle_minutes: 30              # only harvest a chat idle >= this (finished session); avoids paying tokens on an active chat
 
 auto_graduate:                     # stage ②/④
@@ -263,7 +263,7 @@ auto_graduate:                     # stage ②/④
   dedup_threshold: 0.86
   injection_check: true
   staging_ttl_days: 14
-  max_per_run: 8
+  max_per_run: 0
 
 # Deterministic auto-consolidation (compress-then-quarantine). Merges near-duplicate
 # memories (Qdrant ANN cosine >= merge_threshold, SAME type) into a compressed umbrella;
@@ -275,7 +275,7 @@ auto_graduate:                     # stage ②/④
 auto_curate:
   enabled: false
   merge_threshold: 0.92            # cosine >= this to auto-merge (high = only true near-dups)
-  max_merges_per_run: 2
+  max_merges_per_run: 0
   review_gate: self                # self | human. 'self' = engram's own generate backend
                                    # reviews (role verify — the same model path harvest/distill use).
                                    # 'human' = every merge goes to the Telegram approval queue.

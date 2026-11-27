@@ -75,7 +75,7 @@ AG_DEFAULTS = {
     # cap of 8, in name order, let a few never-resolving holds take 7 slots every run: one
     # candidate a day was really evaluated against an intake of 150-250 (2026-11-26).
     "max_per_run": 0,
-    "llm_budget_seconds": 1800,             # model time per run for injection checks (daemon task timeout is 3600)
+    "llm_budget_seconds": 0,                # model time per run for injection checks; 0 = no limit (default since 1.9.0)
     "llm_max_failures": 3,                  # consecutive model failures that stop the model for this run
 }
 

@@ -410,7 +410,11 @@ def test_held_clusters_take_no_slot():
     assert calls["distill"] == 1 and calls["apply"] == 1, f"a held cluster used up the cap: {calls}"
     calls = _run_compress(report, cap=1, more={"project_c.md": "gamma fact", "project_d.md": "delta fact"})
     assert calls["distill"] == 1 and calls["apply"] == 1, f"the cap no longer bounds merge attempts: {calls}"
-    print("ok — a held cluster takes no slot; the cap still bounds attempts")
+    # with no cap (the default since 1.9.0) every clean cluster is attempted
+    calls = _run_compress(report, more={"project_c.md": "gamma fact", "project_d.md": "delta fact",
+                                        "project_e.md": "epsilon fact", "project_f.md": "zeta fact"})
+    assert calls["distill"] == 3 and calls["apply"] == 3, f"the default capped the run: {calls}"
+    print("ok — a held cluster takes no slot; the cap still bounds attempts; no cap by default")
 
 
 def test_a_credential_hold_never_prints_the_credential():

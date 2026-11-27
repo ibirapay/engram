@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.9.0 — every night reads everything new
+
+A full run on 2026-11-26 found the encode stage 430 transcripts (8.7 M chars) behind: harvest read
+4 transcripts a run, one window each, on a daily timer. The graph synced 25 memories a night, and
+the daemon killed any task after an hour. Every cap now defaults to 0 = none:
+
+- **Harvest** reads every transcript with new content (`harvest.max_files_per_run: 0`) and each to
+  its end in one run, one model call per window; progress is saved after every window, so a run cut
+  short loses one window, not the night. A chat still being written is skipped (`idle_minutes`).
+- **Graduation** has no model-time budget (`auto_graduate.llm_budget_seconds: 0`).
+- **Curate** attempts every cluster (`auto_curate.max_merges_per_run: 0`).
+- **The daemon** has no per-task timeout (`daemon.task_timeout_seconds`, 0) and the graph syncs
+  every pending memory (`daemon.graph_sync_limit`, 0); each stage bounds its own model calls.
+
+Every cap still applies when set. The first night on a store with a backlog runs for hours; after
+that a night processes one day.
+
 ## 1.8.1 — graduation lets public values through
 
 - The graduation secret scan quarantined any candidate with a long hex or base64 run, so a fact
