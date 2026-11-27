@@ -293,7 +293,7 @@ skill_autoinstall:                 # stage ⑤
   enabled: false                   # OFF by default (kill-switch: touch ~/.claude/skills/auto/.disabled)
   require_user_direct: true        # only user-direct memories are skill-eligible
   adversarial_review: true         # injection expert sanity pass (advisory)
-  max_per_run: 0
+  max_per_run: 1
   max_candidates_per_run: 3
 
 # Per-session trigger: a Stop hook launches ONE background curate subagent when a
