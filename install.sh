@@ -137,31 +137,114 @@ opencode_register() {
   else
     warn "opencode mcp add failed — add an 'engram' local server running $CLAUDE/rust/engram-mcp to opencode.json"
   fi
-  mkdir -p "$cfg/plugins" && install -m 0644 "$REPO/integrations/opencode/engram-recall.ts" "$cfg/plugins/engram-recall.ts" \
-    && say "installed the opencode recall plugin (restart opencode to load it)"
+  # recall on every prompt: our plugin, unless another plugin already runs engram-recall-hook (two
+  # would inject the memories twice)
+  mkdir -p "$cfg/plugins"
+  if grep -lqs "engram-recall-hook" "$cfg"/plugins/*.ts 2>/dev/null && [[ ! -f "$cfg/plugins/engram-recall.ts" ]]; then
+    say "an opencode plugin already runs engram-recall-hook — not adding a second one"
+  else
+    install -m 0644 "$REPO/integrations/opencode/engram-recall.ts" "$cfg/plugins/engram-recall.ts" \
+      && say "installed the opencode recall plugin (restart opencode to load it)"
+  fi
+  # the same skills and commands as Claude Code (links, so an update reaches both)
+  local sk cmd
+  for sk in "$CLAUDE"/skills/memory-*/; do
+    [[ -d "$sk" ]] || continue
+    mkdir -p "$cfg/skills"; ln -sfn "${sk%/}" "$cfg/skills/$(basename "$sk")"
+  done
+  for cmd in "$CLAUDE"/commands/memory-*.md; do
+    [[ -f "$cmd" ]] || continue
+    mkdir -p "$cfg/command"; ln -sfn "$cmd" "$cfg/command/$(basename "$cmd")"
+  done
+  # how to use (and write to) the shared memory
+  local rc=0
+  managed_block "$cfg/AGENTS.md" "$REPO/integrations/opencode/AGENTS.engram.md" || rc=$?
+  case $rc in
+    0) say "opencode AGENTS.md: engram memory instructions up to date" ;;
+    2) say "opencode AGENTS.md already has a hand-written engram section — left as is" ;;
+  esac
 }
 
 # hermes_soul — teach Hermes how to use the shared memory. Managed block between markers, so
 # a re-run updates it in place; an existing hand-written engram section is left alone.
+# managed_block <file> <snippet> — keep <snippet> in <file> between engram markers, so a re-run
+# updates it in place. A file that already has a hand-written "Shared memory (engram)" section is
+# left alone (the owner wrote it; the installer does not fight it).
+managed_block() {
+  local file="$1" snippet="$2"
+  [[ -f "$snippet" ]] || return 1
+  mkdir -p "$(dirname "$file")"; touch "$file"
+  if ! grep -q '<!-- engram:begin -->' "$file" && grep -q 'Shared memory (engram)' "$file"; then
+    return 2
+  fi
+  python3 - "$file" "$snippet" <<'PY'
+import re, sys
+path, snip = sys.argv[1], sys.argv[2]
+block = "<!-- engram:begin -->\n" + open(snip).read().rstrip() + "\n<!-- engram:end -->\n"
+s = open(path).read()
+pat = re.compile(r"<!-- engram:begin -->.*?<!-- engram:end -->\n?", re.S)
+s = pat.sub(lambda _: block, s) if pat.search(s) else (s.rstrip("\n") + ("\n\n" if s.strip() else "") + block)
+open(path, "w").write(s)
+PY
+}
+
+# hermes_soul — teach Hermes how to use the shared memory (SOUL.md managed block).
 hermes_soul() {
   [[ "$WANT_HERMES" == no ]] && return 0
   command -v hermes >/dev/null || return 0
-  local soul="${HERMES_HOME:-$HOME/.hermes}/SOUL.md" snippet="$REPO/integrations/hermes/SOUL.engram.md"
-  [[ -f "$snippet" ]] || return 0
-  mkdir -p "$(dirname "$soul")"; touch "$soul"
-  if ! grep -q '<!-- engram:begin -->' "$soul" && grep -q 'Shared memory (engram)' "$soul"; then
-    say "SOUL.md already has a hand-written engram section — left as is"; return 0
-  fi
-  python3 - "$soul" "$snippet" <<'PY'
-import re, sys
-soul, snip = sys.argv[1], sys.argv[2]
-block = "<!-- engram:begin -->\n" + open(snip).read().rstrip() + "\n<!-- engram:end -->\n"
-s = open(soul).read()
-pat = re.compile(r"<!-- engram:begin -->.*?<!-- engram:end -->\n?", re.S)
-s = pat.sub(lambda _: block, s) if pat.search(s) else (s.rstrip("\n") + ("\n\n" if s.strip() else "") + block)
-open(soul, "w").write(s)
+  local rc=0
+  managed_block "${HERMES_HOME:-$HOME/.hermes}/SOUL.md" "$REPO/integrations/hermes/SOUL.engram.md" || rc=$?
+  case $rc in
+    0) say "SOUL.md: engram memory instructions up to date" ;;
+    2) say "SOUL.md already has a hand-written engram section — left as is" ;;
+  esac
+}
+
+# hermes_recall_hook — automatic recall for Hermes, like Claude Code's UserPromptSubmit hook: a
+# `pre_llm_call` shell hook whose output Hermes appends to the user message. Registered once in
+# ~/.hermes/config.yaml (validated as YAML before and after; nothing is written on a doubt). Hermes
+# asks for a one-time consent before running a new hook; `hermes --accept-hooks` gives it.
+hermes_recall_hook() {
+  [[ "$WANT_HERMES" == no ]] && return 0
+  command -v hermes >/dev/null || return 0
+  local conf="${HERMES_HOME:-$HOME/.hermes}/config.yaml" hook="$CLAUDE/hermes-recall-hook.py"
+  install -m 0755 "$REPO/integrations/hermes/engram-recall-hook.py" "$hook" || return 0
+  [[ -f "$conf" ]] || { mkdir -p "$(dirname "$conf")"; : > "$conf"; }
+  local out
+  out=$(python3 - "$conf" "$hook --slug $SLUG" <<'PY'
+import re, sys, yaml
+path, command = sys.argv[1], sys.argv[2]
+text = open(path).read()
+before = yaml.safe_load(text) or {}
+hooks = (before.get("hooks") or {}) if isinstance(before, dict) else {}
+if any(isinstance(h, dict) and str(h.get("command", "")).split()[:1] == command.split()[:1]
+       for h in (hooks.get("pre_llm_call") or [])):
+    print("present"); sys.exit(0)
+item = f"    - command: {command}\n      timeout: 20\n"
+lines = text.splitlines(keepends=True)
+top = next((i for i, l in enumerate(lines) if re.match(r"hooks:\s*(#.*)?$", l)), None)
+if top is None:
+    new = text.rstrip("\n") + ("\n" if text.strip() else "") + "hooks:\n  pre_llm_call:\n" + item
+else:
+    sub = next((i for i in range(top + 1, len(lines)) if re.match(r"  pre_llm_call:\s*(#.*)?$", lines[i])), None)
+    end = next((i for i in range(top + 1, len(lines)) if lines[i].strip() and not lines[i].startswith((" ", "#"))), len(lines))
+    if sub is not None and sub < end:
+        lines.insert(sub + 1, item)
+    else:
+        lines.insert(top + 1, "  pre_llm_call:\n" + item)
+    new = "".join(lines)
+after = yaml.safe_load(new) or {}
+got = ((after.get("hooks") or {}).get("pre_llm_call") or [])
+assert any(h.get("command") == command for h in got), "registration did not land"
+assert {k: v for k, v in after.items() if k != "hooks"} == {k: v for k, v in before.items() if k != "hooks"}, "other keys changed"
+open(path, "w").write(new)
+print("added")
 PY
-  say "SOUL.md: engram memory instructions up to date"
+) || { warn "could not register the Hermes recall hook — add a pre_llm_call hook running '$hook --slug $SLUG' to $conf"; return 0; }
+  case "$out" in
+    added) say "registered the Hermes recall hook (pre_llm_call); approve it once: hermes --accept-hooks" ;;
+    present) say "the Hermes recall hook is already registered" ;;
+  esac
 }
 
 # ---- prereqs ----
@@ -691,6 +774,7 @@ fi
 # Other agents: opencode and Hermes get the same recall (and their sessions are harvested).
 hermes_register engram "$CLAUDE/rust/engram-mcp" --slug "$SLUG"
 hermes_soul
+hermes_recall_hook
 opencode_register
 
 # ---- vector venv + MCP (optional Qdrant index) ----

@@ -13,8 +13,8 @@ your agents remember your projects, your infra, and your preferences across sess
 | Agent | Recall (MCP tools) | Automatic recall on every prompt | Learns from its sessions (harvest) | Installer |
 |---|---|---|---|---|
 | **Claude Code** | `engram-rust` | `UserPromptSubmit` hook | transcripts (`~/.claude/projects`) | registers MCP, hooks and `/memory-*` commands |
-| **opencode** | `engram` | `engram-recall` plugin (`integrations/opencode`) | sessions from `opencode.db` | `opencode mcp add` + the plugin |
-| **Hermes Agent** | `engram` | the model recalls on its own, taught by a `SOUL.md` block (`integrations/hermes`) | sessions from `~/.hermes/state.db` | `hermes mcp add` + the `SOUL.md` block |
+| **opencode** | `engram` | `engram-recall` plugin (`integrations/opencode`), plus an `AGENTS.md` block on how to save | sessions from `opencode.db` | `opencode mcp add`, the plugin, the `memory-*` skills and commands, the `AGENTS.md` block |
+| **Hermes Agent** | `engram` | `pre_llm_call` hook (`integrations/hermes/engram-recall-hook.py`), plus a `SOUL.md` block on when to recall and how to save | sessions from `~/.hermes/state.db` | `hermes mcp add`, the hook (one-time consent: `hermes --accept-hooks`) and the `SOUL.md` block |
 
 Every agent reads and writes the same Markdown store through the same Rust recall, and
 each one's conversations feed the same encode, consolidate, fixate pipeline. Missing an

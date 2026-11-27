@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.9.1 — every engram function for all three agents
+
+- **Hermes gets automatic recall.** `integrations/hermes/engram-recall-hook.py` is a `pre_llm_call`
+  shell hook: Hermes sends the turn, the adapter hands the user's message to `engram-recall-hook`
+  (with `--slug <store>`, so the store does not depend on where Hermes runs) and returns the
+  `<relevant-memory>` block as `{"context": ...}`, which Hermes appends to the user message. It
+  fails open. `install.sh` registers it once under `hooks:` in `~/.hermes/config.yaml` (checked as
+  YAML before and after); Hermes asks for its usual one-time consent (`hermes --accept-hooks`).
+- **opencode gets the rest.** The installer links the `memory-*` skills and commands Claude Code has
+  into `~/.config/opencode/{skills,command}`, and keeps an `AGENTS.md` block on when to recall and
+  how to save (`integrations/opencode/AGENTS.engram.md`). It no longer adds its recall plugin next
+  to a plugin that already runs `engram-recall-hook` (the memories would arrive twice).
+- `managed_block` is the one mechanism for the agents' instruction files (Hermes `SOUL.md`, opencode
+  `AGENTS.md`): updated in place between markers, a hand-written engram section left alone.
+
 ## 1.9.0 — every night reads everything new
 
 A full run on 2026-11-26 found the encode stage 430 transcripts (8.7 M chars) behind: harvest read
