@@ -411,10 +411,13 @@ def main():
         # macaroon a user pasted into chat. Quarantine (reviewable) rather than write a secret.
         # Public values (an EVM address, a chain address, a path: engram_secrets.classify_values)
         # are not secrets: a candidate holding only those used to be quarantined, so contract
-        # addresses never graduated. Anything held or a credential still quarantines.
-        text = f"{desc}\n{body}"
-        _public, held = engram_secrets.classify_values([text])
-        if held or engram_secrets.credentials(text):
+        # addresses never graduated. ANY other masked match still quarantines (curation drops
+        # originSessionId on purpose; graduation writes the body as it is, so no exception here),
+        # and so does a credential. The name is scanned too: it becomes the file name.
+        text = f"{meta.get('name', '')}\n{desc}\n{body}"
+        public, _held = engram_secrets.classify_values([text])
+        # (credentials() is a subset of SECRET_RE today; kept as defense in depth if they drift)
+        if engram_secrets.swap_values(text, public, str)[1] or engram_secrets.credentials(text):
             if apply:
                 QUAR.mkdir(parents=True, exist_ok=True)
                 p.rename(QUAR / p.name)
