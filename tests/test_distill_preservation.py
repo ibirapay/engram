@@ -51,7 +51,9 @@ def concrete_tokens():
     }
     (tmp / "reference_a.md").write_text(
         "---\nname: a\n---\n" + "\n".join(isolated) + "\n"
-        "Pinned `6cad780be93835b962af735171fae872f9526503` for good.\n"
+        "Pinned commit `6cad780be93835b962af735171fae872f9526503` for good.\n"
+        "Unlabelled `ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12` here.\n"
+        "\nSession key `sk-abcdefghijklmnopqrstuvwxyz123456` rotated.\n"   # own paragraph: "key" holds its neighbours
         "- Mount /srv/data/x, run `podman ps -a`, then `podman logs x`.\n"
         # over 80 chars in backticks is a sentence, kept as prose: never restated as a token
         "The app said `Depósito na rede tron só é executado pela Mesa OTC, ligue a Mesa OTC antes de tentar de novo`.\n")
@@ -70,8 +72,11 @@ def concrete_tokens():
         assert tok in final, f"concrete token lost in a rewrite: {tok}"
     assert rep["final_fact_coverage"] == 1.0, rep
     appendix = final.split("### Hard facts", 1)[1]
-    # a masked secret is not a fact to keep: its line holds nothing else, so it is not restated
-    assert "Pinned" not in appendix, "the redaction placeholder was kept as a fact"
+    # a bare hex is never restored, labelled or not (a tx hash and a key are the same shape)
+    assert "6cad780be93835b962af735171fae872f9526503" not in final, "a bare 40-hex was restored"
+    assert "ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12" not in final, "an unlabelled 40-hex was restored"
+    # a masked credential is not a fact to keep: its line holds nothing else, so it is not restated
+    assert "Session key" not in appendix and "sk-abcdef" not in final, "a credential or its placeholder was kept"
     # the number the curate gate reads is the size of the entries actually written (none carried)
     entries = [ln for ln in appendix.splitlines() if ln.startswith("- ")]
     assert rep["appendix_fresh_chars"] == sum(len(ln) + 1 for ln in entries), rep
@@ -255,6 +260,71 @@ def third_review_findings():
     print("ok — partial-rule lines, hyphen-glued env vars, subsection labels and fenced YAML")
 
 
+def public_values_round_trip():
+    """Txids, addresses and full hashes: the model only ever sees a stand-in «vN», and the umbrella
+    gets the original back, verbatim. A value the model dropped returns through the appendix; a
+    stand-in the model invented is not restored; a credential stays masked."""
+    tmp = ROOT / "tests" / "_tmp_values"; tmp.mkdir(exist_ok=True); mdv.MEM = tmp
+    txid = "ab" * 32                               # a bare hex: never public, stays masked
+    payee = "0x" + "1f" * 20                       # two addresses: public, restored
+    addr = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+    token = "ghp_" + "Z9y8X7w6V5u4T3s2R1q0" * 2
+    (tmp / "reference_a.md").write_text(
+        f"---\nname: a\n---\nRefund sent in tx {txid} to {payee}.\nPayer address is {addr}.\n"
+        f"Deploy token GITHUB_TOKEN={token} lives in the vault.\n")
+    (tmp / "reference_b.md").write_text(f"---\nname: b\n---\nSame refund to {payee}.\n")
+    seen = {}
+
+    def model(prompt, cfg):
+        seen["prompt"] = prompt
+        # keeps the payee's stand-in, drops the address, invents a stand-in and a hash of its own
+        return (f"Refund went out to «v1» (also «v9»). Hash {'cd' * 32}.", "stop", 0.0)
+    mdv.ollama_stream = model
+    final, rep = mdv.distill_cluster("reference", ["reference_a.md", "reference_b.md"])
+    assert txid not in seen["prompt"] and addr not in seen["prompt"] and token not in seen["prompt"], \
+        "a value reached the model"
+    assert seen["prompt"].count("«v1»") == 2, "the same value must get the same stand-in in every file"
+    assert f"Refund went out to {payee}" in final, "the kept stand-in was not restored"
+    assert txid not in final, "a bare 64-hex was restored"
+    assert f"Payer address is {addr}." in final, "a dropped value did not come back through the appendix"
+    assert "«v9»" in final and "cd" * 32 not in final, "an invented stand-in or hash was restored"
+    assert token not in final, "a credential was restored"
+    assert rep["public_values_restored"] == 2 and rep["final_fact_coverage"] == 1.0, rep      # payee + addr
+    # the contract of public_values: a run that is part of a credential is never "public", even if
+    # a future SECRET_RE alternative matched only the value part of it
+    import engram_secrets as es
+    real = es.credentials
+    es.credentials = lambda t: [f"x{payee}x"]      # the matched run includes its 0x
+    try:
+        assert es.public_values(f"to {payee}") == set(), "a run inside a credential was treated as public"
+    finally:
+        es.credentials = real
+    assert es.public_values(f"to {payee}") == {payee}
+    shutil.rmtree(tmp)
+    print("ok — public values: stand-ins for the model, originals in the umbrella, credentials masked")
+
+
+def stand_in_never_collides_with_text():
+    """A source that already says «v1» (a memory about this very feature) keeps its text: the
+    stand-ins switch to a letter no source uses, and only they are restored."""
+    tmp = ROOT / "tests" / "_tmp_collide"; tmp.mkdir(exist_ok=True); mdv.MEM = tmp
+    tx = "0x" + "cd" * 20                          # an address (public)
+    (tmp / "reference_a.md").write_text("---\nname: a\n---\nThe model sees «v1» instead of a txid.\n")
+    (tmp / "reference_b.md").write_text(f"---\nname: b\n---\nRefund to {tx} went out.\n")
+    seen = {}
+
+    def model(prompt, cfg):
+        seen["prompt"] = prompt
+        return ("Umbrella: the model sees «v1» instead of a txid.", "stop", 0.0)   # echoes the literal
+    mdv.ollama_stream = model
+    final, rep = mdv.distill_cluster("reference", ["reference_a.md", "reference_b.md"])
+    assert "«w1»" in seen["prompt"] and tx[2:] not in seen["prompt"], seen["prompt"]
+    assert "the model sees «v1» instead of a txid." in final, "the literal text was rewritten"
+    assert f"Refund to {tx} went out." in final, "the value was not restored"
+    shutil.rmtree(tmp)
+    print("ok — stand-ins use a letter no source uses; literal «v1» text survives")
+
+
 if __name__ == "__main__":
     main()
     concrete_tokens()
@@ -262,3 +332,5 @@ if __name__ == "__main__":
     identifiers_fences_and_frontmatter()
     second_review_findings()
     third_review_findings()
+    public_values_round_trip()
+    stand_in_never_collides_with_text()

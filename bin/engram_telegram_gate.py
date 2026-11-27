@@ -405,6 +405,9 @@ def _apply_merge_undo(params):
     # FRESHNESS: refuse if the umbrella was legitimately edited since the merge —
     # restoring the stale original would silently erase newer facts.
     post = txn / ".post_sha"
+    if post.is_file() and not (MEM / umbrella).is_file():
+        # absorbed by a later merge (or deleted): restoring would duplicate what lives elsewhere now
+        return False, f"umbrella {umbrella} is gone since the merge — undo refused"
     if post.is_file() and (MEM / umbrella).is_file():
         live = hashlib.sha256((MEM / umbrella).read_bytes()).hexdigest()
         if live != post.read_text().strip():
@@ -429,6 +432,27 @@ def _apply_merge_undo(params):
     try: txn.rmdir()                                   # tidy the txn dir only when fully restored
     except OSError: pass
     return True, f"restored {restored} (umbrella original + absorbed)"
+
+
+SETTLE_DAYS = 7
+
+
+def _settle(d: Path) -> None:
+    """Accept an earlier merge for good: its backup moves to .trash/ (what sweep() does when
+    probation ends; recoverable there for 90 days) and its Telegram UNDO record closes, so a late
+    tap answers "merge backup gone" instead of restoring over the newer merge."""
+    import shutil
+    trash = MEM / ".trash"; trash.mkdir(parents=True, exist_ok=True)
+    mid = d.name[len("merge-"):]
+    # close the undo record FIRST: if the move below fails, a late tap must still not restore
+    for u in _dir("undo").glob("*.json"):
+        try:
+            rec = json.loads(u.read_text())
+        except Exception:
+            continue
+        if rec.get("op") == "merge_undo" and (rec.get("params") or {}).get("merge_id") == mid:
+            u.rename(_dir("undone") / u.name)
+    shutil.move(str(d), str(trash / f"{d.name}-{_now()}"))
 
 
 def _apply_merge(params):
@@ -485,13 +509,21 @@ def _apply_merge(params):
     # an un-undone merge. Checking only the umbrella let a file be absorbed by one merge
     # and act as umbrella in another; undoing those out of order restores an intermediate
     # version over the original and drops the remaining backup.
+    # ...unless that earlier merge is older than settle_days: nobody undid it in that window,
+    # so it is accepted for good (SETTLED, below) instead of locking these memories out of
+    # curation until probation ends (18 live memories were locked on 2026-11-26).
+    settle_s = float(params.get("settle_days", SETTLE_DAYS)) * 86400
+    settling = []
     for d in quar.glob("merge-*"):
         if d == txn:
             continue
         for f in {umbrella, *absorbed}:
             if (d / f"{f}.orig").is_file() or (d / f).is_file():
+                if _now() - d.stat().st_mtime >= settle_s:
+                    settling.append(d); break
                 return False, (f"{f} is referenced by an outstanding merge backup "
-                               f"({d.name}) — undo that first; nothing changed")
+                               f"({d.name}) — undo that first, or it settles after "
+                               f"{settle_s / 86400:g} days; nothing changed")
     # EXCLUSIVE: never reuse a transaction dir. merge_id is content-derived, so an
     # existing one means an unresolved backup from a previous merge — writing into it
     # would overwrite that .orig and destroy the earlier undo.
@@ -516,6 +548,12 @@ def _apply_merge(params):
     # record the post-merge umbrella hash so undo can refuse if it was edited since
     if (MEM / umbrella).is_file():
         (txn / ".post_sha").write_text(hashlib.sha256((MEM / umbrella).read_bytes()).hexdigest())
+    settle_errors = []
+    for d in settling:              # only now: a failed write above left them (and their undo) as they were
+        try:
+            _settle(d)
+        except OSError as e:        # the merge is committed: report it, keep the undo path below
+            settle_errors.append(f"{d.name}: {e}")
     moved, deindex_failed = [], []
     for f in absorbed:                                 # 3. absorbed -> txn dir + de-index
         src = MEM / f
@@ -532,6 +570,10 @@ def _apply_merge(params):
                 deindex_failed.append(f"{f}({d.stderr.strip()[:60]})")
             moved.append(f)
     detail = f"umbrella {umbrella} written; backup in merge-{merge_id} (orig+{moved})"
+    if settling:
+        detail += f"; settled earlier merge(s) {[d.name for d in settling]} (→ .trash, undo closed)"
+    if settle_errors:
+        detail += f"; WARNING could not settle {settle_errors}"
     if deindex_failed:
         # SUCCESS-WITH-WARNING, deliberately not False: by this point the umbrella is
         # overwritten and the sources are moved. Returning False would make callers skip
@@ -668,6 +710,8 @@ def activity_summary():
     staged = grab(r"candidates staged:\s*(\d+)")
     prov = grab(r"by provenance:\s*(\{[^}]*\})", "{}")
     decisions = grab(r"processed \d+ staged candidate\(s\):\s*(\{[^}]*\})", "{}")
+    ttl = grab(r"pruned (\d+) stale staged")
+    model = grab(r"model time used: ([^\n]+)", "")
     errs = len(re.findall(r"\bERROR\b", run))
     ACTIVITY_STAMP.write_text(run_id)
     # Log ACTIVITY, not idle proof-of-life: skip a run that did nothing and errored
@@ -675,7 +719,8 @@ def activity_summary():
     if transcripts == "0" and staged == "0" and decisions in ("{}", "0") and errs == 0:
         return
     notify(f"🧠 engram run @ {run_id}\nharvested: {transcripts} transcript(s) · staged {staged} {prov}\n"
-           f"graduated/held: {decisions}\nerrors: {errs}")
+           f"graduated/held: {decisions}\nexpired by TTL: {ttl}"
+           + (f" · model time: {model}" if model else "") + f"\nerrors: {errs}")
 
 
 def main():

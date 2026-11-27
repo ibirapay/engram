@@ -209,7 +209,14 @@ memory_push_index() {
 # analyzer only if a real keyless-secret leak is observed.
 # A named-credential match needs an ASSIGNMENT and an 8+ char value, so prose like
 # "the DB password lives in Vault" doesn't trip it.
-_MEMORY_SECRET_ERE='((mnemonic|seed[_-]?phrase|recovery[_-]?phrase)[[:space:]]*[:=][[:space:]]*([a-z]+[[:space:],]+){5,}[a-z]+|(client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[_-]?phrase|recovery[_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)[[:space:]]*[:=][[:space:]]*.?[[:alnum:]_/+-]{8,}|BEGIN[[:space:]]+[A-Z ]*PRIVATE KEY|-----BEGIN[[:space:]]|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}|xprv[a-zA-Z0-9]{20,}|[5KL][1-9A-HJ-NP-Za-km-z]{50,51}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|[0-9a-f]{80,})'
+_MEMORY_SECRET_ERE='((mnemonic|seed[_-]?phrase|recovery[_-]?phrase)[[:space:]]*[:=][[:space:]]*([a-z]+[[:space:],]+){5,}[a-z]+|(mnemonic|seed[[:space:]_-]?(phrase|words)|recovery[[:space:]_-]?phrase)[*_]*([[:space:]]*\([^)]{0,40}\))?[*_]*[[:space:]]*[:=][[:space:]*_`"'"'"']*([a-z]{3,8}[[:space:],]+){11,}[a-z]{3,8}|(client[_-]?secret|webhook[_-]?secret|api[_-]?key|apikey|password|passwd|secret|token|access[_-]?token|mnemonic|seed[_-]?phrase|recovery[_-]?phrase|private[_-]?key|priv[_-]?key|macaroon)[[:space:]]*[:=][[:space:]]*.?[[:alnum:]_/+-]{8,}|BEGIN[[:space:]]+[A-Z ]*PRIVATE KEY|-----BEGIN[[:space:]]|Bearer[[:space:]]+[A-Za-z0-9._-]{20,}|xprv[a-zA-Z0-9]{20,}|[5KL][1-9A-HJ-NP-Za-km-z]{50,51}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|[0-9a-f]{80,})'
+# The seed-phrase arm on its own, for a whole-file pass: grep reads line by line, so a label on one
+# line with the words in a code block below (how a model writes it) passes the per-line scan.
+_MEMORY_SEED_ERE='(mnemonic|seed[[:space:]_-]?(phrase|words)|recovery[[:space:]_-]?phrase)[*_]*([[:space:]]*\([^)]{0,40}\))?[*_]*[[:space:]]*[:=][[:space:]*_`"'"'"']*([a-z]{3,8}[[:space:],]+){11,}[a-z]{3,8}'
+
+# _memory_secret_norm <file> — the file with no-break spaces (U+00A0, U+2007, U+202F) as spaces:
+# glibc's [[:space:]] does not match them, Python's \s (the mirrors) does.
+_memory_secret_norm() { LC_ALL=C sed 's/\xc2\xa0/ /g; s/\xe2\x80\x87/ /g; s/\xe2\x80\xaf/ /g' "$1"; }
 
 # memory_scan_secret <file> — echo the offending LINE NUMBERS (never the content,
 # so a secret can't leak into the transcript). Returns 0 if a secret was found,
@@ -218,7 +225,11 @@ memory_scan_secret() {
     local file="$1" hits
     [[ "${MEMORY_ALLOW_SECRET:-0}" == "1" ]] && return 1
     [[ -f "$file" ]] || return 1
-    hits=$(grep -niE "$_MEMORY_SECRET_ERE" "$file" 2>/dev/null | cut -d: -f1 | tr '\n' ' ')
+    # no-break spaces read as spaces (as Python's \s reads them); -a so a stray non-UTF-8 byte
+    # cannot turn a line into "binary file matches" and hide its hit
+    hits=$(_memory_secret_norm "$file" | grep -naiE "$_MEMORY_SECRET_ERE" 2>/dev/null | cut -d: -f1 | tr '\n' ' ')
+    # -z: the whole file is one record, so the seed words may sit on the lines after the label
+    if _memory_secret_norm "$file" | grep -qzaiE "$_MEMORY_SEED_ERE" 2>/dev/null; then hits="${hits} seed-phrase"; fi
     if [[ -n "${hits// /}" ]]; then
         printf '%s' "$hits"
         return 0

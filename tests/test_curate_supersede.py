@@ -219,6 +219,40 @@ def test_apply_merge_rejects_a_file_in_an_outstanding_transaction():
     print("ok — refuses a file already held by an outstanding transaction")
 
 
+def test_an_earlier_merge_settles_after_settle_days():
+    """An earlier merge nobody undid for settle_days no longer locks its files out of curation:
+    its backup goes to .trash and its UNDO record closes; a younger one still blocks."""
+    import hashlib, json, time
+    g = _gate(); d = Path(tempfile.mkdtemp()); g.MEM = d; g.Q = d / ".approvals"; g.HOME = d
+    (d / ".claude").mkdir()
+    save = d / ".claude" / "save_memory.sh"      # fake writer: stdin -> the memory file
+    save.write_text(f'#!/bin/sh\ncat > "{d}/$1"\n'); save.chmod(0o755)
+    doc = "---\nname: b\ndescription: d\n---\n\nbody\n"
+    (d / "b.md").write_text(doc)
+    prior = d / ".quarantine" / "merge-earlier"; prior.mkdir(parents=True)
+    (prior / "b.md.orig").write_text("b before the earlier merge")
+    for uid, mid in (("u1", "earlier"), ("u2", "unrelated")):
+        (g._dir("undo") / f"{uid}.json").write_text(json.dumps(
+            {"id": uid, "op": "merge_undo", "params": {"umbrella": "b.md", "absorbed": [], "merge_id": mid}}))
+    sha = {"b.md": hashlib.sha256((d / "b.md").read_bytes()).hexdigest()}
+    params = {"umbrella": "b.md", "umbrella_content": doc.replace("body", "merged"), "desc": "d",
+              "absorbed": [], "merge_id": "later", "src_sha": sha, "settle_days": 7}
+    six = time.time() - 6 * 86400
+    os.utime(prior, (six, six))
+    ok, why = g._apply_merge(params)
+    assert not ok and "settles after 7 days" in why and prior.is_dir(), why
+    eight = time.time() - 8 * 86400
+    os.utime(prior, (eight, eight))
+    ok, why = g._apply_merge(params)
+    assert ok and "settled earlier merge(s) ['merge-earlier']" in why, why
+    assert not prior.exists() and len(list((d / ".trash").glob("merge-earlier-*"))) == 1
+    assert (g._dir("undone") / "u1.json").is_file() and (g._dir("undo") / "u2.json").is_file(), \
+        "only the settled merge's undo record closes"
+    assert "merged" in (d / "b.md").read_text() and (d / ".quarantine" / "merge-later" / "b.md.orig").is_file()
+    shutil.rmtree(d)
+    print("ok — an earlier merge settles after settle_days; a younger one still blocks")
+
+
 def test_descriptions_with_a_colon_survive_every_document_builder():
     """A description holding ": " (real ones do: "Fake OTC (live on prod): a Mesa ...") used to be
     written as a plain YAML scalar, which is a ScannerError: curate held the umbrella on every pass
@@ -251,24 +285,27 @@ def test_descriptions_with_a_colon_survive_every_document_builder():
 
 
 # ── the compress decision, through main() ──────────────────────────────────
-def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=None, cap=None):
+def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=None, cap=None,
+                  umbrella_body="umbrella body\n", store=None, dry=False, verdict="APPROVE", ac_extra=None,
+                  apply_result=(True, "ok")):
     """Drive main() through compress merges, every outside dependency stubbed: the vector store pairs
     project_a/project_b (plus `more` pairs: {name: body}), distill returns `report`, the reviewer
     approves. engram_secrets is the real one (its regexes decide the credential and value holds).
     Returns the calls and everything main() printed."""
     import contextlib, io
-    d = Path(tempfile.mkdtemp())
+    d = store or Path(tempfile.mkdtemp())      # a given store is reused (and kept) across runs
     fm = "---\nname: {n}\ndescription: d\nmetadata:\n  type: project\n---\n\n{b}\n"
     bodies = {"project_a.md": body_a, "project_b.md": "beta holds another fact", **(more or {})}
     for f, b in bodies.items():
-        (d / f).write_text(fm.format(n=f[:-3], b=b))
+        if not (d / f).exists():
+            (d / f).write_text(fm.format(n=f[:-3], b=b))
     names = sorted(bodies)
     pairs = [(0.99, names[i], names[i + 1]) for i in range(0, len(names) - 1, 2)]
     calls = {"apply": 0, "verify": 0, "distill": 0, "notify": [], "propose": []}
     gate = types.ModuleType("engram_telegram_gate")
     gate.validate_memory_doc = lambda doc: (True, "")
     gate.unwrap_code_fence = lambda text: text
-    gate._apply_merge = lambda p: (calls.__setitem__("apply", calls["apply"] + 1), (True, "ok"))[1]
+    gate._apply_merge = lambda p: (calls.__setitem__("apply", calls["apply"] + 1), apply_result)[1]
     gate.notify_undo = lambda op, p, text: calls["notify"].append(text)
     gate.propose = lambda op, p, text, files=None, verdict=None: calls["propose"].append(text)
     store = types.ModuleType("vector_store")
@@ -278,9 +315,10 @@ def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=N
 
     def distill(key, files, cfg=None, preserve_sources=None):
         calls["distill"] += 1
-        return "umbrella body\n", report
+        return umbrella_body, report
     mdv.distill_cluster = distill
-    ac = {"enabled": True, "autonomous": autonomous, "review_gate": "self", "prune_orphans": False}
+    ac = {"enabled": True, "autonomous": autonomous, "review_gate": "self", "prune_orphans": False,
+          **(ac_extra or {})}
     if cap:
         ac["max_merges_per_run"] = cap
     mai = types.ModuleType("memory_ai"); mai.load = lambda: {"auto_curate": ac}
@@ -288,7 +326,7 @@ def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=N
     stubs = {"vector_store": store, "qdrant_client": types.ModuleType("qdrant_client")}
     saved = {k: sys.modules.get(k) for k in stubs}
     sys.modules.update(stubs)
-    argv, sys.argv = sys.argv, ["memory_auto_curate.py", "--apply"]
+    argv, sys.argv = sys.argv, ["memory_auto_curate.py"] + ([] if dry else ["--apply"])
     out = io.StringIO()
     try:
         m = _load("memory_auto_curate", ROOT / "bin" / "memory_auto_curate.py", memory_ai=mai,
@@ -297,7 +335,7 @@ def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=N
 
         def verify(doc, files):
             calls["verify"] += 1
-            return "APPROVE"
+            return verdict
         m._self_verdict = verify
         with contextlib.redirect_stdout(out):
             m.main()
@@ -305,7 +343,8 @@ def _run_compress(report, autonomous=True, body_a="alpha holds one fact", more=N
         sys.argv = argv
         for k, v in saved.items():
             sys.modules.pop(k) if v is None else sys.modules.__setitem__(k, v)
-        shutil.rmtree(d)
+        if store is None:
+            shutil.rmtree(d)
     calls["out"] = out.getvalue()
     return calls
 
@@ -340,28 +379,38 @@ def test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept():
     print("ok — a bloated merge never applies on its own; the notice reports the facts kept")
 
 
-def test_a_merge_that_would_mask_a_txid_or_address_is_held():
-    """The distiller masks every long hex/base64 run before the model sees it, so a txid, an
-    address or a full hash in a source can never reach the umbrella. Such a merge is held in every
-    mode, judged from the sources (no distill, no review, no slot); a session id does not count."""
+def test_public_values_reach_the_umbrella_or_the_merge_is_held():
+    """The distiller swaps public values (addresses, paths) for stand-ins and restores them, so a
+    cluster that holds one merges (it used to be held forever). Curate still checks the result: an
+    umbrella that lost a value is held, without printing it. A bare hex (a tx hash or a key: the
+    same shape) is held before distill. A session id is not a value."""
     report = {**BASE, "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0}
-    txid = "9f2c" * 16
+    addr = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
+    calls = _run_compress(report, body_a=f"refund sent to {addr}", umbrella_body=f"refund to {addr}\n")
+    assert calls["apply"] == 1, f"a merge whose umbrella keeps the address was held: {calls}"
     for autonomous in (True, False):
-        calls = _run_compress(report, autonomous, body_a=f"refund sent, txid {txid}")
-        assert (calls["apply"], calls["verify"], calls["distill"], calls["propose"]) == (0, 0, 0, []), calls
-        assert txid not in calls["out"], "the held value was printed"
-    calls = _run_compress(report, body_a="refund sent to 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed")
-    assert calls["apply"] == 0 and calls["distill"] == 0, f"merge masking an address went ahead: {calls}"
+        calls = _run_compress(report, autonomous, body_a=f"refund sent to {addr}")
+        assert (calls["apply"], calls["verify"], calls["propose"]) == (0, 0, []), calls
+        assert "lost 1 public value" in calls["out"] and addr[2:] not in calls["out"], calls["out"]
+    txid = "9f2c" * 16
+    calls = _run_compress(report, body_a=f"refund sent, txid {txid}")
+    assert calls["distill"] == 0 and "cannot be told apart from a secret" in calls["out"], calls["out"]
     calls = _run_compress(report, body_a="originSessionId: 5f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b\nplain fact")
     assert calls["apply"] == 1, f"a session id held the merge: {calls}"
-    # a held cluster takes no slot: with a cap of 1, the clean cluster after it still merges
-    calls = _run_compress(report, body_a=f"txid {txid}", cap=1,
+    print("ok — public values reach the umbrella; one that lost a value is held, unprinted")
+
+
+def test_held_clusters_take_no_slot():
+    """A cluster held from its sources (a credential) costs no distill and no slot: with a cap of 1
+    the clean cluster after it still merges, and two clean clusters still get only one attempt."""
+    report = {**BASE, "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0}
+    token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0" * 2
+    calls = _run_compress(report, body_a=f"GITHUB_TOKEN={token}", cap=1,
                           more={"project_c.md": "gamma fact", "project_d.md": "delta fact"})
     assert calls["distill"] == 1 and calls["apply"] == 1, f"a held cluster used up the cap: {calls}"
-    # and the cap still bounds real attempts: two clean clusters, cap 1, one distill
     calls = _run_compress(report, cap=1, more={"project_c.md": "gamma fact", "project_d.md": "delta fact"})
     assert calls["distill"] == 1 and calls["apply"] == 1, f"the cap no longer bounds merge attempts: {calls}"
-    print("ok — a merge that would mask a txid or an address is held before distill; a session id is not a value")
+    print("ok — a held cluster takes no slot; the cap still bounds attempts")
 
 
 def test_a_credential_hold_never_prints_the_credential():
@@ -375,6 +424,129 @@ def test_a_credential_hold_never_prints_the_credential():
     print("ok — a credential hold reports a count, never the value")
 
 
+def test_a_skipped_cluster_is_not_distilled_again_until_it_changes():
+    """A cluster skipped after a distill call (here: bloated) is not distilled again on the next
+    run; an edit to one of its files, or retry_days passing, brings it back."""
+    import json, time
+    bloated = {**BASE, "appendix_facts": 30, "appendix_chars": 650, "appendix_fresh_chars": 600}
+    d = Path(tempfile.mkdtemp())
+    first = _run_compress(bloated, store=d)
+    assert first["distill"] == 1 and "SKIP (this rewrite restated 60%" in first["out"], first["out"]
+    again = _run_compress(bloated, store=d)
+    assert again["distill"] == 0 and "SKIP (unchanged since: this rewrite restated" in again["out"], again["out"]
+    (d / "project_b.md").write_text((d / "project_b.md").read_text() + "\nnew fact\n")
+    edited = _run_compress(bloated, store=d)
+    assert edited["distill"] == 1, "an edited cluster was not retried"
+    skips = json.loads((d / ".curate_skips.json").read_text())
+    for v in skips.values():
+        v["at"] = int(time.time()) - 8 * 86400
+    (d / ".curate_skips.json").write_text(json.dumps(skips))
+    aged = _run_compress(bloated, store=d)
+    assert aged["distill"] == 1, "a skip older than retry_days was not retried"
+    shutil.rmtree(d)
+    # a dry run writes nothing, not even a remembered skip (this hold fires before the dry-run exit)
+    d = Path(tempfile.mkdtemp())
+    report = {**BASE, "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0}
+    dry = _run_compress(report, body_a="refund to 0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", store=d, dry=True)
+    assert "lost 1 public value" in dry["out"] and not (d / ".curate_skips.json").exists(), dry["out"]
+    shutil.rmtree(d)
+    print("ok — a skipped cluster is not distilled again until it changes or retry_days pass")
+
+
+def test_review_round_holds_and_skip_rules():
+    """Independent review 2026-11-26: a value that cannot be told apart from a secret holds BEFORE
+    distill; an umbrella the writer would block is held, not attempted; a down reviewer is not
+    remembered as an answer; a changed setting retries; a skip expires exactly retry_days later."""
+    import json, time
+    report = {**BASE, "appendix_facts": 0, "appendix_chars": 0, "appendix_fresh_chars": 0}
+    pk = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+    calls = _run_compress(report, body_a=f"deployer 0x{pk}")
+    assert calls["distill"] == 0 and "cannot be told apart from a secret" in calls["out"], calls["out"]
+    assert pk not in calls["out"]
+    calls = _run_compress(report, umbrella_body="umbrella " + "A1" * 45 + "\n")      # case-insensitive, like grep -iE
+    assert calls["apply"] == 0 and "secret guard would block" in calls["out"], calls["out"]
+    # an empty model reply is not a judgment: no apply, no queue, not remembered
+    d0 = Path(tempfile.mkdtemp())
+    empty = _run_compress({**report, "gen_empty": True}, store=d0, autonomous=False)
+    assert empty["apply"] == 0 and not empty["propose"] and "returned nothing" in empty["out"], empty
+    assert not (d0 / ".curate_skips.json").exists(), "an empty reply was remembered"
+    shutil.rmtree(d0)
+
+    # a DEFER verdict (reviewer down) is not remembered: the next run distills again
+    d = Path(tempfile.mkdtemp())
+    deferred = _run_compress(report, store=d, verdict="DEFER-RuntimeError")
+    assert "SKIP (self-review DEFER-RuntimeError)" in deferred["out"]
+    assert not (d / ".curate_skips.json").exists(), "a down reviewer was remembered as an answer"
+    # a failed write says nothing about the cluster; waiting for an earlier merge to settle does
+    failed = _run_compress(report, store=d, apply_result=(False, "umbrella write failed: push — rolled back"))
+    assert failed["apply"] == 1 and not (d / ".curate_skips.json").exists(), "a write failure was remembered"
+    waiting = _run_compress(report, store=d, apply_result=(False, "b.md is referenced by an outstanding merge backup"))
+    assert waiting["apply"] == 1 and (d / ".curate_skips.json").exists(), "an outstanding backup was not remembered"
+    (d / ".curate_skips.json").unlink()
+    # a REJECT is remembered; changing a decisive setting retries it
+    _run_compress(report, store=d, verdict="REJECT")
+    assert _run_compress(report, store=d, verdict="REJECT")["distill"] == 0
+    assert _run_compress(report, store=d, verdict="REJECT", ac_extra={"max_appendix_ratio": 0.6})["distill"] == 1
+    # the window: a skip recorded exactly retry_days before this run's start has expired
+    skips = json.loads((d / ".curate_skips.json").read_text())
+    for v in skips.values():
+        v["at"] = int(time.time()) - 7 * 86400
+    (d / ".curate_skips.json").write_text(json.dumps(skips))
+    assert _run_compress(report, store=d, verdict="REJECT", ac_extra={"max_appendix_ratio": 0.6})["distill"] == 1
+    shutil.rmtree(d)
+    print("ok — review round: holds before distill, writer guard, deterministic-only skips, config and age retry")
+
+
+def test_settle_waits_for_a_successful_write():
+    """A failed umbrella write must leave the earlier merge's backup and its UNDO record in place."""
+    import hashlib, json, time
+    g = _gate(); d = Path(tempfile.mkdtemp()); g.MEM = d; g.Q = d / ".approvals"; g.HOME = d
+    (d / ".claude").mkdir()
+    save = d / ".claude" / "save_memory.sh"
+    save.write_text("#!/bin/sh\necho 'push failed' >&2\nexit 1\n"); save.chmod(0o755)
+    doc = "---\nname: b\ndescription: d\n---\n\nbody\n"
+    (d / "b.md").write_text(doc)
+    prior = d / ".quarantine" / "merge-earlier"; prior.mkdir(parents=True)
+    (prior / "b.md.orig").write_text("b before")
+    (g._dir("undo") / "u1.json").write_text(json.dumps(
+        {"id": "u1", "op": "merge_undo", "params": {"umbrella": "b.md", "absorbed": [], "merge_id": "earlier"}}))
+    old = time.time() - 8 * 86400
+    os.utime(prior, (old, old))
+    sha = {"b.md": hashlib.sha256(doc.encode()).hexdigest()}
+    ok, why = g._apply_merge({"umbrella": "b.md", "umbrella_content": doc.replace("body", "merged"), "desc": "d",
+                              "absorbed": [], "merge_id": "later", "src_sha": sha, "settle_days": 7})
+    assert not ok and "write failed" in why, why
+    assert prior.is_dir() and (g._dir("undo") / "u1.json").is_file(), "a failed write settled the earlier merge"
+    # _settle closes the undo record BEFORE moving the backup: a failed move leaves no live undo
+    import shutil as _sh
+    real_move = _sh.move
+    _sh.move = lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    try:
+        g._settle(prior)
+        raise AssertionError("the failing move did not raise")
+    except OSError:
+        pass
+    finally:
+        _sh.move = real_move
+    assert (g._dir("undone") / "u1.json").is_file() and prior.is_dir(), "undo left open by a failed settle"
+    (g._dir("undone") / "u1.json").rename(g._dir("undo") / "u1.json")      # back to the state under test
+    # a settle that fails AFTER a good write is reported; the merge itself stands
+    save.write_text(f'#!/bin/sh\ncat > "{d}/$1"\n')
+
+    def broken(_d):
+        raise OSError("disk full")
+    g._settle = broken
+    ok, why = g._apply_merge({"umbrella": "b.md", "umbrella_content": doc.replace("body", "merged"), "desc": "d",
+                              "absorbed": [], "merge_id": "later", "src_sha": sha, "settle_days": 7})
+    assert ok and "WARNING could not settle" in why and "disk full" in why, why
+    # an undo whose umbrella was absorbed since (gone) is refused instead of restoring duplicates
+    (d / "b.md").unlink()
+    ok, why = g._apply_merge_undo({"umbrella": "b.md", "absorbed": [], "merge_id": "later"})
+    assert not ok and "is gone since the merge" in why, why
+    shutil.rmtree(d)
+    print("ok — settle happens only after the umbrella write succeeded")
+
+
 if __name__ == "__main__":
     test_validator_rejects_the_real_malformed_shapes()
     test_unwrap_fence_leaves_inner_code_blocks_alone()
@@ -384,7 +556,12 @@ if __name__ == "__main__":
     test_apply_merge_refuses_stale_sources()
     test_apply_merge_refuses_to_reuse_a_transaction_dir()
     test_apply_merge_rejects_a_file_in_an_outstanding_transaction()
+    test_an_earlier_merge_settles_after_settle_days()
     test_descriptions_with_a_colon_survive_every_document_builder()
     test_a_bloated_merge_never_applies_and_the_message_says_what_was_kept()
-    test_a_merge_that_would_mask_a_txid_or_address_is_held()
+    test_public_values_reach_the_umbrella_or_the_merge_is_held()
+    test_held_clusters_take_no_slot()
     test_a_credential_hold_never_prints_the_credential()
+    test_a_skipped_cluster_is_not_distilled_again_until_it_changes()
+    test_review_round_holds_and_skip_rules()
+    test_settle_waits_for_a_successful_write()

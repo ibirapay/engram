@@ -1,5 +1,68 @@
 # Changelog
 
+## 1.8.0 — the pipeline drains on its own: nothing waits for a person
+
+A full run on 2026-11-26 showed four places where "autonomous" work stalled until someone stepped
+in. Each is now resolved by the pipeline itself.
+
+- **Graduation drains the whole queue.** It evaluated 8 candidates per run in name order, and holds
+  that never change took 7 of those slots, so with the daily timer one candidate a day was really
+  evaluated against an intake of 150-250 (804 queued; about 200 a day would have expired
+  unevaluated). Now every staged candidate goes through the cheap gates each run (noise, provenance,
+  confidence, dedup, denylist, secret scan), user-direct first and then oldest first:
+  - a failed provenance or confidence gate is terminal: the candidate moves to `.staging/.expired/`
+    (recoverable) instead of coming back every run; an unreadable frontmatter is held, not judged;
+  - the injection check, the only model call, is bounded by `auto_graduate.llm_budget_seconds`
+    (1800), each call capped to what is left of it, and stops after 3 failures in a row (a reply
+    with no verdict counts as a failure, it no longer quarantines); what does not fit is deferred to
+    the front of the next run; the secret scan runs before the model; one run at a time (lock);
+  - a near-copy of something graduated earlier in the same run is dropped;
+  - `max_per_run` defaults to 0 (no cap); the Telegram run summary shows TTL expiries and model time.
+- **Earlier merges settle.** A merge could not touch a file of another merge still inside its
+  30-day undo window, which locked 18 live memories out of curation. A merge nobody undid for
+  `auto_curate.settle_days` (7) now settles when needed: its backup moves to `.trash/` (as the
+  probation sweep does at 30 days) and its UNDO record closes, only after the new umbrella was
+  written. A younger one still blocks.
+- **Addresses and paths reach the umbrella.** Which masked values are public is decided by an
+  ALLOWLIST of shapes that cannot be a secret, over the whole cluster
+  (`engram_secrets.classify_values`): an EVM address (`0x` + 40 hex), a chain bech32 address, a
+  filesystem path (starts its word, not in a URL, lowercase, short segments that are neither hex nor
+  a letters-and-digits token, no secret word
+  in its paragraph after NFKC, invisible-character removal and `_`/`-`/camelCase splitting). A bare
+  hex is never public, labelled or not: a tx hash and a private key are the same 64 hex, and three
+  review passes broke every label rule (they served 3 values on the author's store). The distiller swaps each for a stand-in
+  (`«v1»`, with a letter no source uses) in one pass over the scanner's spans; the model, the
+  checklist and the appendix only see the stand-in, and the final document gets the original back.
+  Everything else stays masked: every sample of the shared secret corpus, a bare 64-hex key, a
+  base64 secret, `nsec1...`. A cluster holding a masked value that is neither public nor a
+  credential is held before distill (it cannot be restored); curate also reconciles after distill
+  and holds an umbrella the writer's secret guard would block.
+- **A skipped cluster is not distilled again for nothing.** A cluster skipped after a distill call
+  for a deterministic reason (bloated, REJECT, malformed, waiting for an earlier merge to settle) is
+  remembered in `.curate_skips.json` and retried when one of its files or a deciding setting
+  changes, or `auto_curate.retry_days` (7) pass. A down reviewer or a failed write is not remembered.
+- **Reviewed** by independent Opus 5.5 xhigh passes. The first found the public-value design was a
+  denylist and would have restored real keys (HIGH); the second broke the first allowlist twice (a
+  label anywhere in the window let "signing key (HMAC-SHA256): <hex>" through; a URL's API key
+  passed as a path). All findings are fixed with tests. Trade-off, measured: 121 of 1125 live
+  memories hold a value that cannot be told apart from a secret, so their clusters are held rather
+  than merged with the value masked away.
+- **Security (pre-existing, all detectors):** a seed phrase written with a space ("seed phrase:",
+  "recovery phrase =", "seed words:", "mnemonic (BIP39):") or the way a model writes it
+  (`**Seed phrase:** words`, the words in backticks or quotes, or in a code block below the label)
+  was neither masked nor blocked, in Python (`engram_secrets`), the shell writer guard
+  (`memory_lib.sh`) and the Rust crate (`engram-secrets`). All three gain a second arm for these
+  forms that needs 12+ BIP39-shaped words (3-8 letters), so prose about seeds ("Seed phrase:
+  per-shop, shared by every till") is not blocked; the original arm is unchanged. The writer guard
+  adds a whole-file pass for the multi-line form, reads no-break spaces as spaces (glibc
+  `[[:space:]]` does not) and greps with `-a` (a stray Latin-1 byte hid a line's hit). The shared
+  corpus has every form, and the Python side now checks the corpus too (only Rust did).
+  **Known gap, next step:** a seed written as a numbered list, under a label outside the list
+  ("Seed:", "Secret phrase:", pt-BR labels) or with no separator still passes; the fix is a
+  detector by the BIP39 wordlist (12+ consecutive list words), measured on the store first.
+- The writer-guard check runs line by line like save_memory.sh's grep; settle closes the UNDO record
+  before moving the backup, and an UNDO whose umbrella was absorbed since is refused.
+
 ## 1.7.4 — memory frontmatter is read the way it is written
 
 Measured 2026-11-26: 63 of 1120 live memories and 38 of 804 staged candidates had a `name:` or

@@ -67,6 +67,10 @@ FACT_PATTERNS = [
 # Kinds whose token IS the fact: a flag, a ref or an identifier is only conveyed by the exact
 # string, as a whole word ("--keep" is not "keep" in the prose, ENGRAM_URL is not ENGRAM_URL_FALLBACK).
 VERBATIM_KINDS = {"code", "hash", "env", "carried"}
+# A public value's stand-in («v1», «v2»...): what the model sees instead of a txid, an address or a
+# full hash. Self-delimiting («v1» is never inside «v10»). The letter is one no source uses in that
+# shape, so a memory that talks about stand-ins can never be rewritten by the restore.
+STAND_IN_LETTERS = "vwxyzjkq"
 FACT_STOP = {"0.0", "1.0", "2.0", "3.0"}
 # A memory file's own name is not a fact about the world: the model labels the umbrella's subsections
 # with the source file names, and those files are quarantined after the merge.
@@ -323,8 +327,26 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
     carried, carried_cav = set(), set()   # read back from an earlier merge's appendix
     sources = {}          # f -> redacted body (for add-only preservation + sentence coverage)
     n_redacted = 0
+    # PUBLIC values (txid, address, full hash: long hex/base64 that is not a credential) would be
+    # masked by the redaction below and lost to the umbrella. Each becomes a stable stand-in «vN»
+    # first: the model, the checklist and the appendix only ever see the stand-in, and the final
+    # document gets the original back. Only values that were in the sources are restored.
+    # Which values are public is decided over the whole cluster by an allowlist of shapes
+    # (engram_secrets.classify_values); everything else masked stays masked.
+    raws = {f: (MEM / f).read_text(errors="ignore") for f in files}
+    public, _held = engram_secrets.classify_values(list(raws.values()))
+    letter = next((c for c in STAND_IN_LETTERS
+                   if not any(re.search(rf"«{c}\d+»", t) for t in raws.values())), None)
+    if letter is None:
+        public = set()                         # no safe stand-in: mask them, as before
+    token_re = re.compile(rf"«{letter}\d+»") if letter else None
+    values = {}           # original value -> stand-in
+
+    def stand_in(v):
+        return values.setdefault(v, f"«{letter}{len(values) + 1}»")
     for f in files:
-        body, n = redact_secrets((MEM / f).read_text(errors="ignore"))
+        # one pass over the scanner's match spans: public -> stand-in, anything else -> masked
+        body, n = engram_secrets.swap_values(raws[f], public, stand_in)
         n_redacted += n
         prose = strip_prior_appendix(body)
         sources[f] = prose
@@ -354,6 +376,11 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
                        or next((ln for ln in lines if disp.lower() in ln.lower()), None))
                 if src is not None:
                     fact_src[norm] = (f, src.strip())
+        # each stand-in is a verbatim fact: if the model drops it, its line goes to the appendix
+        for tok in sorted(set(token_re.findall(keep))) if token_re else []:
+            facts.setdefault(tok, (tok, "value"))
+            if tok not in fact_src:
+                fact_src[tok] = (f, next(ln.strip() for ln in keep.splitlines() if tok in ln))
         all_caveats += [(c, f) for c in caveats(keep)]
     if verbose:
         print(f"[{key}] {len(files)} notes · {len(facts)} hard facts · {len(all_caveats)} caveat lines", flush=True)
@@ -382,6 +409,11 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
     src_low = members_text.lower()
     invented = [disp for norm, (disp, _) in extract_facts(out).items() if norm not in src_low]
 
+    def unmask(t: str) -> str:
+        for v, tok in values.items():
+            t = t.replace(tok, v)
+        return t
+
     appendix = ""
     fresh_chars = carried_chars = 0
     if missing or missing_cav:
@@ -408,9 +440,9 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
             appendix += "### Hard facts\n" + "".join(e for e, _ in hard)
         if cav:
             appendix += "\n### Caveats / rules\n" + "".join(e for e, _ in cav)
-        fresh_chars = sum(len(e) for e, c in hard + cav if not c)
-        carried_chars = sum(len(e) for e, c in hard + cav if c)
-    appendix_chars = len(appendix)
+        fresh_chars = sum(len(unmask(e)) for e, c in hard + cav if not c)    # sizes as written
+        carried_chars = sum(len(unmask(e)) for e, c in hard + cav if c)
+    appendix_chars = len(unmask(appendix))
 
     # ADD-ONLY preservation (C8). final_fact_coverage only proves REGEX TOKEN
     # CLASSES (ports/IPs/paths/env/…) survived — normal PROSE facts can be dropped
@@ -453,6 +485,8 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
     final_norm = re.sub(r"[^a-z0-9]", "", final_low)
     final_cov = len([n for n, (disp, kind) in facts.items()
                      if fact_present(disp, kind, final_low, final_norm)]) / max(1, len(facts))
+    # stand-ins back to the originals, AFTER the final redaction (which would mask them again)
+    final = unmask(final)
     report = {
         "cluster": key, "notes": files,
         "hard_facts": len(facts), "caveats": len(all_caveats),
@@ -467,8 +501,9 @@ def distill_cluster(key, files, cfg=None, verbose=False, preserve_sources=None):
         "appendix_chars": appendix_chars, "appendix_fresh_chars": fresh_chars,
         "appendix_carried_chars": carried_chars,
         "possible_hallucinations": invented,
-        "secrets_redacted": n_redacted,
+        "secrets_redacted": n_redacted, "public_values_restored": len(values),
         "draft_chars": len(final), "gen_done": done,
+        "gen_empty": not out.strip(),          # the model returned nothing: not a judgment on the cluster
     }
     return final, report
 

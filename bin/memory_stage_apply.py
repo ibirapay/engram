@@ -10,11 +10,15 @@ clean candidates — without ever letting an untrusted fact slip into recall.
 A staged candidate graduates only if EVERY gate passes:
   1. provenance ∈ allow_provenance            (default: user-direct only)
   2. confidence ≥ min_confidence
-  3. NOT a near-duplicate of an existing memory (similarity expert; near-dups are
-     held as merge candidates for /memory-curate, never silently graduated)
-  4. injection check (injection expert) returns SAFE   (suspects → .quarantine)
-Graduation writes via save_memory.sh (GitHub + MEMORY.md) and removes the staged
-file. Everything else stays in .staging/ with a recorded reason.
+  3. NOT a near-duplicate of an existing memory, or of one graduated earlier this run
+  4. denylist and secret scan (deterministic; hits → .quarantine)
+  5. injection check (the only model call) returns SAFE   (suspects → .quarantine)
+Every decision is terminal except a transient failure and a deferral: a failed provenance or
+confidence gate leaves the queue for .staging/.expired/ (it can never change), a duplicate is
+dropped, a hit is quarantined. The whole queue goes through the cheap gates every run, user-direct
+first and then oldest first; model time is bounded by auto_graduate.llm_budget_seconds, and what
+does not fit is deferred to the front of the next run.
+Graduation writes via save_memory.sh (GitHub + MEMORY.md) and removes the staged file.
 
 SAFETY: dry-run by default. Real mutation needs BOTH `--apply` AND
 auto_graduate.enabled=true in engram.yaml (the lights-out switch, OFF until
@@ -35,6 +39,7 @@ import re
 import subprocess
 import sys
 import datetime
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path.home() / ".claude"))
@@ -64,7 +69,14 @@ AG_DEFAULTS = {
     "dedup_threshold": 0.86,                # cosine ≥ this vs an existing memory => duplicate (dropped, already covered)
     "injection_check": True,                # the screen that makes assistant-provenance safe to graduate
     "staging_ttl_days": 14,                 # prune staged candidates older than this (bounds .staging/ growth)
-    "max_per_run": 8,
+    # 0 = the whole staged backlog every run. The cheap gates (noise, provenance, confidence,
+    # dedup by embedding, denylist, secret scan) run on every candidate; only the injection
+    # check calls the model, and that is bounded by time instead (llm_budget_seconds). The old
+    # cap of 8, in name order, let a few never-resolving holds take 7 slots every run: one
+    # candidate a day was really evaluated against an intake of 150-250 (2026-11-26).
+    "max_per_run": 0,
+    "llm_budget_seconds": 1800,             # model time per run for injection checks (daemon task timeout is 3600)
+    "llm_max_failures": 3,                  # consecutive model failures that stop the model for this run
 }
 
 
@@ -241,6 +253,31 @@ _Provenance: auto-harvested from session {sid} ({provenance}); auto-graduated {n
 """
 
 
+_clock = time.monotonic          # patched by tests
+
+
+def _capped(cfg: dict, seconds: float) -> dict:
+    """cfg with every backend's timeout lowered to `seconds` (at least 30) and no retries."""
+    t = max(30, int(seconds))
+    out = dict(cfg)
+    for k in ("llama_cpp", "ollama", "claude", "ccg"):
+        sec = dict(out.get(k) or {})
+        sec["timeout_seconds"] = min(int(sec.get("timeout_seconds", t)), t)
+        if k in ("claude", "ccg"):
+            sec["retries"] = 1
+        out[k] = sec
+    return out
+
+
+def _expire(p: Path, apply: bool) -> None:
+    """Terminal decision: the candidate leaves the queue for .staging/.expired/ (recoverable, the
+    same place the TTL sweep uses), so it never takes a slot again."""
+    if apply:
+        expired = STAGING / ".expired"
+        expired.mkdir(exist_ok=True)
+        p.rename(expired / p.name)
+
+
 def graduate(fname, content, desc, apply):
     if not apply:
         return "would-graduate"
@@ -271,6 +308,14 @@ def main():
     if not STAGING.is_dir():
         print("no .staging/ — nothing to do.")
         return
+    # One graduation at a time: a timed-out pipeline can leave this script running as an orphan.
+    import fcntl
+    lock = open(STAGING / ".stage_apply.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[stage-apply] another graduation run holds the lock — skipping this one")
+        return
 
     # Prune stale staged candidates so held (never-graduating) items can't pile up.
     # RENAME to .staging/.expired/ (not unlink) so a starved/never-evaluated
@@ -286,21 +331,25 @@ def main():
                 p.rename(expired / p.name)
                 pruned += 1
 
-    def _prov(p):
-        m = re.search(r"^\s*provenance:\s*(\S+)", p.read_text(errors="ignore"), re.M)
-        return m.group(1) if m else "unverified"
-    # Process allow_provenance candidates FIRST so a pile of never-graduating holds
-    # (assistant/unverified) can't starve fresh user-direct candidates out of the
-    # per-run window (they'd otherwise sit unevaluated until the TTL deletes them).
-    allow = set(ag["allow_provenance"])
-    cands = sorted(STAGING.glob("*.md"),
-                   key=lambda p: (0 if _prov(p) in allow else 1, p.name))[:max_per]
+    # One parse per candidate, used for the order AND the gates (a regex for the order used to
+    # disagree with the parser). Priority, not name order: user-direct first, then the OLDEST
+    # (closest to the TTL sweep).
+    parsed = []
+    for p in STAGING.glob("*.md"):
+        meta, body = parse_frontmatter(p.read_text(errors="ignore"))
+        parsed.append((p, meta, body))
+    harvest_of = lambda m: m.get("harvest") if isinstance(m.get("harvest"), dict) else {}
+    prov_of = lambda m: harvest_of(m).get("provenance", "unverified")
+    parsed.sort(key=lambda x: (prov_of(x[1]) != "user-direct", x[0].stat().st_mtime, x[0].name))
+    cands = parsed[:max_per] if max_per > 0 else parsed
     decisions = []
     embs = existing_embeddings(cfg) if cands else {}
+    llm_spent, llm_fails, llm_off = 0.0, 0, ""
+    budget = float(ag.get("llm_budget_seconds") or 0)
+    max_fails = int(ag.get("llm_max_failures") or 3)
 
-    for p in cands:
-        meta, body = parse_frontmatter(p.read_text(errors="ignore"))
-        h = meta.get("harvest") or {}
+    for p, meta, body in cands:
+        h = harvest_of(meta)
         prov = h.get("provenance", "unverified")
         conf = float(h.get("confidence") or 0.0)
         sid = h.get("source_session", "?")
@@ -314,31 +363,37 @@ def main():
                 p.unlink(missing_ok=True)
             d.update(action="drop-noise", reason="transient session-status pattern (not durable)")
             decisions.append(d); continue
-        # Gate 1: provenance allowlist
-        if prov not in ag["allow_provenance"]:
-            d.update(action="hold", reason=f"provenance {prov} not in {ag['allow_provenance']}")
+        # A file whose frontmatter does not read (or has no harvest block) is NOT judged: a
+        # reader fix can recover it (v1.7.4 recovered 38 this way). Held, so the TTL decides.
+        if not h:
+            d.update(action="hold", reason="unreadable frontmatter or no harvest block — not judged")
             decisions.append(d); continue
-        # Gate 2: confidence floor — assistant-provenance must clear a HIGHER bar.
+        # Gates 1-2 are TERMINAL: provenance and confidence never change, so a candidate that
+        # fails them leaves the queue (.expired, recoverable) instead of coming back every run.
+        if prov not in ag["allow_provenance"]:
+            _expire(p, apply)
+            d.update(action="expire-terminal", reason=f"provenance {prov} not in {ag['allow_provenance']}")
+            decisions.append(d); continue
         floor = ag["assistant_min_confidence"] if prov == "assistant" else ag["min_confidence"]
         if conf < floor:
-            d.update(action="hold", reason=f"confidence {conf} < {floor} ({prov} bar)")
+            _expire(p, apply)
+            d.update(action="expire-terminal", reason=f"confidence {conf} < {floor} ({prov} bar)")
             decisions.append(d); continue
-        # Gate 3: dedup vs existing recall — a near-duplicate is already covered, so
-        # DROP it (terminal) instead of re-checking it every run.
-        if embs:
-            try:
-                ce = memory_ai.ollama_embed(embed_key(meta, body), cfg=cfg)
-                best = max(((cosine(ce, v), n) for n, v in embs.items()), default=(0, None))
-                if best[0] >= ag["dedup_threshold"]:
-                    if apply:
-                        p.unlink(missing_ok=True)
-                    d.update(action="drop-duplicate", reason=f"already covered by {best[1]} (cos={best[0]:.3f})")
-                    decisions.append(d); continue
-            except Exception as e:
-                d.update(action="hold", reason=f"dedup embed failed: {e}")
-                decisions.append(d); continue
-        else:
+        # Gate 3: dedup vs existing recall AND vs what this run already graduated — a
+        # near-duplicate is already covered, so DROP it (terminal).
+        if not embs:
             d.update(action="hold", reason="similarity expert unreachable — holding (fail-safe)")
+            decisions.append(d); continue
+        try:
+            ce = memory_ai.ollama_embed(embed_key(meta, body), cfg=cfg)
+        except Exception as e:
+            d.update(action="hold", reason=f"dedup embed failed: {e}")
+            decisions.append(d); continue
+        best = max(((cosine(ce, v), n) for n, v in embs.items()), default=(0, None))
+        if best[0] >= ag["dedup_threshold"]:
+            if apply:
+                p.unlink(missing_ok=True)
+            d.update(action="drop-duplicate", reason=f"already covered by {best[1]} (cos={best[0]:.3f})")
             decisions.append(d); continue
         # Gate 3.5: deterministic injection/exfil denylist (fail-closed, no LLM).
         # Runs regardless of injection_check so a down/disabled LLM can't open the
@@ -350,30 +405,45 @@ def main():
                 p.rename(QUAR / p.name)
             d.update(action="quarantine", reason=f"denylist: {deny}")
             decisions.append(d); continue
-        # Gate 4: injection check
-        if ag["injection_check"]:
-            try:
-                v = injection_verdict(body, cfg)
-            except Exception as e:
-                d.update(action="hold", reason=f"injection check failed: {e}")
-                decisions.append(d); continue
-            if v != "SAFE":
-                if apply:
-                    QUAR.mkdir(parents=True, exist_ok=True)
-                    p.rename(QUAR / p.name)
-                d.update(action="quarantine", reason=f"injection verdict={v}")
-                decisions.append(d); continue
-        # Gate 5: strong secret scan (engram_secrets.SECRET_RE — the AGGRESSIVE
-        # variant: 32+ hex, 40+ base64, mnemonics, WIF/xprv). save_memory.sh only
-        # applies the high-precision block ERE, which misses a bare 64-hex EVM key
-        # or a base64 macaroon a user pasted into chat. Quarantine (reviewable)
-        # rather than write a secret into the store.
+        # Gate 5 (cheap, so before the model): strong secret scan (engram_secrets.SECRET_RE —
+        # the AGGRESSIVE variant: 32+ hex, 40+ base64, mnemonics, WIF/xprv). save_memory.sh only
+        # applies the high-precision block ERE, which misses a bare 64-hex EVM key or a base64
+        # macaroon a user pasted into chat. Quarantine (reviewable) rather than write a secret.
         if engram_secrets.looks_secret(f"{desc}\n{body}"):
             if apply:
                 QUAR.mkdir(parents=True, exist_ok=True)
                 p.rename(QUAR / p.name)
             d.update(action="quarantine", reason="secret-scan: possible credential in body")
             decisions.append(d); continue
+        # Gate 4: injection check — the only model call, bounded by time and by a breaker.
+        if ag["injection_check"]:
+            if not llm_off and budget and llm_spent >= budget:
+                llm_off = f"llm budget of {int(budget)}s used"
+            if llm_off:
+                d.update(action="defer", reason=f"{llm_off} — first in line next run")
+                decisions.append(d); continue
+            t0 = _clock()
+            try:
+                # one call may not outlive the budget (the backend timeout can be an hour)
+                v = injection_verdict(body, _capped(cfg, budget - llm_spent) if budget else cfg)
+                if v not in ("SAFE", "SUSPECT"):
+                    # no verdict (empty or thinking-only reply): a model failure, not a judgment
+                    raise RuntimeError(f"no verdict ({v})")
+            except Exception as e:
+                llm_spent += _clock() - t0
+                llm_fails += 1
+                if llm_fails >= max_fails:
+                    llm_off = f"model failed {llm_fails}x in a row"
+                d.update(action="hold", reason=f"injection check failed: {e}")
+                decisions.append(d); continue
+            llm_spent += _clock() - t0
+            llm_fails = 0
+            if v != "SAFE":
+                if apply:
+                    QUAR.mkdir(parents=True, exist_ok=True)
+                    p.rename(QUAR / p.name)
+                d.update(action="quarantine", reason=f"injection verdict={v}")
+                decisions.append(d); continue
         # All gates passed → graduate
         content = canonical_content(meta, body, prov, sid)
         status = graduate(p.name, content, desc or p.stem, apply)
@@ -381,10 +451,12 @@ def main():
             p.unlink(missing_ok=True)
         elif apply and status.startswith("save-failed"):
             # e.g. the writer's secret guard blocked it — don't re-run gates + a
-            # fresh ccg injection call every 6h for 14 days; quarantine for review.
+            # fresh ccg injection call every run for 14 days; quarantine for review.
             QUAR.mkdir(parents=True, exist_ok=True)
             p.rename(QUAR / p.name)
             d.update(action="quarantine", reason=status); decisions.append(d); continue
+        if status in ("graduated", "would-graduate"):
+            embs[f"(this run) {p.name}"] = ce        # a later near-copy in the queue drops
         d.update(action=status, reason="all gates passed")
         decisions.append(d)
 
@@ -398,6 +470,8 @@ def main():
     print(f"# memory_stage_apply — apply={apply}  enabled={ag['enabled']}  "
           f"allow_provenance={ag['allow_provenance']}  (assistant bar={ag['assistant_min_confidence']})")
     print(f"pruned {pruned} stale staged file(s) (> {ttl_days}d)")
+    print(f"model time used: {int(llm_spent)}s of {int(budget) or 'unlimited'}"
+          + (f" — stopped: {llm_off}" if llm_off else ""))
     print(f"processed {len(decisions)} staged candidate(s): {counts or '{}'}\n")
     for d in decisions:
         print(f"  [{str(d['action']):<14}] {d['file']:<42} {d['reason']}")

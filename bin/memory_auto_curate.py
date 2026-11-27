@@ -86,6 +86,13 @@ AC_DEFAULTS = {
     # Only what THIS rewrite dropped counts; lines carried over from an earlier merge's appendix
     # (which the model never sees) do not, or a merged umbrella could never be merged again.
     "max_appendix_ratio": 0.5,
+    # An earlier merge nobody undid within this many days is accepted for good when a new merge
+    # needs one of its files (its backup goes to .trash, 90 days). Below it, it still blocks.
+    "settle_days": 7,
+    # A cluster skipped AFTER a distill call (bloated, REJECT, malformed, a failed apply...) is not
+    # distilled again until one of its files changes or this many days pass: retrying an
+    # unchanged cluster every day spent a model call for the same answer.
+    "retry_days": 7,
 }
 
 
@@ -104,16 +111,27 @@ def ac_cfg(cfg):
 _FM_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n", re.S)
 
 
-_PUBLIC_SHAPE_RE = re.compile(r"[0-9a-fA-F]{32,}|[A-Za-z0-9+/]{40,}={0,2}")
+SKIPS_FILE = ".curate_skips.json"
 
 
-def _public_values(text: str) -> set:
-    """Long hex/base64 runs that engram_secrets masks but that are not credentials: txids,
-    addresses, full hashes. Named secrets and session ids are not counted (dropping those is the
-    distiller's policy)."""
-    creds = engram_secrets.credentials(text)
-    return {m.group(0) for m in engram_secrets.SECRET_RE.finditer(text or "")
-            if _PUBLIC_SHAPE_RE.fullmatch(m.group(0)) and not any(m.group(0) in c for c in creds)}
+def _load_skips(retry_days: float, run_start: float) -> dict:
+    """Remembered skips still inside retry_days. Each records the START of the run that skipped,
+    and the window closes a minute early, so a run exactly retry_days later (the curate interval
+    can equal it) retries instead of depending on how long the earlier run took."""
+    try:
+        skips = json.loads((MEM / SKIPS_FILE).read_text())
+    except Exception:
+        return {}
+    cutoff = run_start - retry_days * 86400 + 60
+    return {k: v for k, v in skips.items() if isinstance(v, dict) and v.get("at", 0) >= cutoff}
+
+
+def _skip_key(sha0: dict, ac: dict) -> str:
+    """The cluster's files and content hashes, plus the settings that decided the skip: changing
+    the gate or a ratio is a reason to try again."""
+    knobs = {k: ac.get(k) for k in ("review_gate", "autonomous", "max_appendix_ratio",
+                                    "min_auto_coverage", "settle_days")}
+    return json.dumps([sorted(sha0.items()), knobs], sort_keys=True)
 
 
 def _umbrella_doc(stem: str, desc: str, typ: str, body: str) -> str:
@@ -344,6 +362,9 @@ def main():
     print(f"near-dup clusters this run: {len(typed)} (cap {ac['max_merges_per_run']} merge attempts)")
     import engram_telegram_gate as gate
     done = queued = attempted = 0
+    retry_days = float(ac.get("retry_days", 7))
+    run_start = int(__import__("time").time())
+    skips = _load_skips(retry_days, run_start)
     for files in typed:
         # The cap counts clusters that cost a merge attempt. A cluster held from its sources alone
         # (credential or public value, below) costs nothing and must not take a slot: those holds
@@ -357,6 +378,22 @@ def main():
         # produced, so _apply_merge would wave through an umbrella computed from the OLD
         # bytes while a newly added fact sat unread in the source.
         sha0 = _src_sha(files)
+        key = _skip_key(sha0, ac)
+        if key in skips:
+            print(f"· {files}: SKIP (unchanged since: {skips[key]['reason']}; retried after "
+                  f"{retry_days:g} days or an edit)")
+            continue
+
+        def remember(why, key=key, files=files):
+            """A skip that cost a distill call: do not pay for the same answer again tomorrow.
+            Only DETERMINISTIC answers are remembered: a model or backend that was down, or a
+            write that failed, says nothing about the cluster and is retried on the next run."""
+            if apply:
+                skips[key] = {"files": files, "reason": why[:160], "at": run_start}
+                try:
+                    (MEM / SKIPS_FILE).write_text(json.dumps(skips, indent=1))
+                except OSError:
+                    pass
         # ── SUPERSEDE first: if the members are identical copies, this is not a
         # compression problem at all. Keep one BYTE-FOR-BYTE and quarantine the rest —
         # no LLM, no coverage score, nothing generated that could be lossy or malformed.
@@ -377,7 +414,7 @@ def main():
                  + "supersede").encode()).hexdigest()[:10]
             params = {"umbrella": keeper, "umbrella_content": content, "desc": kdesc,
                       "absorbed": absorbed, "merge_id": merge_id,
-                      "src_sha": sha0}
+                      "src_sha": sha0, "settle_days": ac["settle_days"]}
             preview = (f"Supersede: {absorbed} are canonically IDENTICAL copies of "
                        f"{keeper}. Keeper unchanged; absorbed→quarantine.")
             print(f"\n· {files} -> {keeper}  [SUPERSEDE — lossless]")
@@ -397,6 +434,8 @@ def main():
                 print(f"  APPLIED ({detail})"); done += 1
             else:
                 print(f"  FAILED ({detail})")
+                if "outstanding merge backup" in detail:
+                    remember(f"supersede refused: {detail}")
             continue
         umbrella = max(paths, key=lambda p: _score(p, scores))   # keep the highest-trust member's name
         name, desc, typ = _fm(umbrella)
@@ -408,36 +447,53 @@ def main():
         # verbatim in the final doc. Only CREDENTIAL_RE (high-precision) counts —
         # txids/EVM-addresses/UUIDs are public data the aggressive scanner used to
         # block on, which is why secret-bearing clusters never consolidated.
-        # The same for PUBLIC values (2026-11-26): the distiller masks every long hex/base64 run
-        # before the model sees it, so a txid, an address or a full hash in a source can never
-        # reach the umbrella; ~65 of the author's money memories hold one.
         # The umbrella BODY is always redacted, so only its description (kept verbatim) can carry
-        # either: both are judged from the sources here, before a distill call is spent.
+        # a credential: judged from the sources here, before a distill call is spent.
         # Counted, never printed (the credential HOLD used to print the first 50 chars of each).
+        # PUBLIC values (txid, address, full hash) are not held any more: the distiller swaps them
+        # for placeholders the model sees and puts the originals back (checked after distill).
         srcs = [(MEM / f).read_text(errors="ignore") for f in files]
         creds = {c for t in srcs for c in engram_secrets.credentials(t) if c not in (desc or "")}
         if creds:
             print(f"· {files}: HOLD (umbrella would drop {len(creds)} credential(s)) — skipping"); continue
-        masked = {v for t in srcs for v in _public_values(t) if v not in (desc or "")}
-        if masked:
-            print(f"· {files}: HOLD (umbrella would mask {len(masked)} public value(s) the sources hold: "
-                  f"txid, address or full hash) — skipping"); continue
+        # A masked run that is neither a credential nor positively public (a 64-hex with no tx
+        # label could be a private key) cannot be restored and would be lost: hold.
+        public, held = engram_secrets.classify_values(srcs)
+        if held:
+            print(f"· {files}: HOLD ({len(held)} masked value(s) that cannot be told apart from a "
+                  f"secret) — skipping"); continue
         attempted += 1
         # COMPRESS for real (no preserve_sources) — the umbrella is a tight consolidation.
         # Losslessness is provided by REVERSIBILITY (sources -> quarantine), not by
         # appending everything. sentence_coverage is recorded, not gated.
         final, report = mdv.distill_cluster(umbrella.stem, files, cfg=cfg, preserve_sources=False)
+        if report.get("gen_empty"):
+            # everything would land in the appendix and read as BLOATED; it says nothing about the
+            # cluster, so it is neither remembered nor queued: the next run tries again
+            print(f"· {files}: HOLD (the model returned nothing) — retried next run"); continue
         # share of the doc THIS rewrite left to the appendix; carried lines are out of both sides
         ratio = report.get("appendix_fresh_chars", 0) / max(
             1, (report.get("draft_chars") or 0) - report.get("appendix_carried_chars", 0))
         bloated = ratio > float(ac["max_appendix_ratio"])
         body = _body_of(final)
         if not body.strip():
-            print(f"· {files}: HOLD (empty umbrella) — skipping"); continue
+            print(f"· {files}: HOLD (empty umbrella) — skipping"); remember("empty umbrella"); continue
         doc = _umbrella_doc(umbrella.stem, desc, typ, body)
         okdoc, whydoc = gate.validate_memory_doc(doc)
         if not okdoc:
-            print(f"· {files}: HOLD (malformed umbrella: {whydoc}) — skipping"); continue
+            print(f"· {files}: HOLD (malformed umbrella: {whydoc}) — skipping")
+            remember(f"malformed umbrella: {whydoc}"); continue
+        # Reconciliation: every public value of the sources must be in the umbrella (the
+        # distiller restores them by construction; this catches a regression). Counted only.
+        lost = {v for v in public if v not in doc}
+        if lost:
+            print(f"· {files}: HOLD (umbrella lost {len(lost)} public value(s): txid, address or "
+                  f"full hash) — skipping"); remember("umbrella lost public values"); continue
+        # The writer (save_memory.sh) would block this umbrella: refuse here instead of failing the
+        # write (and retrying every run). Same pattern, case-insensitive like its grep -iE.
+        if engram_secrets.writer_would_block(doc):
+            print(f"· {files}: HOLD (the memory writer's secret guard would block this umbrella) — skipping")
+            remember("writer guard would block"); continue
         absorbed = [f for f in files if f != umbrella.name]
         # transaction id so a second merge on the same umbrella can't clobber the
         # first merge's backup (each merge's originals live under their own dir)
@@ -445,7 +501,8 @@ def main():
         merge_id = _hl.sha256((umbrella.name + "".join(sorted(absorbed)) + doc
                                + json.dumps(sha0, sort_keys=True)).encode()).hexdigest()[:10]
         params = {"umbrella": umbrella.name, "umbrella_content": doc, "desc": desc,
-                  "absorbed": absorbed, "merge_id": merge_id, "src_sha": sha0}
+                  "absorbed": absorbed, "merge_id": merge_id, "src_sha": sha0,
+                  "settle_days": ac["settle_days"]}
         # Say what the merge actually kept. "near-lossless" used to sit next to a prose coverage of
         # 0.0: that number is the share of source sentences copied word for word, so any rewrite
         # scores ~0 and it said nothing about what survived.
@@ -465,7 +522,8 @@ def main():
         # HUMAN gate (no model review): every merge goes to the Telegram approval queue.
         if gate_mode == "human":
             if ac.get("autonomous"):
-                print(f"· {files}: SKIP (autonomous but human gate) — fail-closed"); continue
+                print(f"· {files}: SKIP (autonomous but human gate) — fail-closed")
+                remember("autonomous but human gate"); continue
             gate.propose("merge_apply", params, f"Needs your approval (human gate). {preview}",
                          files=files, verdict="human-gate")
             print("  QUEUED for human approval (human gate)"); queued += 1
@@ -487,6 +545,8 @@ def main():
                                  {"umbrella": umbrella.name, "absorbed": absorbed, "merge_id": merge_id},
                                  f"🧠 auto-merged: {preview}\nTap UNDO to reverse.")
                 done += 1
+            elif "outstanding merge backup" in detail:     # waits for settle_days: deterministic
+                remember(f"apply refused: {detail}")
         else:
             if verdict == "BLOATED":
                 why = (f"this rewrite restated {ratio:.0%} of the umbrella in its appendix, over "
@@ -496,7 +556,10 @@ def main():
             else:
                 why = f"lossy compression (cov={cov} < {ac['min_auto_coverage']})"
             if ac.get("autonomous"):
-                print(f"· {files}: SKIP ({why}) — not queued"); continue
+                print(f"· {files}: SKIP ({why}) — not queued")
+                if not verdict.startswith("DEFER"):          # a down reviewer is not an answer
+                    remember(why)
+                continue
             gate.propose("merge_apply", params, f"Needs approval — {why}. {preview}",
                          files=files, verdict=verdict)
             print(f"  QUEUED for human approval ({why})"); queued += 1
